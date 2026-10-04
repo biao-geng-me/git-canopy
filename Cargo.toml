@@ -1,0 +1,26 @@
+[package]
+name = "git-canopy"
+version = "0.1.0"
+edition = "2024"
+description = "Live TUI showing every git worktree of a repo at a glance"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "canopy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "canopy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+notify = { version = "8.2.0", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+unicode-width = "0.2.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
