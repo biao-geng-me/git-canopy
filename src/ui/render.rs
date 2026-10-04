@@ -19,8 +19,9 @@ pub const C_MODIFIED: Color = Color::Yellow;
 pub const C_UNTRACKED: Color = Color::Magenta;
 pub const C_CONFLICT: Color = Color::Red;
 pub const C_DIM: Color = Color::DarkGray;
-/// Remote branch labels: a gray that is not a lane color, so they never look like local branches.
-const C_REMOTE: Color = Color::Indexed(245);
+/// Remote branch labels: red, which no lane uses, so they never look like local branches (a gray
+/// blended in with the dim age and parentheses around it).
+const C_REMOTE: Color = Color::Red;
 const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
@@ -579,13 +580,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
 // ---------------------------------------------------------------------------------------------
 // Graph panel
 
+/// No red: that's for remote labels (and conflicts, blocked agents).
 const LANE_COLORS: [Color; 6] = [
     Color::Blue,
     Color::Magenta,
     Color::Green,
     Color::Yellow,
     Color::Cyan,
-    Color::Red,
+    Color::Indexed(208), // orange
 ];
 
 fn lane_style(color: u8) -> Style {

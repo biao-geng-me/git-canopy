@@ -185,7 +185,9 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   right after `worktree add`) make every status re-read those files' contents until some normal
   git command refreshes the index. fs events still give ~150 ms latency for anything touching `.git`;
   only pure working-tree edits wait for the poll.
-- **Remote labels are gray** (`C_REMOTE`, not a lane color); local branches and `[name]` use lane colors.
+- **Remote labels are red** (`C_REMOTE`, not a lane color); local branches and `[name]` use lane colors.
+  Gray was tried and dropped: next to the dim age and parentheses the remotes were easy to miss.
+  Red is therefore not a lane color (the sixth lane is orange).
 - **Pane chrome:** each pane has only a horizontal rule on top carrying its title (cyan when focused),
   plus a plain rule above the footer; no side lines, those columns stay blank (`render::panel`, with
   `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
