@@ -42,7 +42,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            interval: Duration::from_millis(1500),
+            interval: Duration::from_secs(60),
             watch: true,
             base: None,
             page: GRAPH_PAGE,

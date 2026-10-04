@@ -18,6 +18,8 @@ pub const C_MODIFIED: Color = Color::Yellow;
 pub const C_UNTRACKED: Color = Color::Magenta;
 pub const C_CONFLICT: Color = Color::Red;
 pub const C_DIM: Color = Color::DarkGray;
+/// Remote branch labels: a gray that is not a lane color, so they never look like local branches.
+const C_REMOTE: Color = Color::Indexed(245);
 const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
@@ -613,7 +615,8 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
             kind => {
                 // Branches take their lane's color; tags stay yellow.
                 let (text, style) = match kind {
-                    LabelKind::Branch | LabelKind::Remote => (l.text.clone(), lane_style(row.color)),
+                    LabelKind::Branch => (l.text.clone(), lane_style(row.color)),
+                    LabelKind::Remote => (l.text.clone(), Style::new().fg(C_REMOTE)),
                     _ => (format!("tag: {}", l.text), Style::new().fg(Color::Yellow)),
                 };
                 if !refs.is_empty() {
@@ -857,6 +860,15 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
             }
             Some(Line::from(spans))
         }
+    }
+}
+
+/// `60s`, `1.5s`: an interval without a pointless `.0`.
+fn secs(ms: u128) -> String {
+    if ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
 
@@ -1173,9 +1185,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
     let mode = if app.snap.watching {
-        format!("live · poll {:.1}s ", app.interval_ms as f64 / 1000.0)
+        format!("live · poll {} ", secs(app.interval_ms))
     } else {
-        format!("polling {:.1}s ", app.interval_ms as f64 / 1000.0)
+        format!("polling {} ", secs(app.interval_ms))
     };
     if left_width + mode.width() < hints.width as usize {
         let right = Line::from(Span::styled(mode, Style::new().fg(C_DIM))).right_aligned();

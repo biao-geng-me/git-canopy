@@ -16,7 +16,7 @@ ARGS:
     PATH    any directory inside the repository (default: current directory)
 
 OPTIONS:
-    -i, --interval <SECS>   status poll interval in seconds (default: 1.5)
+    -i, --interval <SECS>   status poll interval in seconds (default: 60)
         --base <BRANCH>     branch to compare worktrees against (default: main/master/...)
         --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only

@@ -80,7 +80,8 @@ Editing a file does NOT touch `.git`, so watching `.git` alone misses new dirty 
    `packed-refs`, `HEAD`, and each linked worktree's admin dir `<common>/worktrees/<name>/` (its `HEAD`,
    `index`). Watch directories, not files (git writes via `*.lock` + rename); ignore `*.lock`; debounce
    ~150ms. On event → reload refs/graph and the affected worktree's status.
-2. Poll `status` per worktree every ~1.5s (configurable) on a background thread for working-tree edits.
+2. Poll `status` per worktree every 60s (configurable; was 1.5s, see decisions) on a background thread
+   for working-tree edits.
    Run status calls in parallel with a small bound.
 3. Fallback to pure polling if watching fails (e.g. WSL2 repos under `/mnt/c` where inotify doesn't fire).
    The dev machine is WSL2.
@@ -130,6 +131,14 @@ UI thread only renders snapshots received over a channel.
   uncommitted row's lane inherits the color of the lane it joins, so a worktree keeps its color whether
   dirty or clean. `[name]`, branch and remote labels use their row's lane color (`Row::color`), tags
   stay yellow, and the worktree list colors each name like its graph row.
+- **Poll interval 60s by default** (user's call; `r` refreshes on demand, `-i` overrides). Measured
+  cost of one `git status --no-optional-locks`: ~1 stat per tracked file + a readdir per directory,
+  no content reads (e.g. 755 file syscalls for a 500-file tree, ~5 ms). Caveat: canopy never
+  writes the index, so "racily clean" entries (files written in the same second as the index, e.g.
+  right after `worktree add`) make every status re-read those files' contents until some normal
+  git command refreshes the index. fs events still give ~150 ms latency for anything touching `.git`;
+  only pure working-tree edits wait for the poll.
+- **Remote labels are gray** (`C_REMOTE`, not a lane color); local branches and `[name]` use lane colors.
 - **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
   the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/

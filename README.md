@@ -25,8 +25,9 @@ tree doing, and which ones are dirty?" on one screen:
   subject and message (wrapped) and its changed files right there; `Space` on a file unfolds its diff.
   `Esc` folds back. `Enter` (or a double-click) opens the full diff view.
 - **Layout:** stacked by default; `v` (or `--layout side`) puts the worktrees beside the graph.
-- **Live:** status is polled every 1.5s, and changes to refs, HEADs and indexes are picked up via file
-  system events within ~150ms. Refreshing never blocks the UI.
+- **Live:** commits, checkouts, staging and other git operations show up within ~150ms via file system
+  events on the git dir. Plain file edits (which don't touch `.git`) show up at the next status poll,
+  every 60s by default (`-i` to change), or immediately with `r`. Refreshing never blocks the UI.
 - **Details on demand:** `Enter` shows `git show` for a commit, or the uncommitted diff (including
   untracked files) for a worktree.
 
@@ -51,7 +52,7 @@ canopy [OPTIONS] [PATH]
 git canopy [OPTIONS] [PATH]
 
   PATH                    any directory inside the repository (default: current directory)
-  -i, --interval <SECS>   status poll interval in seconds (default: 1.5)
+  -i, --interval <SECS>   status poll interval in seconds (default: 60)
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
                           develop, or the main worktree's branch)
       --layout <MODE>     stacked (graph above worktrees, default) or side
@@ -72,7 +73,8 @@ git canopy [OPTIONS] [PATH]
 graph (its `◌` row when dirty, else its HEAD commit), and focus stays on the list.
 
 Each worktree and branch is drawn in the color of its graph lane: the `[name]` and branch labels in
-the graph and the worktree names in the list. A dirty worktree is labelled once, on its `◌` row.
+the graph and the worktree names in the list (remote branches are gray). A dirty worktree is labelled
+once, on its `◌` row.
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
 | `Tab` | switch between the graph and the worktree list |
 | `v` | stacked / side-by-side layout |
@@ -104,8 +106,11 @@ changes.
 
 ## Notes
 
-- On WSL2, repositories under `/mnt/c` don't deliver file system events. canopy notices nothing and
-  keeps polling, so updates just take up to one interval.
+- On WSL2, repositories under `/mnt/c` don't deliver file system events, so everything updates at the
+  poll interval there; consider `-i 5` (status over 9p is slow, so not much lower).
+- Cost of a poll: per worktree one `git status`, which stats every tracked file and lists the
+  directories (metadata only, normally served from the kernel's cache, no file contents), plus two
+  cheap repo-wide commands.
 - The graph loads the newest 1000 commits first and loads more as you scroll toward the end.
 
 ## Development
