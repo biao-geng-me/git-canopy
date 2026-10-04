@@ -18,8 +18,16 @@ impl Fixture {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/mkfixture.sh");
-        let out = Command::new("bash").arg(script).arg(&dir).output().expect("run mkfixture.sh");
-        assert!(out.status.success(), "mkfixture failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("bash")
+            .arg(script)
+            .arg(&dir)
+            .output()
+            .expect("run mkfixture.sh");
+        assert!(
+            out.status.success(),
+            "mkfixture failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         Fixture { dir }
     }
 
