@@ -1,0 +1,18 @@
+# canopy's herdr plugin: a shell popup. herdr only opens popups for plugin panes, so canopy (when
+# it runs inside herdr) asks for this pane with the worktree as `cwd` when you double-click a
+# worktree's path or press `s`. Link it once with `herdr plugin link <this directory>`.
+id = "local.canopy"
+name = "canopy"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Shell popups for canopy, the git worktree monitor"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "shell"
+title = "shell"
+description = "An interactive shell in the directory canopy passes as cwd"
+command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
+placement = "popup"
+width = "80%"
+height = "80%"

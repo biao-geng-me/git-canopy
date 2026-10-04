@@ -55,6 +55,31 @@ pub fn focus_at(path: &Path, pane_id: &str) -> std::io::Result<()> {
     Rpc::connect(path)?.call("agent.focus", &params).map(|_| ())
 }
 
+/// Open a shell in `cwd` as a herdr popup (through the canopy plugin, see [`super::PLUGIN_ID`]).
+/// Only when canopy itself runs inside herdr, so the popup shows up where the user is looking.
+/// Fails when herdr is unreachable or the plugin isn't installed and enabled.
+pub fn open_shell_popup(cwd: &Path) -> std::io::Result<()> {
+    if std::env::var_os("HERDR_PANE_ID").is_none() {
+        return Err(ErrorKind::NotFound.into());
+    }
+    let path = socket_path().ok_or(ErrorKind::NotFound)?;
+    open_shell_popup_at(&path, cwd)
+}
+
+/// [`open_shell_popup`] against the server at `path`.
+pub fn open_shell_popup_at(path: &Path, cwd: &Path) -> std::io::Result<()> {
+    let mut rpc = Rpc::connect(path)?;
+    let list = rpc.call(
+        "plugin.list",
+        &format!("{{\"plugin_id\":{}}}", json::quote(super::PLUGIN_ID)),
+    )?;
+    if !super::has_shell_pane(&list) {
+        return Err(ErrorKind::NotFound.into());
+    }
+    rpc.call("plugin.pane.open", &super::shell_popup_params(cwd))
+        .map(|_| ())
+}
+
 fn run(resolve: &dyn Fn() -> Option<PathBuf>, emit: &Emit) {
     let mut backoff = BACKOFF_MIN;
     let mut shown = true; // whether the last emit was a view (so "unreachable" is sent once)

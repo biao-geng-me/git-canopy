@@ -7,10 +7,12 @@
 mod diff_view;
 mod inset;
 mod render;
+mod term;
 
 use std::collections::HashMap;
 use std::io::stdout;
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -47,6 +49,12 @@ pub enum UiMsg {
     },
     /// What herdr reports; `None` when herdr isn't reachable.
     Herdr(Option<Arc<herdr::View>>),
+    /// The inset shell printed something (redraw).
+    TermOutput,
+    /// The inset shell with this id exited.
+    TermExited(u64),
+    /// Neither a herdr nor a tmux popup could show a shell in this worktree: use the inset.
+    ShellInset(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +78,21 @@ pub enum LayoutMode {
 pub struct Areas {
     pub worktrees: Rect,
     pub graph: Rect,
+    /// The inset shell (empty when none is open).
+    pub shell: Rect,
+}
+
+/// Where the clickable fields of a worktree row are (columns relative to the panel content).
+#[derive(Clone, Debug, Default)]
+pub struct WtFields {
+    pub agent: Option<Range<u16>>,
+    pub path: Option<Range<u16>>,
+}
+
+/// A shell in an inset below the graph.
+pub struct Shell {
+    id: u64,
+    pub term: term::Term,
 }
 
 /// A vertically scrolling selection over a list of lines.
@@ -178,6 +201,15 @@ pub struct App {
     pub areas: Areas,
     /// Graph width the open rows' text was wrapped for.
     pub wrap_width: usize,
+    /// Clickable fields of the visible worktree rows, by worktree index (from the last render).
+    pub wt_fields: HashMap<usize, WtFields>,
+    pub shell: Option<Shell>,
+    /// Keys go to the inset shell (Ctrl-] leaves it).
+    pub shell_focus: bool,
+    /// A one-off message for the footer, cleared by the next key or click.
+    pub notice: Option<String>,
+    /// herdr integration enabled (`--no-herdr` turns it off, the shell popup included).
+    with_herdr: bool,
     next_id: u64,
     tx: Sender<UiMsg>,
     last_click: Option<Click>,
@@ -204,6 +236,11 @@ impl App {
             quit: false,
             areas: Areas::default(),
             wrap_width: 0,
+            wt_fields: HashMap::new(),
+            shell: None,
+            shell_focus: false,
+            notice: None,
+            with_herdr: true,
             next_id: 0,
             tx,
             last_click: None,
@@ -529,6 +566,14 @@ impl App {
                 self.herdr = view;
                 self.map_agents();
             }
+            UiMsg::TermOutput => {}
+            UiMsg::TermExited(id) => {
+                if self.shell.as_ref().is_some_and(|s| s.id == id) {
+                    self.shell = None;
+                    self.shell_focus = false;
+                }
+            }
+            UiMsg::ShellInset(path) => self.open_shell_inset(&path),
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
                     d.loaded(result);
@@ -668,6 +713,17 @@ impl App {
 
     fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        self.notice = None;
+        if self.shell_focus
+            && let Some(shell) = self.shell.as_mut()
+        {
+            // Everything goes to the shell except Ctrl-], which hands the keys back to canopy.
+            match k.code {
+                KeyCode::Char(']' | '5') if ctrl => self.shell_focus = false,
+                _ => shell.term.key(k),
+            }
+            return;
+        }
         if self.help {
             // Any key closes the help popup; Ctrl-C still quits.
             self.help = false;
@@ -682,6 +738,15 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('r') => self.worker.request(Request::Refresh),
             KeyCode::Char('a') => self.focus_agent(),
+            KeyCode::Char('s') => {
+                let wi = match self.focus {
+                    Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
+                    Focus::Graph => self.graph_row_worktree(),
+                };
+                if let Some(w) = wi.and_then(|wi| self.snap.worktrees.get(wi)) {
+                    self.open_shell(w.path.clone());
+                }
+            }
             KeyCode::Char('v') => {
                 self.layout = match self.layout {
                     LayoutMode::Stacked => LayoutMode::Side,
@@ -713,12 +778,15 @@ impl App {
             KeyCode::Esc => self.fold_row(f),
             KeyCode::Right | KeyCode::Char('l') => self.expand(f),
             KeyCode::Left | KeyCode::Char('h') => self.collapse(f),
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Worktrees => Focus::Graph,
-                    Focus::Graph => Focus::Worktrees,
+            // Tab: worktrees → graph → shell (when open) → worktrees.
+            KeyCode::Tab | KeyCode::BackTab => match self.focus {
+                Focus::Worktrees => self.focus = Focus::Graph,
+                Focus::Graph if self.shell.is_some() => {
+                    self.focus = Focus::Worktrees;
+                    self.shell_focus = true;
                 }
-            }
+                Focus::Graph => self.focus = Focus::Worktrees,
+            },
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Char('d') if ctrl => self.move_sel(self.page() as isize / 2),
@@ -884,8 +952,91 @@ impl App {
         p.pos.follow = true;
     }
 
+    /// Which field of a worktree row is at column `col` (of the panel content).
+    fn wt_field_at(&self, f: Focus, line: usize, col: u16) -> Option<WtField> {
+        if f != Focus::Worktrees {
+            return None;
+        }
+        let wi = self.wt.lines.get(line)?.row();
+        let fields = self.wt_fields.get(&wi)?;
+        if fields.agent.as_ref().is_some_and(|r| r.contains(&col)) {
+            return Some(WtField::Agent);
+        }
+        if fields.path.as_ref().is_some_and(|r| r.contains(&col)) {
+            return Some(WtField::Path(self.snap.worktrees.get(wi)?.path.clone()));
+        }
+        None
+    }
+
+    /// A shell in worktree `path`: a herdr popup if canopy runs in herdr and the canopy plugin is
+    /// installed, else a tmux popup inside tmux, else an inset below the graph. The popups are
+    /// tried off the UI thread (`display-popup` blocks until the popup closes).
+    fn open_shell(&mut self, path: PathBuf) {
+        if let Some(shell) = &self.shell {
+            // One inset shell at a time: focus the open one rather than hang it up.
+            self.shell_focus = true;
+            if shell.term.path != path {
+                self.notice = Some(format!(
+                    "a shell is open in {}; exit it first",
+                    render::tilde(&shell.term.path)
+                ));
+            }
+            return;
+        }
+        let (tx, with_herdr) = (self.tx.clone(), self.with_herdr);
+        spawn_named("canopy-shell", move || {
+            if (with_herdr && herdr::open_shell_popup(&path).is_ok()) || tmux_popup(&path) {
+                return;
+            }
+            let _ = tx.send(UiMsg::ShellInset(path));
+        });
+    }
+
+    fn open_shell_inset(&mut self, path: &Path) {
+        if self.shell.is_some() {
+            return;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        let (out, exit) = (self.tx.clone(), self.tx.clone());
+        // Sized properly on the next render.
+        let started = term::Term::spawn(
+            path,
+            12,
+            80,
+            move || {
+                let _ = out.send(UiMsg::TermOutput);
+            },
+            move || {
+                let _ = exit.send(UiMsg::TermExited(id));
+            },
+        );
+        match started {
+            Ok(term) => {
+                self.shell = Some(Shell { id, term });
+                self.shell_focus = true;
+            }
+            Err(e) => self.notice = Some(format!("can't start a shell: {e}")),
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if let Some(shell) = self.shell.as_mut()
+            && self.areas.shell.contains(pos)
+        {
+            match m.kind {
+                MouseEventKind::Down(_) => self.shell_focus = true,
+                MouseEventKind::ScrollUp => shell.term.scroll(3),
+                MouseEventKind::ScrollDown => shell.term.scroll(-3),
+                _ => {}
+            }
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.shell_focus = false;
+            self.notice = None;
+        }
         let hit = [
             (Focus::Worktrees, self.areas.worktrees),
             (Focus::Graph, self.areas.graph),
@@ -915,12 +1066,17 @@ impl App {
                     .as_ref()
                     .filter(|c| c.panel == f && c.line == idx && now.duration_since(c.at) < Duration::from_millis(400));
                 if let Some(first) = double {
-                    // Double-click: undo the first click's expand/collapse, open the full view.
+                    // Double-click: undo the first click's expand/collapse, then act on what was
+                    // clicked: a worktree's agent marker or path, else open the full view.
                     if first.toggled {
                         self.toggle_at(f, idx);
                     }
                     self.last_click = None;
-                    self.open_full(f, idx);
+                    match self.wt_field_at(f, idx, m.column - inner.x) {
+                        Some(WtField::Agent) => self.focus_agent(),
+                        Some(WtField::Path(path)) => self.open_shell(path),
+                        None => self.open_full(f, idx),
+                    }
                 } else {
                     let toggled = self.toggle_at(f, idx);
                     self.last_click = Some(Click {
@@ -1048,6 +1204,35 @@ impl App {
     }
 }
 
+enum WtField {
+    Agent,
+    Path(PathBuf),
+}
+
+/// A shell in `path` as a tmux popup, when canopy runs inside tmux. Blocks until the popup is
+/// closed; `false` if tmux couldn't show one (not in tmux, tmux < 3.2, no client).
+fn tmux_popup(path: &Path) -> bool {
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    let started = Instant::now();
+    let status = std::process::Command::new("tmux")
+        .arg("display-popup")
+        .arg("-E")
+        .arg("-d")
+        .arg(path)
+        .args(["-w", "80%", "-h", "80%"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // A shell's own exit status comes back too; only a quick failure means there was no popup.
+    match status {
+        Ok(s) => s.success() || started.elapsed() > Duration::from_secs(1),
+        Err(_) => false,
+    }
+}
+
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new().name(name.into()).spawn(f).expect("spawn thread");
 }
@@ -1077,6 +1262,7 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool) 
     let _ = execute!(stdout(), EnableMouseCapture);
 
     let mut app = App::new(worker, tx, &cfg, layout);
+    app.with_herdr = with_herdr;
     let res = event_loop(&mut terminal, &mut app, &rx);
 
     let _ = execute!(stdout(), DisableMouseCapture);

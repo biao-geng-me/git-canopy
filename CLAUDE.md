@@ -120,8 +120,10 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 - **Display:** a marker per worktree by its most urgent agent state — `◆ blocked` (bold red),
   `▶ working`, `✓ done`, `· idle` — with `×N` when several agents share a worktree; the same glyph on
   the worktree's `[name]` label in the graph; footer `herdr: 3 agents, 1 blocked`.
-- **The only write-like call:** `a` on a worktree sends `agent.focus` for its (most urgent) agent so
-  herdr jumps to that pane. canopy never prompts, sends keys to, starts or stops agents.
+- **The only write-like calls**, both on the user's explicit request: `a` (or a double-click on the
+  agent marker) sends `agent.focus` for the worktree's most urgent agent so herdr jumps to that pane;
+  `s` (or a double-click on the path) opens a shell popup via `plugin.pane.open` (see Shells). canopy
+  never prompts, sends keys to, starts or stops agents.
 - **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
   every request opens a fresh connection; only the subscription connection stays open. Tests run the
@@ -188,10 +190,29 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 - **Remote labels are red** (`C_REMOTE`, not a lane color); local branches and `[name]` use lane colors.
   Gray was tried and dropped: next to the dim age and parentheses the remotes were easy to miss.
   Red is therefore not a lane color (the sixth lane is orange).
-- **Pane chrome:** each pane has only a horizontal rule on top carrying its title (cyan when focused),
-  plus a plain rule above the footer; no side lines, those columns stay blank (`render::panel`, with
-  `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
+- **Pane chrome:** each pane has only a horizontal rule on top carrying its title after a short `──`
+  lead-in (cyan when focused), plus a plain rule above the footer; no side lines, those columns stay
+  blank (`render::panel`, with `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
   boxes were visual clutter. Only the `?` popup keeps a full frame, since it floats over content.
+- **Shells:** `s` / double-click on a worktree's path opens a shell there, first that works:
+  (1) a herdr popup — herdr 0.9.3 only opens popups for plugin panes (`plugin.pane.open` with
+  `placement: "popup"`), so the repo ships `herdr-plugin/herdr-plugin.toml` (id `local.canopy`, pane
+  `shell` = `$SHELL`, cwd from the request); used only when canopy runs inside herdr
+  (`HERDR_PANE_ID`) and `plugin.list` shows the plugin enabled, and never with `--no-herdr`;
+  (2) `tmux display-popup -E -d <path>` inside tmux — it blocks until the popup closes, so it runs on
+  a thread, and only a quick non-zero exit (no client, old tmux) counts as failure; (3) an inset
+  terminal in the lower half of the graph's space (`ui/term.rs`): a pty from `openpty` (libc) with
+  `$SHELL` as session leader, emulated by the `vt100` crate (which doesn't answer queries, so cursor
+  position / device attribute requests are answered from its callbacks), drawn cell by cell. While
+  it has focus every key goes to it except `Ctrl-]`; `Tab` cycles worktrees → graph → shell. One inset
+  shell at a time (a second request focuses it rather than hanging it up); closing canopy sends the
+  shell's session SIGHUP. These two crates are the price of the inset; canopy is Unix-only anyway.
+  Tested live: the inset in a private tmux, the herdr popup in a fully separate herdr instance
+  (relative `HOME` under the scratchpad, plugin linked only there), agent focus and the popup request
+  against a fake socket server.
+- **Worktree row fields are clickable:** render records each row's agent-marker and path column
+  ranges (`App::wt_fields`); a double-click on them focuses the agent / opens a shell, anywhere else
+  opens the diff as before.
 - **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
   the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/
@@ -235,7 +256,8 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   agent still writing to an already-modified file shows up, and open worktree diffs reload on it.
 - **Worktree rows show HEAD sha + age, not the subject** (the graph has it). HEAD commit times come
   from one `git log --no-walk=unsorted` over the HEAD shas, cached by sha.
-- **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width.
+- **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width
+  (plus libc and vt100 for the inset shell).
   ratatui is used with default features off (`crossterm`, `layout-cache`) and its crossterm re-export.
 - **Static binary:** the default glibc build links libc dynamically; `--target x86_64-unknown-linux-musl`
   gives a fully static ~1.2 MB binary (no C deps, works out of the box with rustup's musl target).

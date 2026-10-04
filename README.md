@@ -74,20 +74,21 @@ git canopy [OPTIONS] [PATH]
 | `Space`, click | graph: expand / collapse a commit or `◌` row (message, files), or a file (its diff) |
 | `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
 | `Esc` | fold the expansion under the cursor back to its row (on a folded row: fold everything) |
+| `Enter`, double-click | full diff view, opened at the file and line under the cursor |
+| `Tab` | switch between the graph, the worktree list and the shell (when one is open) |
+| `v` | stacked / side-by-side layout |
+| `a`, double-click an agent marker | herdr: jump to the worktree's agent pane |
+| `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
+| `r` | refresh now |
+| `?` | help |
+| `q`, `Ctrl-C` | quit |
 
 `Space`, `→`, `←` and `Esc` also work from the worktree list: they act on that worktree's row in the
 graph (its `◌` row when dirty, else its HEAD commit), and focus stays on the list.
 
 Each worktree and branch is drawn in the color of its graph lane: the `[name]` and branch labels in
-the graph and the worktree names in the list (remote branches are gray). A dirty worktree is labelled
+the graph and the worktree names in the list (remote branches are red). A dirty worktree is labelled
 once, on its `◌` row.
-| `Enter`, double-click | full diff view, opened at the file and line under the cursor |
-| `Tab` | switch between the graph and the worktree list |
-| `v` | stacked / side-by-side layout |
-| `a` | herdr: jump to the selected worktree's agent pane |
-| `r` | refresh now |
-| `?` | help |
-| `q`, `Ctrl-C` | quit |
 
 The diff view lists the changed files on top (status, path, `+`/`-` counts; the first entry is the
 commit message and diffstat, or a summary for a worktree) and shows the selected file's diff below.
@@ -120,12 +121,26 @@ inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns i
 - Worktree rows get `◆ blocked` (bold red), `▶ working`, `✓ done` or `· idle` for their most urgent
   agent, plus `×N` when several agents share a worktree; the graph's `[name]` labels get the same mark.
 - The footer sums it up: `herdr: 3 agents, 1 blocked`.
-- `a` asks herdr to focus that worktree's agent pane. That is the only thing canopy ever asks herdr to
-  do; it never prompts, sends keys to, starts or stops agents.
+- `a` (or a double-click on the marker) asks herdr to focus that worktree's agent pane. That and
+  opening a shell popup (below) are the only things canopy ever asks herdr to do; it never prompts,
+  sends keys to, starts or stops agents.
 
 An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
 of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, `HERDR_SESSION`, or
 `~/.config/herdr/herdr.sock`), follows its event stream, and reconnects if herdr restarts.
+
+## Shells
+
+`s`, or a double-click on a worktree's path, opens a shell in that worktree, in the first of these that
+works:
+
+1. **A herdr popup**, when canopy runs inside herdr and canopy's herdr plugin is linked. herdr only
+   opens popups for plugin panes, so link it once:
+   `herdr plugin link /path/to/canopy/herdr-plugin`.
+2. **A tmux popup** (`tmux display-popup`, tmux ≥ 3.2), when canopy runs inside tmux.
+3. **An inset** in the lower half of the graph's space: a real terminal (your `$SHELL` on a pty).
+   Keys go to the shell while it has focus; `Ctrl-]` hands them back to canopy, a click or `Tab`
+   returns to it, and `exit` closes it. The mouse wheel scrolls its history. One inset shell at a time.
 
 ## Notes
 

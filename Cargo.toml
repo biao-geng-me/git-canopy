@@ -16,9 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+libc = "0.2.190"
 notify = { version = "8.2.0", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 unicode-width = "0.2.2"
+vt100 = "0.16.2"
 
 [profile.release]
 lto = true

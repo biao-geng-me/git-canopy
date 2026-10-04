@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
-use super::{App, Focus, InsetText, LayoutMode};
+use super::{App, Focus, InsetText, LayoutMode, WtFields};
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::herdr::{self, AgentState};
 use crate::model::WorktreeView;
@@ -55,10 +55,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let [left, right] = Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main);
         (left, right)
     };
+    // An inset shell takes the lower half of the graph's space.
+    let (graph_area, shell_area) = if app.shell.is_some() {
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(graph_area);
+        (top, bottom)
+    } else {
+        (graph_area, Rect::default())
+    };
     app.areas.worktrees = wt_area;
     app.areas.graph = graph_area;
+    app.areas.shell = shell_area;
     draw_worktrees(f, app, wt_area, stacked);
     draw_graph(f, app, graph_area);
+    draw_shell(f, app, shell_area);
     draw_footer(f, app, footer);
     if app.help {
         draw_help(f);
@@ -76,11 +86,14 @@ fn border_style(focused: bool) -> Style {
 /// A pane: a horizontal rule on top carrying the title, no side lines (they add clutter inside
 /// tmux/herdr, which draw their own); one blank column on each side instead. See [`content`].
 fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
+    // A short lead-in of rule before the title: `── graph ────…`.
+    let mut spans = vec![Span::styled("──", border_style(focused))];
+    spans.extend(title.spans);
     Block::new()
         .borders(Borders::TOP)
         .border_style(border_style(focused))
         .padding(Padding::horizontal(1))
-        .title(title)
+        .title(Line::from(spans))
 }
 
 /// Rows a [`panel`] uses for its rule.
@@ -374,8 +387,9 @@ fn wt_line(
     wide: bool,
     width: usize,
     now: i64,
-) -> Line<'static> {
+) -> (Line<'static>, WtFields) {
     let dim = Style::new().fg(C_DIM);
+    let mut fields = WtFields::default();
     let mut spans = vec![row.marker, Span::raw(" ")];
     spans.push(Span::styled(
         pad(truncate(&row.name.content, cols.name), cols.name),
@@ -384,6 +398,10 @@ fn wt_line(
     spans.push(Span::raw(" "));
     if cols.agent > 0 {
         let aw = spans_width(&row.agent);
+        if aw > 0 {
+            let at = spans_width(&spans) as u16;
+            fields.agent = Some(at..at + aw as u16);
+        }
         spans.extend(row.agent);
         spans.push(Span::raw(" ".repeat(cols.agent - aw + 1)));
     }
@@ -398,7 +416,7 @@ fn wt_line(
         }
     }
     if !wide {
-        return Line::from(spans);
+        return (Line::from(spans), fields);
     }
 
     // Wide rows: last edit, HEAD commit (sha, age), path on the right.
@@ -421,9 +439,10 @@ fn wt_line(
     let used = spans_width(&spans);
     if cols.path > 0 && used + 2 + path.width() <= width {
         spans.push(Span::raw(" ".repeat(width - used - path.width())));
+        fields.path = Some((width - path.width()) as u16..width as u16);
         spans.push(Span::styled(path, dim));
     }
-    Line::from(spans)
+    (Line::from(spans), fields)
 }
 
 /// An inset line's content (without indentation): message, file entry or diff line.
@@ -474,7 +493,7 @@ fn inset_spans(app: &App, f: Focus, r: usize, item: Item) -> Vec<Span<'static>> 
 }
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
-    let focused = app.focus == Focus::Worktrees;
+    let focused = app.focus == Focus::Worktrees && !app.shell_focus;
     let n = app.snap.worktrees.len();
     let dirty = app.snap.worktrees.iter().filter(|w| w.is_dirty()).count();
     let mut title = vec![Span::raw(" worktrees ")];
@@ -555,13 +574,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
         .take(height)
         .copied()
         .collect();
+    let mut fields = std::collections::HashMap::new();
     let lines: Vec<Line> = visible
         .into_iter()
         .map(|l| match l {
             VLine::Row(r) => match rows.get_mut(r).and_then(Option::take) {
                 Some(row) => {
                     let w = &app.snap.worktrees[r];
-                    wt_line(row, w, &shown_path(w), &cols, wide, width, now)
+                    let (line, hit) = wt_line(row, w, &shown_path(w), &cols, wide, width, now);
+                    fields.insert(r, hit);
+                    line
                 }
                 None => Line::default(),
             },
@@ -572,6 +594,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
             }
         })
         .collect();
+    app.wt_fields = fields;
     let sel = app.wt.pos.sel.checked_sub(app.wt.pos.offset);
     paint_rows(f, inner, lines, sel, true);
 }
@@ -777,7 +800,7 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
 }
 
 fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Graph;
+    let focused = app.focus == Focus::Graph && !app.shell_focus;
     let mut title = vec![Span::raw(" graph ")];
     if let Some(b) = &app.snap.base {
         title.push(Span::styled(format!("· base {b} "), Style::new().fg(C_DIM)));
@@ -1275,13 +1298,112 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), hints);
 }
 
+/// The inset shell: its screen, drawn cell by cell, and the cursor while it has the keys.
+fn draw_shell(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(shell) = app.shell.as_mut() else { return };
+    let focused = app.shell_focus;
+    let dim = Style::new().fg(C_DIM);
+    let hint = if focused {
+        " Ctrl-] back to canopy · exit to close "
+    } else {
+        " click or Tab to type "
+    };
+    // `── shell · feat-auth ~/…/wt/feat-auth ──── hint`, the path shortened to fit.
+    let name = app
+        .snap
+        .worktrees
+        .iter()
+        .find(|w| w.path == shell.term.path)
+        .map(|w| w.name.clone());
+    let mut title = vec![Span::raw(" shell ")];
+    if let Some(n) = &name {
+        title.push(Span::styled("· ", dim));
+        title.push(Span::styled(format!("{n} "), Style::new().add_modifier(Modifier::BOLD)));
+    }
+    let room = (area.width as usize).saturating_sub(spans_width(&title) + hint.width() + 6);
+    if room >= 8 {
+        title.push(Span::styled(
+            format!("{} ", truncate_left(&tilde(&shell.term.path), room)),
+            dim,
+        ));
+    }
+    let title = Line::from(title);
+    let block = panel(title, focused).title_top(Line::styled(hint, dim).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    shell.term.resize(inner.height, inner.width);
+    let parser = shell.term.screen();
+    let screen = parser.screen();
+    let buf = f.buffer_mut();
+    for row in 0..inner.height {
+        for col in 0..inner.width {
+            let Some(cell) = screen.cell(row, col) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut style = Style::new()
+                .fg(term_color(cell.fgcolor()))
+                .bg(term_color(cell.bgcolor()));
+            for (on, m) in [
+                (cell.bold(), Modifier::BOLD),
+                (cell.dim(), Modifier::DIM),
+                (cell.italic(), Modifier::ITALIC),
+                (cell.underline(), Modifier::UNDERLINED),
+                (cell.inverse(), Modifier::REVERSED),
+            ] {
+                if on {
+                    style = style.add_modifier(m);
+                }
+            }
+            let text = if cell.has_contents() { cell.contents() } else { " " };
+            buf[(inner.x + col, inner.y + row)].set_symbol(text).set_style(style);
+        }
+    }
+    if focused && !screen.hide_cursor() && screen.scrollback() == 0 {
+        let (row, col) = screen.cursor_position();
+        if row < inner.height && col < inner.width {
+            f.set_cursor_position((inner.x + col, inner.y + row));
+        }
+    }
+}
+
+fn term_color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let key = |k: &'static str| Span::styled(k, Style::new().fg(Color::Cyan));
+    let text = |t: &'static str| Span::styled(t, Style::new().fg(C_DIM));
+    if let Some(n) = &app.notice {
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" {n}"), Style::new().fg(C_MODIFIED))),
+            details,
+        );
+    }
+    if app.shell_focus {
+        let line = Line::from(vec![
+            Span::raw(" "),
+            key("Ctrl-]"),
+            text(" back to canopy  "),
+            key("exit"),
+            text(" close the shell  "),
+            text("keys go to the shell"),
+        ]);
+        f.render_widget(Paragraph::new(line), hints);
+        return;
+    }
     let line = match app.focus {
         Focus::Worktrees => app.selected_worktree().map(|w| worktree_details(w, app.snap.watching)),
         Focus::Graph => graph_details(app),
     };
-    if let Some(e) = &app.snap.error {
+    if app.notice.is_some() {
+        // Shown above instead of the details.
+    } else if let Some(e) = &app.snap.error {
         let msg = format!(" {}", e.lines().next().unwrap_or(""));
         f.render_widget(Paragraph::new(Span::styled(msg, Style::new().fg(C_CONFLICT))), details);
     } else if let Some(mut line) = line {
@@ -1289,8 +1411,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(line), details);
     }
 
-    let key = |k: &'static str| Span::styled(k, Style::new().fg(Color::Cyan));
-    let text = |t: &'static str| Span::styled(t, Style::new().fg(C_DIM));
     let left = Line::from(vec![
         Span::raw(" "),
         key("↑↓"),
@@ -1327,7 +1447,9 @@ const HELP: &[(&str, &str)] = &[
     ("Enter  dbl-click", "full diff view"),
     ("Tab", "switch panel"),
     ("v", "stacked / side-by-side layout"),
-    ("a", "jump to the worktree's agent in herdr"),
+    ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
+    ("s  dbl-click path", "shell in the worktree (popup or inset)"),
+    ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("r", "refresh now"),
     ("?", "toggle this help"),
     ("q  Ctrl-C", "quit"),
