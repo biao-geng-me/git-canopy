@@ -1,0 +1,107 @@
+# canopy
+
+A live-updating TUI that shows every git worktree of a repo at a glance — the view from above the trees.
+
+## Why it exists
+
+In agentic development many agents work in parallel, each in its own linked worktree. You lose track of
+what each tree is doing. Re-running `git log --oneline --graph --all` plus `git status` in every worktree
+is tedious, and neither command shows the whole picture.
+
+Existing tools each cover a piece, none covers the whole:
+- gwq / lazyworktree / worktrunk: worktree table with dirty + ahead/behind, but no commit graph.
+- keifu / gwm-cli: graph with an "uncommitted" row, but single worktree or manual refresh.
+- lazygit: worktree panel without dirty state, 10s polling, graph not annotated per worktree.
+- herdr (the multiplexer the author uses): sidebar shows only branch + ahead/behind.
+
+**canopy's unique core:** an `--all` commit graph where each worktree's HEAD is labelled and gets a
+synthetic "uncommitted changes" node when dirty, kept live automatically, with diffs one keypress away.
+
+This is not another general git client. No staging, committing, rebasing, etc. Read-only monitoring.
+
+## Requirements
+
+- **Self-contained:** single static binary; the only runtime dependency is the `git` executable.
+  Shell out to git — no libgit2/gix. (Matches whatever the user's git sees, config included.)
+- **Fast:** startup feels instant on repos with thousands of commits and ~10–20 worktrees; refresh never
+  blocks input.
+- **Overview first, details on demand:** the main screen answers "what is every tree doing, and which are
+  dirty?" Drill-down (diff, full commit message) via keyboard and mouse.
+- **Never interfere with agents:** every git invocation uses `--no-optional-locks` (or
+  `GIT_OPTIONAL_LOCKS=0`) so `status` never grabs `index.lock` while an agent commits. Never write to the repo.
+
+## Stack
+
+Rust + ratatui + crossterm. Keep dependencies lean (ratatui, crossterm, notify for fs events, maybe
+anyhow). No async runtime unless clearly needed — threads + channels are fine.
+
+Crate name `git-canopy` (crates.io `canopy` is taken); binary `canopy`. Also usable as `git canopy` via a
+`git-canopy` symlink/copy on PATH.
+
+## Target layout
+
+```
+┌ worktrees ────────────────┬ graph (all branches) ─────────────────────┐
+│ ● main         ↓2   clean │ ◌ [feat-auth]  +3 ~2 ?1  uncommitted      │
+│ ✎ feat-auth    +3 ~2 ?1   │ * a1b2 (feat-auth) add token refresh      │
+│ ✎ fix-parser   ~1         │ │ ◌ [fix-parser]  ~1                      │
+│ ● refactor-db  ↑4         │ │ * c3d4 (fix-parser) handle eof          │
+│                           │ |/                                        │
+│                           │ * 9f8e (main) merge #12                   │
+└───────────────────────────┴───────────────────────────────────────────┘
+ Enter: diff (commit or worktree)   Tab: switch focus   q: quit
+```
+
+- Left: one row per worktree — dirty marker, branch (or detached sha), staged/modified/untracked counts,
+  ahead/behind vs upstream and/or vs the main branch. Selecting a worktree jumps the graph to its HEAD.
+- Right: graph of all refs, newest first, with lanes drawn in box/unicode characters. Worktree HEADs are
+  labelled `[name]`; dirty worktrees get a `◌` pseudo-row above their HEAD.
+- Enter on a commit → `git show --stat -p`; on a `◌` row or dirty worktree → working-tree diff
+  (`git diff HEAD` + untracked files listed/shown). Scrollable diff view with basic +/- coloring, Esc back.
+- Mouse: click to select, wheel to scroll.
+
+## Git facts to build on (git ≥ 2.43 on the dev machine)
+
+- `git worktree list --porcelain -z` → worktree path, HEAD, branch, detached/locked/prunable.
+- `git -C <wt> --no-optional-locks status --porcelain=v2 --branch -z` → `# branch.oid/head/upstream/ab`
+  headers + entries (`1`/`2` changed, `u` unmerged, `?` untracked).
+- `git for-each-ref --format='%(refname) %(objectname) %(worktreepath) %(upstream:track)'`;
+  `%(ahead-behind:<ref>)` exists since git 2.41.
+- Graph: build lanes yourself from `git log --all --topo-order -z --format=%H%x00%P%x00%D%x00%an%x00%at%x00%s`
+  (cap the count, e.g. 1000, lazily load more). lazygit's `pkg/gui/presentation/graph` is a good reference
+  for the pipe/lane algorithm.
+- Commit diff: `git show --stat -p <sha>`. Worktree diff: `git -C <wt> diff HEAD` plus
+  `git -C <wt> ls-files --others --exclude-standard`.
+
+## Refresh strategy
+
+Editing a file does NOT touch `.git`, so watching `.git` alone misses new dirty state. Combine:
+1. fs watch (notify crate) on the common git dir (`git rev-parse --git-common-dir`): `refs/`,
+   `packed-refs`, `HEAD`, and each linked worktree's admin dir `<common>/worktrees/<name>/` (its `HEAD`,
+   `index`). Watch directories, not files (git writes via `*.lock` + rename); ignore `*.lock`; debounce
+   ~150ms. On event → reload refs/graph and the affected worktree's status.
+2. Poll `status` per worktree every ~1.5s (configurable) on a background thread for working-tree edits.
+   Run status calls in parallel with a small bound.
+3. Fallback to pure polling if watching fails (e.g. WSL2 repos under `/mnt/c` where inotify doesn't fire).
+   The dev machine is WSL2.
+One shared cache per common dir; don't redo graph work when refs haven't changed (fingerprint refs).
+UI thread only renders snapshots received over a channel.
+
+## Milestones
+
+1. Scaffold: cargo project, module layout (git layer / model / ui / watch), CI-free `cargo test` setup,
+   a `scripts/mkfixture.sh` that builds a throwaway repo with several worktrees in various states
+   (clean, dirty, ahead, detached, untracked-only) under a temp dir for manual and automated testing.
+2. Git layer + model: parse worktree list, status v2, log; unit tests on captured outputs.
+3. Worktree panel + live refresh (poll first, then fs watch).
+4. Graph with lane rendering, worktree labels, dirty pseudo-rows.
+5. Diff view for commits and worktrees.
+6. Polish: mouse, resize, help popup (`?`), `canopy [path]` arg, `--interval`, graceful non-repo error.
+7. (Later, not now) herdr plugin: `herdr-plugin.toml` with a popup pane running canopy and a startup
+   poller that sets a per-workspace `$wt_dirty` sidebar token via `herdr workspace report-metadata`.
+
+## Conventions
+
+- Commit after each milestone (small, descriptive messages). No remote is configured; don't push.
+- Keep `cargo clippy` clean and `cargo test` green.
+- README.md for users; this file for design intent — update it when design decisions change.
