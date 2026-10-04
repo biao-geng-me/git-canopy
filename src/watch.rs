@@ -107,8 +107,8 @@ struct Worker {
     fingerprint: u64,
     base: Option<String>,
     ab_cache: HashMap<(String, String), (u32, u32)>,
-    /// Commit time and subject per HEAD sha.
-    head_cache: HashMap<String, (i64, String)>,
+    /// Commit time per HEAD sha.
+    head_cache: HashMap<String, i64>,
 
     limit: usize,
     commits: Arc<Vec<Commit>>,
@@ -386,14 +386,13 @@ impl Worker {
             self.head_cache.clear();
         }
         if let Ok(described) = git::log::describe(&dir, &missing) {
-            for (id, time, subject) in described {
-                self.head_cache.insert(id, (time, subject));
+            for (id, time, _) in described {
+                self.head_cache.insert(id, time);
             }
         }
         for v in &mut views {
-            if let Some((time, subject)) = v.head.as_ref().and_then(|h| self.head_cache.get(h)) {
+            if let Some(time) = v.head.as_ref().and_then(|h| self.head_cache.get(h)) {
                 v.head_time = Some(*time);
-                v.head_subject = Some(subject.clone());
             }
         }
         self.worktrees = views;

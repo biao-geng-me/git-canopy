@@ -147,19 +147,24 @@ UI thread only renders snapshots received over a channel.
   column (≥ 100 cols). `v` / `--layout side` switches to side-by-side; narrow terminals (< 72 cols)
   always stack. The worktree panel takes the height it needs, up to half the screen. Paths are shown
   relative to the worktrees' common parent directory.
-- **Insets (expand in place):** both panels are flat lists of visual lines (`ui/inset.rs`): base rows
-  plus, for open rows, the commit message body, one line per file, and for open files their diff
+- **Insets (expand in place), graph only:** the graph is a flat list of visual lines (`ui/inset.rs`):
+  base rows plus, for open rows, the subject's wrapped continuation lines (aligned under the subject,
+  which is not truncated while open), the message body wrapped to the panel width, one line per
+  file, and for open files their diff
   from the first hunk (max 200 lines, then "… n more"). The cursor moves over every visual line
   (magit-style). Space/click toggles a row or file; Space/← inside a diff folds the enclosing section;
   Enter/double-click opens the full view at that file/line (a double-click undoes its first click's
-  toggle). Expansion state is per panel, keyed by row identity (commit sha / worktree path); docs are
+  toggle); Esc folds the row under the cursor (or everything). Wrapping is recomputed when the graph
+  width changes (`App::set_wrap_width`, called from render). The worktree panel doesn't expand
+  (decided after trying it: the graph's `◌` rows cover it with more room). Expansion is keyed by row
+  identity (commit sha / worktree path); docs are
   cached per target (commit docs forever, capped; worktree docs keyed by status + last-edit stamp,
   reloaded while shown, dropped otherwise). Graph insets keep drawing the lanes passing by
   (`Row::below`). The cursor is relocated by line identity when refreshes change lines above it.
 - **Last edited** = newest mtime among the paths `git status` reports as changed (first 256), so an
   agent still writing to an already-modified file shows up, and open worktree diffs reload on it.
-- **HEAD subjects** for worktree rows come from one `git log --no-walk=unsorted` over the HEAD shas,
-  cached by sha (refetched only when refs change).
+- **Worktree rows show HEAD sha + age, not the subject** (the graph has it). HEAD commit times come
+  from one `git log --no-walk=unsorted` over the HEAD shas, cached by sha.
 - **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width.
   ratatui is used with default features off (`crossterm`, `layout-cache`) and its crossterm re-export.
 - **Static binary:** the default glibc build links libc dynamically; `--target x86_64-unknown-linux-musl`

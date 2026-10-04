@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
-use super::{App, Focus, LayoutMode};
+use super::{App, Focus, InsetText, LayoutMode};
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::model::WorktreeView;
 
@@ -340,7 +340,7 @@ fn wt_line(
         return Line::from(spans);
     }
 
-    // Wide rows: last edit, HEAD commit (sha, age, subject), path on the right.
+    // Wide rows: last edit, HEAD commit (sha, age), path on the right.
     let activity = activity_text(w, now).unwrap_or_default();
     if cols.activity > 0 {
         spans.push(Span::styled(pad(activity, cols.activity), Style::new().fg(C_MODIFIED)));
@@ -349,20 +349,16 @@ fn wt_line(
     let used = spans_width(&spans);
     let path = truncate_left(shown_path, cols.path);
     let room = width.saturating_sub(used + cols.path + 2);
-    if let Some(h) = &w.head {
-        let mut head = vec![
-            Span::styled(h[..h.len().min(7)].to_string(), Style::new().fg(Color::Yellow)),
-            Span::styled(
-                format!(" {:>3} ", w.head_time.map(|t| age(t, now)).unwrap_or_default()),
-                dim,
-            ),
-        ];
-        let subject_room = room.saturating_sub(spans_width(&head));
-        if room > 12 {
-            let subject = w.head_subject.clone().unwrap_or_default();
-            head.push(Span::raw(truncate(&subject, subject_room)));
-            spans.extend(head);
-        }
+    // HEAD commit: sha and age (its subject is in the graph).
+    if let Some(h) = &w.head
+        && room > 12
+    {
+        spans.push(Span::styled(
+            h[..h.len().min(7)].to_string(),
+            Style::new().fg(Color::Yellow),
+        ));
+        let head_age = w.head_time.map(|t| age(t, now)).unwrap_or_default();
+        spans.push(Span::styled(format!(" {head_age:>3}"), dim));
     }
     let used = spans_width(&spans);
     if cols.path > 0 && used + 2 + path.width() <= width {
@@ -387,6 +383,7 @@ fn inset_spans(app: &App, f: Focus, r: usize, item: Item) -> Vec<Span<'static>> 
             vec![Span::styled(msg, Style::new().fg(C_CONFLICT))]
         }
         Item::Empty => vec![Span::styled("no changes", dim)],
+        Item::Subject(_) => vec![],
         Item::Message(i) => {
             let text = entry.and_then(|e| e.message.get(i)).cloned().unwrap_or_default();
             vec![Span::styled(text, dim.add_modifier(Modifier::ITALIC))]
@@ -582,61 +579,116 @@ fn cells_spans(cells: &[graph::Cell]) -> Vec<Span<'static>> {
 const AUTHOR_MIN_WIDTH: usize = 100;
 const AUTHOR_MAX: usize = 18;
 
-fn graph_line(app: &App, row: &Row, now: i64, width: usize) -> Line<'static> {
+/// Columns available for the subject on a commit row whose prefix is `prefix` wide.
+fn subject_room(prefix: usize, width: usize) -> usize {
+    let author = if width >= AUTHOR_MIN_WIDTH { AUTHOR_MAX + 2 } else { 0 };
+    width.saturating_sub(prefix + author)
+}
+
+/// Everything on a commit row before the subject: lanes, sha, age, labels.
+fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>> {
     let g = &app.snap.graph;
+    let c = &g.commits[ci];
+    let dim = Style::new().fg(C_DIM);
     let mut spans = cells_spans(&row.cells);
     spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        c.id[..c.id.len().min(7)].to_string(),
+        Style::new().fg(Color::Yellow),
+    ));
+    spans.push(Span::styled(format!(" {:>3} ", age(c.time, now)), dim));
+    let mut refs: Vec<Span> = Vec::new();
+    for l in &g.labels[ci] {
+        match l.kind {
+            LabelKind::Worktree => {
+                spans.push(worktree_label(&l.text));
+                spans.push(Span::raw(" "));
+            }
+            kind => {
+                let (text, color) = match kind {
+                    LabelKind::Branch => (l.text.clone(), Color::Green),
+                    LabelKind::Remote => (l.text.clone(), Color::Red),
+                    _ => (format!("tag: {}", l.text), Color::Yellow),
+                };
+                if !refs.is_empty() {
+                    refs.push(Span::styled(", ", dim));
+                }
+                refs.push(Span::styled(text, Style::new().fg(color)));
+            }
+        }
+    }
+    if !refs.is_empty() {
+        spans.push(Span::styled("(", dim));
+        spans.extend(refs);
+        spans.push(Span::styled(") ", dim));
+    }
+    spans
+}
+
+/// Column where inset content starts under graph row `row`.
+fn inset_col(row: &Row) -> usize {
+    row.cells.len().max(row.below.len()) + 2
+}
+
+/// Wrapped subject and message of graph row `r` for a panel `width` wide (`None` before the
+/// first render, when the width is unknown).
+pub(super) fn inset_text(app: &App, r: usize, width: usize) -> Option<InsetText> {
+    if width == 0 {
+        return None;
+    }
+    let g = &app.snap.graph;
+    let row = g.rows.get(r)?;
+    let (subject_col, subject) = match row.kind {
+        RowKind::Commit(ci) => {
+            let col = spans_width(&commit_prefix(app, row, ci, now_secs()));
+            let room = subject_room(col, width);
+            (
+                col,
+                inset::wrap(&g.commits[ci].subject, room, width.saturating_sub(col)),
+            )
+        }
+        RowKind::Uncommitted(_) => (0, Vec::new()),
+    };
+    let body = width.saturating_sub(inset_col(row));
+    let message = app
+        .row_doc(Focus::Graph, r)
+        .filter(|e| e.doc.is_some())
+        .map(|e| e.message.iter().flat_map(|l| inset::wrap(l, body, body)).collect());
+    Some(InsetText {
+        subject_col,
+        subject,
+        message,
+    })
+}
+
+fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
+    let g = &app.snap.graph;
+    let row = &g.rows[r];
     match row.kind {
         RowKind::Commit(ci) => {
             let c = &g.commits[ci];
-            spans.push(Span::styled(
-                c.id[..c.id.len().min(7)].to_string(),
-                Style::new().fg(Color::Yellow),
-            ));
-            spans.push(Span::styled(
-                format!(" {:>3} ", age(c.time, now)),
-                Style::new().fg(C_DIM),
-            ));
-            let labels = &g.labels[ci];
-            let mut refs: Vec<Span> = Vec::new();
-            for l in labels {
-                match l.kind {
-                    LabelKind::Worktree => {
-                        spans.push(worktree_label(&l.text));
-                        spans.push(Span::raw(" "));
-                    }
-                    kind => {
-                        let (text, color) = match kind {
-                            LabelKind::Branch => (l.text.clone(), Color::Green),
-                            LabelKind::Remote => (l.text.clone(), Color::Red),
-                            _ => (format!("tag: {}", l.text), Color::Yellow),
-                        };
-                        if !refs.is_empty() {
-                            refs.push(Span::styled(", ", Style::new().fg(C_DIM)));
-                        }
-                        refs.push(Span::styled(text, Style::new().fg(color)));
-                    }
-                }
-            }
-            if !refs.is_empty() {
-                spans.push(Span::styled("(", Style::new().fg(C_DIM)));
-                spans.extend(refs);
-                spans.push(Span::styled(") ", Style::new().fg(C_DIM)));
-            }
+            let mut spans = commit_prefix(app, row, ci, now);
+            // An open row wraps its subject onto continuation lines; otherwise it is truncated.
+            let subject = match app.graph.texts.get(&r).and_then(|t| t.subject.first()) {
+                Some(first) => first.clone(),
+                None if width >= AUTHOR_MIN_WIDTH => truncate(&c.subject, subject_room(spans_width(&spans), width)),
+                None => c.subject.clone(),
+            };
             if width >= AUTHOR_MIN_WIDTH {
                 // Subject, then the author right-aligned.
                 let author = truncate(&c.author, AUTHOR_MAX);
-                let room = width.saturating_sub(spans_width(&spans) + AUTHOR_MAX + 2);
-                let subject = truncate(&c.subject, room);
                 let gap = width.saturating_sub(spans_width(&spans) + subject.width() + author.width());
                 spans.push(Span::raw(subject));
                 spans.push(Span::raw(" ".repeat(gap)));
                 spans.push(Span::styled(author, Style::new().fg(C_DIM)));
             } else {
-                spans.push(Span::raw(c.subject.clone()));
+                spans.push(Span::raw(subject));
             }
+            Line::from(spans)
         }
         RowKind::Uncommitted(wi) => {
+            let mut spans = cells_spans(&row.cells);
+            spans.push(Span::raw(" "));
             if let Some(w) = app.snap.worktrees.get(wi) {
                 spans.push(worktree_label(&w.name));
                 spans.push(Span::raw(" "));
@@ -646,9 +698,9 @@ fn graph_line(app: &App, row: &Row, now: i64, width: usize) -> Line<'static> {
                     Style::new().fg(C_DIM).add_modifier(Modifier::ITALIC),
                 ));
             }
+            Line::from(spans)
         }
     }
-    Line::from(spans)
 }
 
 fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
@@ -672,6 +724,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    app.set_wrap_width(inner.width as usize);
     let len = app.graph.lines.len();
     if let Some(path) = app.graph_jump.take()
         && let Some(&row) = g.worktree_row.get(&path)
@@ -703,14 +756,26 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = visible
         .into_iter()
         .map(|l| match l {
-            VLine::Row(r) => graph_line(app, &g.rows[r], now, width),
+            VLine::Row(r) => graph_line(app, r, now, width),
             VLine::Inset(r, item) => {
                 // Keep drawing the lanes that pass by, then the inset content.
                 let row = &g.rows[r];
-                let indent = row.cells.len().max(row.below.len()) + 1;
+                let text = app.graph.texts.get(&r);
+                let (col, content) = match (item, text) {
+                    (Item::Subject(k), Some(t)) => {
+                        let line = t.subject.get(k).cloned().unwrap_or_default();
+                        (t.subject_col, vec![Span::raw(line)])
+                    }
+                    (Item::Message(i), Some(InsetText { message: Some(m), .. })) => {
+                        let line = m.get(i).cloned().unwrap_or_default();
+                        let style = Style::new().fg(C_DIM).add_modifier(Modifier::ITALIC);
+                        (inset_col(row), vec![Span::styled(line, style)])
+                    }
+                    _ => (inset_col(row), inset_spans(app, Focus::Graph, r, item)),
+                };
                 let mut spans = cells_spans(&row.below);
-                spans.push(Span::raw(" ".repeat(indent - row.below.len() + 1)));
-                spans.extend(inset_spans(app, Focus::Graph, r, item));
+                spans.push(Span::raw(" ".repeat(col.saturating_sub(row.below.len()))));
+                spans.extend(content);
                 Line::from(spans)
             }
         })
@@ -1125,6 +1190,7 @@ const HELP: &[(&str, &str)] = &[
     ("g G  Home End", "first / last"),
     ("Space  click", "expand / collapse row or file"),
     ("→ l  ← h", "expand / collapse"),
+    ("Esc", "fold back to the row (again: fold all)"),
     ("Enter  dbl-click", "full diff view"),
     ("Tab", "switch panel"),
     ("v", "stacked / side-by-side layout"),

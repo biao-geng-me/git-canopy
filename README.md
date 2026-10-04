@@ -18,11 +18,12 @@ tree doing, and which ones are dirty?" on one screen:
 - **Worktrees** (bottom): one row per worktree: state marker, branch (or directory name when detached),
   staged `+`, modified `~`, untracked `?` and conflicted `!` counts, ahead/behind the base branch `↑↓`
   and the upstream `⇡⇣`, in-progress operations (`MERGING`, `REBASING`, …), when its changed files
-  were last edited, its HEAD commit (sha, age, subject) and its path.
+  were last edited, its HEAD commit (sha, age) and its path.
 - **Graph** (top): the commit graph of all branches, remotes and tags, with authors. Each worktree's
   HEAD is labelled `[name]`, and a dirty worktree gets a `◌` "uncommitted" row right above its HEAD.
-- **Expand in place:** `Space` (or a click) on a commit or worktree unfolds its changed files right
-  there; `Space` on a file unfolds its diff. `Enter` (or a double-click) opens the full diff view.
+- **Expand in place** (graph): `Space` (or a click) on a commit or a `◌` row unfolds its full
+  subject and message (wrapped) and its changed files right there; `Space` on a file unfolds its diff.
+  `Esc` folds back. `Enter` (or a double-click) opens the full diff view.
 - **Layout:** stacked by default; `v` (or `--layout side`) puts the worktrees beside the graph.
 - **Live:** status is polled every 1.5s, and changes to refs, HEADs and indexes are picked up via file
   system events within ~150ms. Refreshing never blocks the UI.
@@ -63,8 +64,9 @@ git canopy [OPTIONS] [PATH]
 | --- | --- |
 | `↑` `↓` / `j` `k` | move, through expanded lines too (selecting a worktree jumps the graph to it) |
 | `PgUp` `PgDn`, `Ctrl-u` `Ctrl-d`, `g` `G` | page, half page, first, last |
-| `Space`, click | expand / collapse a commit or worktree (its files), or a file (its diff) |
+| `Space`, click | graph: expand / collapse a commit or `◌` row (message, files), or a file (its diff) |
 | `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
+| `Esc` | fold the expansion under the cursor back to its row (on a folded row: fold everything) |
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
 | `Tab` | switch between the graph and the worktree list |
 | `v` | stacked / side-by-side layout |

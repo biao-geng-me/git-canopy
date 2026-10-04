@@ -26,7 +26,9 @@ pub enum Item {
     Error,
     /// Nothing changed (e.g. a clean worktree that was dirty when expanded).
     Empty,
-    /// Line `i` of the commit message body.
+    /// Continuation line `i` (≥ 1) of a wrapped commit subject.
+    Subject(usize),
+    /// Line `i` of the (wrapped) commit message body.
     Message(usize),
     /// File `i` of the doc.
     File(usize),
@@ -160,26 +162,39 @@ pub fn diff_start(file: &FileDiff) -> usize {
         .unwrap_or(1.min(file.lines.len()))
 }
 
-/// The visual lines of a panel with `n` base rows. `opened` lists the open rows as
-/// `(row index, row key, target key)`.
-pub fn build(n: usize, opened: &[(usize, Key, Key)], exp: &Expansion, docs: &HashMap<Key, Entry>) -> Vec<VLine> {
-    let insets: BTreeMap<usize, (&Key, &Key)> = opened.iter().map(|(r, rk, tk)| (*r, (rk, tk))).collect();
+/// An open row of a panel.
+#[derive(Clone, Debug)]
+pub struct Open {
+    pub row: usize,
+    pub row_key: Key,
+    pub target: Key,
+    /// Lines the wrapped subject takes (the first is on the row itself).
+    pub subject_lines: usize,
+    /// Lines the wrapped message body takes; `None` = one per message line.
+    pub message_lines: Option<usize>,
+}
+
+/// The visual lines of a panel with `n` base rows and the given open rows.
+pub fn build(n: usize, opened: &[Open], exp: &Expansion, docs: &HashMap<Key, Entry>) -> Vec<VLine> {
+    let insets: BTreeMap<usize, &Open> = opened.iter().map(|o| (o.row, o)).collect();
     let mut out = Vec::with_capacity(n + insets.len() * 8);
     let mut next = 0;
-    for (&r, &(rk, tk)) in &insets {
+    for (&r, &open) in &insets {
         if r >= n {
             break;
         }
         out.extend((next..=r).map(VLine::Row));
         next = r + 1;
-        inset_lines(r, rk, docs.get(tk), exp, &mut out);
+        inset_lines(open, docs.get(&open.target), exp, &mut out);
     }
     out.extend((next..n).map(VLine::Row));
     out
 }
 
-fn inset_lines(r: usize, rk: &Key, entry: Option<&Entry>, exp: &Expansion, out: &mut Vec<VLine>) {
+fn inset_lines(open: &Open, entry: Option<&Entry>, exp: &Expansion, out: &mut Vec<VLine>) {
+    let (r, rk) = (open.row, &open.row_key);
     let item = |i| VLine::Inset(r, i);
+    out.extend((1..open.subject_lines).map(|i| item(Item::Subject(i))));
     let Some(entry) = entry else {
         out.push(item(Item::Loading));
         return;
@@ -189,8 +204,9 @@ fn inset_lines(r: usize, rk: &Key, entry: Option<&Entry>, exp: &Expansion, out: 
         Some(Err(_)) => return out.push(item(Item::Error)),
         Some(Ok(doc)) => doc,
     };
-    out.extend((0..entry.message.len()).map(|i| item(Item::Message(i))));
-    if doc.files.is_empty() && entry.message.is_empty() {
+    let message_lines = open.message_lines.unwrap_or(entry.message.len());
+    out.extend((0..message_lines).map(|i| item(Item::Message(i))));
+    if doc.files.is_empty() && message_lines == 0 {
         out.push(item(Item::Empty));
     }
     for (fi, f) in doc.files.iter().enumerate() {
@@ -204,6 +220,38 @@ fn inset_lines(r: usize, rk: &Key, entry: Option<&Entry>, exp: &Expansion, out: 
             }
         }
     }
+}
+
+/// Word-wrap `text`: the first line gets `first` columns, the rest `rest`. Words longer than a
+/// line are split.
+pub fn wrap(text: &str, first: usize, rest: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let mut lines = vec![String::new()];
+    let limit = |n: usize| if n == 1 { first.max(1) } else { rest.max(1) };
+    for word in text.split(' ') {
+        let max = limit(lines.len());
+        let cur = lines.last_mut().unwrap();
+        let sep = usize::from(!cur.is_empty());
+        if cur.width() + sep + word.width() <= max {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(String::new());
+        }
+        for c in word.chars() {
+            let n = lines.len();
+            let cur = lines.last_mut().unwrap();
+            if cur.width() + c.width().unwrap_or(0) > limit(n) {
+                lines.push(String::new());
+            }
+            lines.last_mut().unwrap().push(c);
+        }
+    }
+    lines
 }
 
 /// Position of base row `r` in `lines` (lines are ordered by row).
@@ -274,7 +322,14 @@ mod tests {
         exp.toggle_file(&k, "b");
         let mut docs = HashMap::new();
         docs.insert(k.clone(), entry(vec![file("a", 1), file("b", MAX_INLINE + 5)]));
-        let lines = build(3, &[(1, k.clone(), k.clone())], &exp, &docs);
+        let open = |row: usize, target: Key| Open {
+            row,
+            row_key: k.clone(),
+            target,
+            subject_lines: 1,
+            message_lines: None,
+        };
+        let lines = build(3, &[open(1, k.clone())], &exp, &docs);
         assert_eq!(lines[0], VLine::Row(0));
         assert_eq!(lines[1], VLine::Row(1));
         assert_eq!(lines[2], VLine::Inset(1, Item::Message(0)));
@@ -287,7 +342,33 @@ mod tests {
         assert_eq!(index_of_row(&lines, 1), Some(1));
 
         // Not loaded yet.
-        let lines = build(2, &[(0, k.clone(), Key::Commit("other".into()))], &exp, &docs);
+        let lines = build(2, &[open(0, Key::Commit("other".into()))], &exp, &docs);
         assert_eq!(lines, [VLine::Row(0), VLine::Inset(0, Item::Loading), VLine::Row(1)]);
+
+        // A wrapped subject puts its continuation lines first; wrapped message line counts win.
+        let o = Open {
+            subject_lines: 3,
+            message_lines: Some(2),
+            ..open(0, k.clone())
+        };
+        let lines = build(1, &[o], &Expansion::default(), &docs);
+        assert_eq!(
+            lines[..5],
+            [
+                VLine::Row(0),
+                VLine::Inset(0, Item::Subject(1)),
+                VLine::Inset(0, Item::Subject(2)),
+                VLine::Inset(0, Item::Message(0)),
+                VLine::Inset(0, Item::Message(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_words() {
+        assert_eq!(wrap("fix the parser for eof", 10, 20), ["fix the", "parser for eof"]);
+        assert_eq!(wrap("short", 10, 10), ["short"]);
+        assert_eq!(wrap("abcdefghij", 4, 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("", 5, 5), [""]);
     }
 }

@@ -34,8 +34,7 @@ pub struct WorktreeView {
     pub op: Option<&'static str>,
     /// (ahead, behind) relative to the base branch.
     pub vs_base: Option<(u32, u32)>,
-    /// HEAD commit's subject and commit time (unix seconds).
-    pub head_subject: Option<String>,
+    /// HEAD commit time (unix seconds).
     pub head_time: Option<i64>,
     /// Newest modification time (unix seconds) among the changed files: "last edited".
     pub changed_at: Option<i64>,

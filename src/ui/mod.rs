@@ -30,7 +30,7 @@ use crate::graph::RowKind;
 use crate::model::Snapshot;
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
-use inset::{Entry, Expansion, Item, Key, VLine};
+use inset::{Entry, Expansion, Item, Key, Open, VLine};
 
 pub enum UiMsg {
     Input(Event),
@@ -116,6 +116,19 @@ pub struct Panel {
     pub pos: ListPos,
     pub exp: Expansion,
     pub lines: Vec<VLine>,
+    /// Wrapped subject and message text of open rows, laid out for the panel width.
+    pub texts: HashMap<usize, InsetText>,
+}
+
+/// Wrapped text of an open graph row.
+#[derive(Clone, Debug, Default)]
+pub struct InsetText {
+    /// Column where the subject starts (continuation lines align to it).
+    pub subject_col: usize,
+    /// The subject: the first line goes on the row, the rest on continuation lines.
+    pub subject: Vec<String>,
+    /// The message body wrapped to the inset width, once loaded.
+    pub message: Option<Vec<String>>,
 }
 
 /// Identity of a visual line, stable across refreshes (for keeping the cursor in place).
@@ -127,6 +140,7 @@ struct LineId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ItemId {
+    Subject(usize),
     Message(usize),
     File(String),
     Diff(String, usize),
@@ -157,6 +171,8 @@ pub struct App {
     pub help: bool,
     pub quit: bool,
     pub areas: Areas,
+    /// Graph width the open rows' text was wrapped for.
+    pub wrap_width: usize,
     next_id: u64,
     tx: Sender<UiMsg>,
     last_click: Option<Click>,
@@ -180,6 +196,7 @@ impl App {
             help: false,
             quit: false,
             areas: Areas::default(),
+            wrap_width: 0,
             next_id: 0,
             tx,
             last_click: None,
@@ -265,28 +282,76 @@ impl App {
     // Visual lines
 
     /// Rebuild both panels' visual lines, requesting docs for newly opened rows.
+    /// Only the graph expands; the worktree panel is a plain list.
     fn rebuild(&mut self) {
-        for f in [Focus::Worktrees, Focus::Graph] {
-            let n = match f {
-                Focus::Worktrees => self.snap.worktrees.len(),
-                Focus::Graph => self.snap.graph.rows.len(),
-            };
-            let opened: Vec<(usize, Key, Key)> = self
-                .panel(f)
-                .exp
-                .keys()
-                .filter_map(|k| {
-                    let r = self.row_of(f, k)?;
-                    Some((r, k.clone(), self.target(f, r)?))
-                })
-                .collect();
-            for (_, _, target) in &opened {
-                self.request_doc(target);
+        let wt = &mut self.wt;
+        wt.lines = (0..self.snap.worktrees.len()).map(VLine::Row).collect();
+        wt.pos.clamp(wt.lines.len());
+
+        let f = Focus::Graph;
+        let mut texts = HashMap::new();
+        let opened: Vec<Open> = self
+            .graph
+            .exp
+            .keys()
+            .filter_map(|k| {
+                let row = self.row_of(f, k)?;
+                let text = render::inset_text(self, row, self.wrap_width);
+                let open = Open {
+                    row,
+                    row_key: k.clone(),
+                    target: self.target(f, row)?,
+                    subject_lines: text.as_ref().map_or(1, |t| t.subject.len().max(1)),
+                    message_lines: text.as_ref().and_then(|t| t.message.as_ref().map(Vec::len)),
+                };
+                if let Some(t) = text {
+                    texts.insert(row, t);
+                }
+                Some(open)
+            })
+            .collect();
+        for o in &opened {
+            self.request_doc(&o.target);
+        }
+        let lines = inset::build(self.snap.graph.rows.len(), &opened, &self.graph.exp, &self.docs);
+        let p = &mut self.graph;
+        p.lines = lines;
+        p.texts = texts;
+        p.pos.clamp(p.lines.len());
+    }
+
+    /// Re-wrap open rows for a new graph width, keeping the cursor on the same line.
+    pub(super) fn set_wrap_width(&mut self, width: usize) {
+        if width != self.wrap_width {
+            self.wrap_width = width;
+            let id = self.line_id(Focus::Graph);
+            self.rebuild();
+            self.relocate(Focus::Graph, id);
+        }
+    }
+
+    /// Esc: fold the expansion around the cursor (back to its row), or every expansion.
+    fn fold_row(&mut self, f: Focus) {
+        let sel = self.panel(f).pos.sel;
+        let Some(&line) = self.panel(f).lines.get(sel) else {
+            return;
+        };
+        let row = line.row();
+        match self.row_key(f, row) {
+            Some(k) if self.panel(f).exp.is_open(&k) => {
+                let header = inset::index_of_row(&self.panel(f).lines, row);
+                self.panel_mut(f).exp.close(&k);
+                if let Some(h) = header {
+                    self.set_cursor(f, h);
+                }
             }
-            let lines = inset::build(n, &opened, &self.panel(f).exp, &self.docs);
-            let p = self.panel_mut(f);
-            p.lines = lines;
-            p.pos.clamp(p.lines.len());
+            _ => {
+                let id = self.line_id(f);
+                self.panel_mut(f).exp = Expansion::default();
+                self.rebuild();
+                self.relocate(f, id);
+                self.panel_mut(f).pos.follow = true;
+            }
         }
     }
 
@@ -297,6 +362,7 @@ impl App {
         let item = match line {
             VLine::Row(_) => None,
             VLine::Inset(r, item) => Some(match item {
+                Item::Subject(i) => ItemId::Subject(i),
                 Item::Message(i) => ItemId::Message(i),
                 Item::File(fi) => ItemId::File(self.file_path(f, r, fi)?),
                 Item::Diff(fi, li) => ItemId::Diff(self.file_path(f, r, fi)?, li),
@@ -330,6 +396,7 @@ impl App {
                 .find(|&i| {
                     let VLine::Inset(_, it) = p.lines[i] else { return false };
                     match (item, it) {
+                        (ItemId::Subject(a), Item::Subject(b)) => *a == b,
                         (ItemId::Message(a), Item::Message(b)) => *a == b,
                         (ItemId::File(path), Item::File(fi)) => self.file_path(f, r, fi).as_ref() == Some(path),
                         (ItemId::Diff(path, a), Item::Diff(fi, b)) => {
@@ -554,6 +621,7 @@ impl App {
             }
             KeyCode::Enter => self.open_full(f, self.panel(f).pos.sel),
             KeyCode::Char(' ') => self.space(f),
+            KeyCode::Esc => self.fold_row(f),
             KeyCode::Right | KeyCode::Char('l') => self.expand(f),
             KeyCode::Left | KeyCode::Char('h') => self.collapse(f),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -614,6 +682,9 @@ impl App {
     /// Expand or collapse what is at `line`: a row's summary or a file's diff. Returns whether
     /// anything changed.
     fn toggle_at(&mut self, f: Focus, line: usize) -> bool {
+        if f == Focus::Worktrees {
+            return false;
+        }
         let Some(&l) = self.panel(f).lines.get(line) else {
             return false;
         };
@@ -641,6 +712,9 @@ impl App {
 
     /// Space: toggle a row or file; inside a diff or the message, fold the enclosing section.
     fn space(&mut self, f: Focus) {
+        if f == Focus::Worktrees {
+            return;
+        }
         let sel = self.panel(f).pos.sel;
         match self.panel(f).lines.get(sel) {
             Some(VLine::Row(_)) | Some(VLine::Inset(_, Item::File(_))) => {
@@ -652,6 +726,9 @@ impl App {
     }
 
     fn expand(&mut self, f: Focus) {
+        if f == Focus::Worktrees {
+            return;
+        }
         let sel = self.panel(f).pos.sel;
         let Some(&l) = self.panel(f).lines.get(sel) else { return };
         let Some(rk) = self.row_key(f, l.row()) else { return };
@@ -798,7 +875,7 @@ impl App {
         // Where to land: (file, scroll) within the doc.
         let focus = match l {
             VLine::Row(_) => None,
-            VLine::Inset(_, Item::Message(_)) => Some((None, 0)),
+            VLine::Inset(_, Item::Subject(_) | Item::Message(_)) => Some((None, 0)),
             VLine::Inset(_, Item::File(fi)) => self.file_path(f, r, fi).map(|p| (Some(p), 0)),
             VLine::Inset(_, Item::Diff(fi, li)) => self.file_path(f, r, fi).map(|p| (Some(p), li.saturating_sub(3))),
             VLine::Inset(_, Item::More(fi, _)) => self.row_doc(f, r).and_then(|e| {
