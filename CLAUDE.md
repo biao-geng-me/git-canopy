@@ -123,8 +123,15 @@ UI thread only renders snapshots received over a channel.
 - **Uncommitted rows** are synthetic commits whose only parent is the worktree HEAD, inserted right above
   it, so the normal lane logic connects them (they get their own lane when the HEAD has children).
 - **Worktree name** = branch name, or the directory name when detached. In the graph a branch that is
-  checked out in a worktree is shown only as `[name]` (cyan); other refs as `(branch, remote, tag: x)`.
-  Prunable worktrees don't get `[name]` labels.
+  checked out in a worktree is shown only as `[name]`; other refs as `(branch, remote, tag: x)`.
+  A dirty worktree's `[name]` is on its `◌` row only (not repeated on its HEAD). Prunable worktrees
+  don't get `[name]` labels.
+- **Colors follow lanes:** each lane gets a color when it is allocated (by column), except that an
+  uncommitted row's lane inherits the color of the lane it joins, so a worktree keeps its color whether
+  dirty or clean. `[name]`, branch and remote labels use their row's lane color (`Row::color`), tags
+  stay yellow, and the worktree list colors each name like its graph row.
+- **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
+  the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/
   develop, else the main worktree's branch), computed with `rev-list --left-right --count` and cached
   per (base sha, head sha). `⇡a ⇣b` vs upstream from status. The base worktree shows upstream only.
@@ -156,7 +163,8 @@ UI thread only renders snapshots received over a channel.
   Enter/double-click opens the full view at that file/line (a double-click undoes its first click's
   toggle); Esc folds the row under the cursor (or everything). Wrapping is recomputed when the graph
   width changes (`App::set_wrap_width`, called from render). The worktree panel doesn't expand
-  (decided after trying it: the graph's `◌` rows cover it with more room). Expansion is keyed by row
+  (decided after trying it: the graph's `◌` rows cover it with more room); instead Space/→/←/Esc
+  in the worktree list move the graph cursor to that worktree's row and act there. Expansion is keyed by row
   identity (commit sha / worktree path); docs are
   cached per target (commit docs forever, capped; worktree docs keyed by status + last-edit stamp,
   reloaded while shown, dropped otherwise). Graph insets keep drawing the lanes passing by

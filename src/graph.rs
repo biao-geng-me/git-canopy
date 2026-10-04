@@ -47,6 +47,8 @@ pub struct Row {
     /// The lanes continuing below this row (`│` per open lane), for drawing content that is
     /// inserted between this row and the next.
     pub below: Vec<Cell>,
+    /// Lane color of the row's node (its labels use it too).
+    pub color: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -188,11 +190,15 @@ struct Item<'a> {
 /// `trunk` (the base branch tip) gets lane 0 reserved from the start, so the base branch is a
 /// straight line on the left instead of wherever topo order happens to put it. The reserved lane
 /// is invisible until the trunk tip (or the uncommitted row right above it) is reached.
-fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec<Cell>)> {
+fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec<Cell>, u8)> {
     let mut lanes: Vec<Option<&str>> = Vec::new();
+    // Color per lane, chosen when the lane is (re)allocated: normally by column, but an
+    // uncommitted row's lane takes the color of the lane it joins, so a worktree keeps one color.
+    let mut colors: Vec<u8> = Vec::new();
     let mut phantom = false;
     if let Some(t) = trunk {
         lanes.push(Some(t));
+        colors.push(lane_color(0));
         phantom = true;
     }
     let mut rows = Vec::with_capacity(items.len());
@@ -206,13 +212,20 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec
         };
         let col = match found {
             Some(c) => c,
-            None => match lanes.iter().position(Option::is_none) {
-                Some(c) => c,
-                None => {
+            None => {
+                let c = lanes.iter().position(Option::is_none).unwrap_or_else(|| {
                     lanes.push(None);
+                    colors.push(NO_COLOR);
                     lanes.len() - 1
-                }
-            },
+                });
+                let joins = item
+                    .parents
+                    .first()
+                    .filter(|_| item.node == NODE_UNCOMMITTED)
+                    .and_then(|p| lanes.iter().position(|l| *l == Some(p.as_str())));
+                colors[c] = joins.map_or(lane_color(c), |m| colors[m]);
+                c
+            }
         };
 
         // Pipes coming from the row above: continue, or end at this commit.
@@ -223,20 +236,20 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec
             }
             match lane {
                 Some(id) if *id == item.id => {
-                    row.set(2 * j, U, lane_color(j));
+                    row.set(2 * j, U, colors[j]);
                     if j != col {
-                        row.hline(j, col, lane_color(j));
+                        row.hline(j, col, colors[j]);
                         freed.insert(j);
                     }
                 }
-                Some(_) => row.set(2 * j, U | D, lane_color(j)),
+                Some(_) => row.set(2 * j, U | D, colors[j]),
                 None => {}
             }
         }
         for &j in &freed {
             lanes[j] = None;
         }
-        row.node = Some((col, item.node, lane_color(col)));
+        row.node = Some((col, item.node, colors[col]));
         if col == 0 {
             phantom = false;
         }
@@ -246,7 +259,7 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec
             None => lanes[col] = None,
             Some((first, rest)) => {
                 lanes[col] = Some(first.as_str());
-                row.set(2 * col, D, lane_color(col));
+                row.set(2 * col, D, colors[col]);
                 for p in rest {
                     let existing = lanes
                         .iter()
@@ -254,19 +267,23 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec
                         .position(|(k, l)| k != col && *l == Some(p.as_str()));
                     let k = existing.unwrap_or_else(|| {
                         let free = (col + 1..lanes.len()).find(|&k| lanes[k].is_none() && !freed.contains(&k));
-                        free.unwrap_or_else(|| {
+                        let k = free.unwrap_or_else(|| {
                             lanes.push(None);
+                            colors.push(NO_COLOR);
                             lanes.len() - 1
-                        })
+                        });
+                        colors[k] = lane_color(k);
+                        k
                     });
                     lanes[k] = Some(p.as_str());
-                    row.set(2 * k, D, lane_color(k));
-                    row.hline(col, k, lane_color(k));
+                    row.set(2 * k, D, colors[k]);
+                    row.hline(col, k, colors[k]);
                 }
             }
         }
         while lanes.last().is_some_and(Option::is_none) {
             lanes.pop();
+            colors.pop();
         }
         let blank = Cell {
             ch: ' ',
@@ -277,14 +294,15 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec
             if lane.is_some() && !(phantom && j == 0) {
                 below[2 * j] = Cell {
                     ch: '│',
-                    color: lane_color(j),
+                    color: colors[j],
                 };
             }
         }
         while below.last().is_some_and(|c| c.ch == ' ') {
             below.pop();
         }
-        rows.push((row.finish(), below));
+        let color = row.node.map_or(NO_COLOR, |(_, _, c)| c);
+        rows.push((row.finish(), below, color));
     }
     rows
 }
@@ -364,7 +382,12 @@ impl Graph {
         let rows: Vec<Row> = layout(&items, trunk)
             .into_iter()
             .zip(kinds)
-            .map(|((cells, below), kind)| Row { kind, cells, below })
+            .map(|((cells, below, color), kind)| Row {
+                kind,
+                cells,
+                below,
+                color,
+            })
             .collect();
 
         let mut commit_row = HashMap::new();
@@ -408,6 +431,10 @@ fn build_labels(
     let worktrees: Vec<&WorktreeView> = worktrees.iter().filter(|w| w.prunable.is_none()).collect();
     let checked_out: HashSet<&str> = worktrees.iter().filter_map(|w| w.branch.as_deref()).collect();
     for w in worktrees {
+        // A dirty worktree is labelled once, on its uncommitted row, not again on its HEAD.
+        if w.is_dirty() {
+            continue;
+        }
         if let Some(&ci) = w.head.as_deref().and_then(|h| commit_idx.get(h)) {
             labels[ci].push(Label {
                 kind: LabelKind::Worktree,
@@ -541,12 +568,20 @@ mod tests {
         assert_eq!(g.worktree_row[&PathBuf::from("/w/feat")], 0);
         assert_eq!(g.worktree_row[&PathBuf::from("/w/main")], 2);
         assert_eq!(g.worktree_row[&PathBuf::from("/w/clean")], 4);
+        assert!(
+            g.labels[0].is_empty(),
+            "dirty worktree is labelled on its uncommitted row only"
+        );
         assert_eq!(
-            g.labels[0],
+            g.labels[2],
             [Label {
                 kind: LabelKind::Worktree,
-                text: "feat".into()
+                text: "clean".into()
             }]
+        );
+        assert_eq!(
+            g.rows[2].color, g.rows[3].color,
+            "uncommitted row shares its HEAD's lane"
         );
     }
 

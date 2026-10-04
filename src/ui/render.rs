@@ -200,7 +200,8 @@ fn wt_rows(app: &App) -> Vec<WtRow> {
         .worktrees
         .iter()
         .map(|w| {
-            let mut style = Style::new();
+            // Named in the same color as its lane in the graph.
+            let mut style = worktree_color(app, w).map_or(Style::new(), lane_style);
             if w.is_current {
                 style = style.add_modifier(Modifier::BOLD);
             }
@@ -511,7 +512,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
         })
         .collect();
     let sel = app.wt.pos.sel.checked_sub(app.wt.pos.offset);
-    paint_rows(f, inner, lines, sel, focused);
+    paint_rows(f, inner, lines, sel, true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -555,11 +556,16 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn worktree_label(name: &str) -> Span<'static> {
-    Span::styled(
-        format!("[{name}]"),
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )
+/// `[name]` in the worktree's lane color.
+fn worktree_label(name: &str, color: u8) -> Span<'static> {
+    Span::styled(format!("[{name}]"), lane_style(color).add_modifier(Modifier::BOLD))
+}
+
+/// The lane color of a worktree in the graph (its uncommitted row or HEAD commit).
+pub fn worktree_color(app: &App, w: &WorktreeView) -> Option<u8> {
+    let g = &app.snap.graph;
+    let r = *g.worktree_row.get(&w.path)?;
+    Some(g.rows.get(r)?.color).filter(|&c| c != graph::NO_COLOR)
 }
 
 fn cells_spans(cells: &[graph::Cell]) -> Vec<Span<'static>> {
@@ -601,19 +607,19 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
     for l in &g.labels[ci] {
         match l.kind {
             LabelKind::Worktree => {
-                spans.push(worktree_label(&l.text));
+                spans.push(worktree_label(&l.text, row.color));
                 spans.push(Span::raw(" "));
             }
             kind => {
-                let (text, color) = match kind {
-                    LabelKind::Branch => (l.text.clone(), Color::Green),
-                    LabelKind::Remote => (l.text.clone(), Color::Red),
-                    _ => (format!("tag: {}", l.text), Color::Yellow),
+                // Branches take their lane's color; tags stay yellow.
+                let (text, style) = match kind {
+                    LabelKind::Branch | LabelKind::Remote => (l.text.clone(), lane_style(row.color)),
+                    _ => (format!("tag: {}", l.text), Style::new().fg(Color::Yellow)),
                 };
                 if !refs.is_empty() {
                     refs.push(Span::styled(", ", dim));
                 }
-                refs.push(Span::styled(text, Style::new().fg(color)));
+                refs.push(Span::styled(text, style));
             }
         }
     }
@@ -683,7 +689,7 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
             let mut spans = cells_spans(&row.cells);
             spans.push(Span::raw(" "));
             if let Some(w) = app.snap.worktrees.get(wi) {
-                spans.push(worktree_label(&w.name));
+                spans.push(worktree_label(&w.name, row.color));
                 spans.push(Span::raw(" "));
                 spans.extend(count_spans(w));
                 spans.push(Span::styled(
@@ -780,7 +786,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
     let sel = app.graph.pos.sel.checked_sub(app.graph.pos.offset);
-    paint_rows(f, inner, lines, sel, focused);
+    paint_rows(f, inner, lines, sel, true);
 }
 
 // ---------------------------------------------------------------------------------------------

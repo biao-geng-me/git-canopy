@@ -67,6 +67,12 @@ git canopy [OPTIONS] [PATH]
 | `Space`, click | graph: expand / collapse a commit or `◌` row (message, files), or a file (its diff) |
 | `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
 | `Esc` | fold the expansion under the cursor back to its row (on a folded row: fold everything) |
+
+`Space`, `→`, `←` and `Esc` also work from the worktree list: they act on that worktree's row in the
+graph (its `◌` row when dirty, else its HEAD commit), and focus stays on the list.
+
+Each worktree and branch is drawn in the color of its graph lane: the `[name]` and branch labels in
+the graph and the worktree names in the list. A dirty worktree is labelled once, on its `◌` row.
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
 | `Tab` | switch between the graph and the worktree list |
 | `v` | stacked / side-by-side layout |

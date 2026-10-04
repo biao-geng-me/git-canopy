@@ -618,6 +618,25 @@ impl App {
                 self.panel_mut(Focus::Graph).pos.follow = true;
             }
             KeyCode::Enter => self.open_full(f, self.panel(f).pos.sel),
+            // From the worktree list, expanding acts on that worktree's row in the graph.
+            KeyCode::Char(' ')
+            | KeyCode::Esc
+            | KeyCode::Right
+            | KeyCode::Char('l')
+            | KeyCode::Left
+            | KeyCode::Char('h')
+                if f == Focus::Worktrees =>
+            {
+                if self.graph_cursor_to_selected_worktree() {
+                    let g = Focus::Graph;
+                    match k.code {
+                        KeyCode::Char(' ') => self.space(g),
+                        KeyCode::Esc => self.fold_row(g),
+                        KeyCode::Right | KeyCode::Char('l') => self.expand(g),
+                        _ => self.collapse(g),
+                    }
+                }
+            }
             KeyCode::Char(' ') => self.space(f),
             KeyCode::Esc => self.fold_row(f),
             KeyCode::Right | KeyCode::Char('l') => self.expand(f),
@@ -659,6 +678,23 @@ impl App {
             Focus::Graph => self.maybe_load_more(),
             _ => {}
         }
+    }
+
+    /// Put the graph cursor on the selected worktree's row (its uncommitted row or HEAD), so
+    /// expand/collapse keys pressed in the worktree list act there. Focus stays on the list.
+    /// Returns false if the worktree has no row in the graph.
+    fn graph_cursor_to_selected_worktree(&mut self) -> bool {
+        let Some(path) = self.selected_worktree().map(|w| w.path.clone()) else {
+            return false;
+        };
+        let Some(&r) = self.snap.graph.worktree_row.get(&path) else {
+            return false;
+        };
+        let Some(idx) = inset::index_of_row(&self.graph.lines, r) else {
+            return false;
+        };
+        self.set_cursor(Focus::Graph, idx);
+        true
     }
 
     fn jump_graph_to_selected(&mut self) {
