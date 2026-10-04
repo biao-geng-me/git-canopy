@@ -22,6 +22,8 @@ pub const C_DIM: Color = Color::DarkGray;
 /// Remote branch labels: red, which no lane uses, so they never look like local branches (a gray
 /// blended in with the dim age and parentheses around it).
 const C_REMOTE: Color = Color::Red;
+/// Commit hashes: a muted yellow (dark goldenrod), present but quieter than the subject.
+const C_HASH: Color = Color::Indexed(136);
 const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
@@ -412,10 +414,7 @@ fn wt_line(
     if let Some(h) = &w.head
         && room > 12
     {
-        spans.push(Span::styled(
-            h[..h.len().min(7)].to_string(),
-            Style::new().fg(Color::Yellow),
-        ));
+        spans.push(Span::styled(h[..h.len().min(7)].to_string(), Style::new().fg(C_HASH)));
         let head_age = w.head_time.map(|t| age(t, now)).unwrap_or_default();
         spans.push(Span::styled(format!(" {head_age:>3}"), dim));
     }
@@ -663,7 +662,7 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         c.id[..c.id.len().min(7)].to_string(),
-        Style::new().fg(Color::Yellow),
+        Style::new().fg(C_HASH),
     ));
     spans.push(Span::styled(format!(" {:>3} ", age(c.time, now)), dim));
     let mut refs: Vec<Span> = Vec::new();
@@ -881,10 +880,7 @@ fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
     let sep = || Span::styled("  ·  ", dim);
     if let Some(h) = &w.head {
         spans.push(sep());
-        spans.push(Span::styled(
-            h[..h.len().min(8)].to_string(),
-            Style::new().fg(Color::Yellow),
-        ));
+        spans.push(Span::styled(h[..h.len().min(8)].to_string(), Style::new().fg(C_HASH)));
     }
     match (&w.branch, w.status.as_ref().and_then(|s| s.upstream.clone())) {
         (Some(b), Some(up)) => {
@@ -929,7 +925,7 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
             let c = &g.commits[ci];
             let dim = Style::new().fg(C_DIM);
             let mut spans = vec![
-                Span::styled(c.id[..c.id.len().min(10)].to_string(), Style::new().fg(Color::Yellow)),
+                Span::styled(c.id[..c.id.len().min(10)].to_string(), Style::new().fg(C_HASH)),
                 Span::styled("  ·  ", dim),
                 Span::raw(c.author.clone()),
                 Span::styled("  ·  ", dim),
