@@ -14,9 +14,7 @@ fn wait_for(
     let deadline = Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let s = rx
-            .recv_timeout(left)
-            .expect("timed out waiting for snapshot");
+        let s = rx.recv_timeout(left).expect("timed out waiting for snapshot");
         if pred(&s) {
             return s;
         }
@@ -48,21 +46,11 @@ fn run(watch_fs: bool) {
 
     // A working-tree edit is picked up by polling.
     std::fs::write(fx.wt("refactor-db").join("new.txt"), "x").unwrap();
-    wait_for(&rx, Duration::from_secs(5), |s| {
-        by(s, "refactor-db").is_dirty()
-    });
+    wait_for(&rx, Duration::from_secs(5), |s| by(s, "refactor-db").is_dirty());
 
     // A new commit moves ahead/behind.
     let ok = std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qam",
-            "more",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "more"])
         .current_dir(fx.wt("fix-parser"))
         .status()
         .unwrap();
@@ -96,15 +84,11 @@ fn graph_loads_more_history_on_request() {
     let h = watch::spawn(paths, cfg, move |s| {
         let _ = tx.send(s);
     });
-    let s = wait_for(&rx, Duration::from_secs(10), |s| {
-        !s.graph.commits.is_empty()
-    });
+    let s = wait_for(&rx, Duration::from_secs(10), |s| !s.graph.commits.is_empty());
     assert_eq!(s.graph.commits.len(), 5);
     assert!(s.graph.truncated);
     h.request(watch::Request::LoadMore);
-    let s = wait_for(&rx, Duration::from_secs(10), |s| {
-        s.graph.commits.len() == 10
-    });
+    let s = wait_for(&rx, Duration::from_secs(10), |s| s.graph.commits.len() == 10);
     assert!(s.graph.truncated);
     for _ in 0..3 {
         h.request(watch::Request::LoadMore);

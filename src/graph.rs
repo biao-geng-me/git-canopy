@@ -134,10 +134,7 @@ impl RowCells {
             .bits
             .iter()
             .zip(&self.colors)
-            .map(|(&b, &c)| Cell {
-                ch: glyph(b),
-                color: c,
-            })
+            .map(|(&b, &c)| Cell { ch: glyph(b), color: c })
             .collect();
         if let Some((lane, ch, color)) = self.node {
             let slot = 2 * lane;
@@ -219,8 +216,7 @@ fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
                         .enumerate()
                         .position(|(k, l)| k != col && *l == Some(p.as_str()));
                     let k = existing.unwrap_or_else(|| {
-                        let free = (col + 1..lanes.len())
-                            .find(|&k| lanes[k].is_none() && !freed.contains(&k));
+                        let free = (col + 1..lanes.len()).find(|&k| lanes[k].is_none() && !freed.contains(&k));
                         free.unwrap_or_else(|| {
                             lanes.push(None);
                             lanes.len() - 1
@@ -241,17 +237,8 @@ fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
 }
 
 impl Graph {
-    pub fn build(
-        commits: &Arc<Vec<Commit>>,
-        refs: &[RefEntry],
-        worktrees: &[WorktreeView],
-        truncated: bool,
-    ) -> Graph {
-        let commit_idx: HashMap<&str, usize> = commits
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id.as_str(), i))
-            .collect();
+    pub fn build(commits: &Arc<Vec<Commit>>, refs: &[RefEntry], worktrees: &[WorktreeView], truncated: bool) -> Graph {
+        let commit_idx: HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
 
         // Uncommitted rows go directly above their HEAD commit (or on top if it is not loaded).
         let mut above: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -267,9 +254,7 @@ impl Graph {
         }
 
         let heads: HashSet<&str> = worktrees.iter().filter_map(|w| w.head.as_deref()).collect();
-        let synthetic_ids: Vec<String> = (0..worktrees.len())
-            .map(|wi| format!("\0worktree:{wi}"))
-            .collect();
+        let synthetic_ids: Vec<String> = (0..worktrees.len()).map(|wi| format!("\0worktree:{wi}")).collect();
         let head_parent: Vec<Vec<String>> = worktrees
             .iter()
             .map(|w| match &w.head {
@@ -357,10 +342,7 @@ fn build_labels(
     let mut labels: Vec<Vec<Label>> = vec![Vec::new(); commits.len()];
     // Prunable worktrees no longer exist on disk; show their branch as a plain branch.
     let worktrees: Vec<&WorktreeView> = worktrees.iter().filter(|w| w.prunable.is_none()).collect();
-    let checked_out: HashSet<&str> = worktrees
-        .iter()
-        .filter_map(|w| w.branch.as_deref())
-        .collect();
+    let checked_out: HashSet<&str> = worktrees.iter().filter_map(|w| w.branch.as_deref()).collect();
     for w in worktrees {
         if let Some(&ci) = w.head.as_deref().and_then(|h| commit_idx.get(h)) {
             labels[ci].push(Label {
@@ -431,10 +413,7 @@ mod tests {
 
     #[test]
     fn two_branches_from_one_base() {
-        let g = build(
-            vec![c("d", &["b"]), c("c", &["b"]), c("b", &["a"]), c("a", &[])],
-            &[],
-        );
+        let g = build(vec![c("d", &["b"]), c("c", &["b"]), c("b", &["a"]), c("a", &[])], &[]);
         assert_eq!(render(&g), ["● d", "│ ● c", "●─╯ b", "● a"]);
     }
 
@@ -448,12 +427,7 @@ mod tests {
     fn merge_into_existing_lane_and_crossing() {
         // m's second parent (b) is already expected by x's lane, so m joins that lane.
         let g = build(
-            vec![
-                c("x", &["b"]),
-                c("m", &["a", "b"]),
-                c("b", &["a"]),
-                c("a", &[]),
-            ],
+            vec![c("x", &["b"]), c("m", &["a", "b"]), c("b", &["a"]), c("a", &[])],
             &[],
         );
         assert_eq!(render(&g), ["● x", "├─○ m", "● │ b", "●─╯ a"]);
@@ -544,15 +518,9 @@ mod tests {
         };
         assert_eq!(
             texts(0),
-            [
-                (LabelKind::Worktree, "main"),
-                (LabelKind::Remote, "origin/main")
-            ]
+            [(LabelKind::Worktree, "main"), (LabelKind::Remote, "origin/main")]
         );
-        assert_eq!(
-            texts(1),
-            [(LabelKind::Branch, "old"), (LabelKind::Tag, "v1")]
-        );
+        assert_eq!(texts(1), [(LabelKind::Branch, "old"), (LabelKind::Tag, "v1")]);
     }
 
     #[test]

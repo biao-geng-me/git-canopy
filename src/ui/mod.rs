@@ -8,16 +8,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Position, Rect};
 
+use crate::diff;
 use crate::git::RepoPaths;
+use crate::git::status::Status;
 use crate::graph::RowKind;
 use crate::model::Snapshot;
 use crate::watch::{self, Config, Request};
@@ -25,6 +28,25 @@ use crate::watch::{self, Config, Request};
 pub enum UiMsg {
     Input(Event),
     Snapshot(Arc<Snapshot>),
+    Diff {
+        id: u64,
+        result: Result<Vec<String>, String>,
+    },
+}
+
+/// The full-screen diff view.
+pub struct DiffView {
+    pub id: u64,
+    pub title: String,
+    pub target: diff::Target,
+    /// `None` while loading.
+    pub lines: Option<Result<Vec<String>, String>>,
+    pub scroll: usize,
+    pub hscroll: usize,
+    /// For worktree diffs: the status the diff was loaded with; reloaded when it changes.
+    pub status: Option<Status>,
+    /// Keep the scroll position across the next load (reloads), instead of starting at the top.
+    keep_scroll: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +60,7 @@ pub enum Focus {
 pub struct Areas {
     pub worktrees: Rect,
     pub graph: Rect,
+    pub diff: Rect,
 }
 
 /// A vertically scrolling selection over a list of rows.
@@ -58,9 +81,7 @@ impl ListPos {
 
     pub fn move_by(&mut self, delta: isize, len: usize) {
         let max = len.saturating_sub(1) as isize;
-        self.sel = (self.sel as isize)
-            .saturating_add(delta)
-            .clamp(0, max.max(0)) as usize;
+        self.sel = (self.sel as isize).saturating_add(delta).clamp(0, max.max(0)) as usize;
         self.follow = true;
     }
 
@@ -98,16 +119,21 @@ pub struct App {
     pub graph: ListPos,
     /// Pending "show this worktree in the graph" request, applied at render time (needs height).
     pub graph_jump: Option<PathBuf>,
+    pub diff: Option<DiffView>,
     pub help: bool,
     pub quit: bool,
     pub areas: Areas,
+    next_diff_id: u64,
+    tx: Sender<UiMsg>,
+    /// Last left click (time, panel, row), for double-click detection.
+    last_click: Option<(Instant, Focus, usize)>,
     /// Graph row count when "load more" was last requested, to ask only once per page.
     more_requested_at: usize,
     worker: watch::Handle,
 }
 
 impl App {
-    fn new(worker: watch::Handle, cfg: &Config) -> Self {
+    fn new(worker: watch::Handle, tx: Sender<UiMsg>, cfg: &Config) -> Self {
         App {
             snap: Arc::new(Snapshot::default()),
             interval_ms: cfg.interval.as_millis(),
@@ -115,9 +141,13 @@ impl App {
             wt: ListPos::default(),
             graph: ListPos::default(),
             graph_jump: None,
+            diff: None,
             help: false,
             quit: false,
             areas: Areas::default(),
+            next_diff_id: 0,
+            tx,
+            last_click: None,
             more_requested_at: 0,
             worker,
         }
@@ -126,8 +156,30 @@ impl App {
     fn handle(&mut self, msg: UiMsg) {
         match msg {
             UiMsg::Snapshot(s) => self.on_snapshot(s),
-            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.on_key(k),
-            UiMsg::Input(Event::Mouse(m)) => self.on_mouse(m),
+            UiMsg::Diff { id, result } => {
+                if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
+                    if !d.keep_scroll {
+                        d.scroll = 0;
+                    }
+                    d.keep_scroll = false;
+                    d.lines = Some(result);
+                    self.scroll_diff(0);
+                }
+            }
+            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                if self.diff.is_some() && !self.help {
+                    self.on_diff_key(k)
+                } else {
+                    self.on_key(k)
+                }
+            }
+            UiMsg::Input(Event::Mouse(m)) => {
+                if self.diff.is_some() {
+                    self.on_diff_mouse(m)
+                } else {
+                    self.on_mouse(m)
+                }
+            }
             UiMsg::Input(_) => {}
         }
     }
@@ -166,6 +218,28 @@ impl App {
             self.relocate_graph_selection(selected_row, &old_graph);
         }
         self.graph.clamp(self.snap.graph.rows.len());
+
+        // Keep an open worktree diff in sync when that worktree's status changes.
+        let changed = match &self.diff {
+            Some(DiffView {
+                target: diff::Target::Worktree { path, .. },
+                status,
+                lines: Some(_),
+                ..
+            }) => {
+                let now = self
+                    .snap
+                    .worktrees
+                    .iter()
+                    .find(|w| &w.path == path)
+                    .and_then(|w| w.status.clone());
+                now.is_some() && now != *status
+            }
+            _ => false,
+        };
+        if changed {
+            self.reload_diff();
+        }
     }
 
     /// Keep the same commit (or uncommitted row) selected when the graph is rebuilt.
@@ -194,8 +268,9 @@ impl App {
     fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.help {
+            // Any key closes the help popup; Ctrl-C still quits.
             self.help = false;
-            if !matches!(k.code, KeyCode::Char('q')) || ctrl {
+            if !(ctrl && k.code == KeyCode::Char('c')) {
                 return;
             }
         }
@@ -204,6 +279,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('r') => self.worker.request(Request::Refresh),
+            KeyCode::Enter | KeyCode::Char(' ') => self.open_diff(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Worktrees => Focus::Graph,
@@ -259,12 +335,187 @@ impl App {
     fn maybe_load_more(&mut self) {
         let g = &self.snap.graph;
         let rows = g.rows.len();
-        let near_end =
-            self.graph.sel + 2 * self.page() >= rows || self.graph.offset + 2 * self.page() >= rows;
+        let near_end = self.graph.sel + 2 * self.page() >= rows || self.graph.offset + 2 * self.page() >= rows;
         if g.truncated && near_end && self.more_requested_at != rows {
             self.more_requested_at = rows;
             self.worker.request(Request::LoadMore);
         }
+    }
+
+    /// Register a click on a row; a second click on the same row soon after opens its diff.
+    fn click(&mut self, panel: Focus, row: usize) {
+        let now = Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|(t, p, r)| p == panel && r == row && now.duration_since(t) < Duration::from_millis(400));
+        self.last_click = if double { None } else { Some((now, panel, row)) };
+        if double {
+            self.open_diff();
+        }
+    }
+
+    /// Open the diff for the current selection: a commit, or a worktree's uncommitted changes.
+    /// A clean worktree shows its HEAD commit instead.
+    fn open_diff(&mut self) {
+        let snap = self.snap.clone();
+        let commit = |id: &str| {
+            let subject = snap
+                .graph
+                .commit_row
+                .get(id)
+                .and_then(|&r| match snap.graph.rows[r].kind {
+                    RowKind::Commit(ci) => Some(snap.graph.commits[ci].subject.clone()),
+                    RowKind::Uncommitted(_) => None,
+                });
+            let short = &id[..id.len().min(7)];
+            let title = match subject {
+                Some(s) => format!("{short} {s}"),
+                None => short.to_string(),
+            };
+            (
+                title,
+                diff::Target::Commit {
+                    dir: snap.common_dir.clone(),
+                    id: id.to_string(),
+                },
+                None,
+            )
+        };
+        let worktree = |wi: usize| {
+            let w = snap.worktrees.get(wi)?;
+            if !w.has_worktree() {
+                return None;
+            }
+            if !w.is_dirty() && w.status.is_some() {
+                return w.head.as_deref().map(commit);
+            }
+            let title = format!("[{}] uncommitted changes", w.name);
+            let target = diff::Target::Worktree {
+                path: w.path.clone(),
+                has_head: w.head.is_some(),
+            };
+            Some((title, target, w.status.clone()))
+        };
+        let picked = match self.focus {
+            Focus::Worktrees => worktree(self.wt.sel),
+            Focus::Graph => match snap.graph.rows.get(self.graph.sel).map(|r| r.kind) {
+                Some(RowKind::Commit(ci)) => Some(commit(&snap.graph.commits[ci].id)),
+                Some(RowKind::Uncommitted(wi)) => worktree(wi),
+                None => None,
+            },
+        };
+        let Some((title, target, status)) = picked else { return };
+        self.next_diff_id += 1;
+        self.diff = Some(DiffView {
+            id: self.next_diff_id,
+            title,
+            target,
+            lines: None,
+            scroll: 0,
+            hscroll: 0,
+            status,
+            keep_scroll: false,
+        });
+        self.spawn_diff_load();
+    }
+
+    fn reload_diff(&mut self) {
+        let status = match &self.diff {
+            Some(DiffView {
+                target: diff::Target::Worktree { path, .. },
+                ..
+            }) => self
+                .snap
+                .worktrees
+                .iter()
+                .find(|w| &w.path == path)
+                .and_then(|w| w.status.clone()),
+            _ => None,
+        };
+        if let Some(d) = self.diff.as_mut() {
+            self.next_diff_id += 1;
+            d.id = self.next_diff_id;
+            d.keep_scroll = true;
+            if status.is_some() {
+                d.status = status;
+            }
+        }
+        self.spawn_diff_load();
+    }
+
+    fn spawn_diff_load(&self) {
+        let Some(d) = &self.diff else { return };
+        let (id, target, tx) = (d.id, d.target.clone(), self.tx.clone());
+        thread::Builder::new()
+            .name("canopy-diff".into())
+            .spawn(move || {
+                let result = diff::load(&target).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiMsg::Diff { id, result });
+            })
+            .expect("spawn diff thread");
+    }
+
+    fn diff_page(&self) -> usize {
+        (self.areas.diff.height.saturating_sub(2) as usize).max(1)
+    }
+
+    fn on_diff_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.diff_page() as isize;
+        match k.code {
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.diff = None,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('r') => self.reload_diff(),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => self.scroll_diff(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_diff(-1),
+            KeyCode::Char('d') if ctrl => self.scroll_diff(page / 2),
+            KeyCode::Char('u') if ctrl => self.scroll_diff(-page / 2),
+            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => self.scroll_diff(page),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_diff(-page),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_diff(isize::MAX),
+            KeyCode::Right | KeyCode::Char('l') => self.pan_diff(8),
+            KeyCode::Left | KeyCode::Char('h') => self.pan_diff(-8),
+            KeyCode::Char('n') | KeyCode::Char(']') => self.jump_file(true),
+            KeyCode::Char('p') | KeyCode::Char('N') | KeyCode::Char('[') => self.jump_file(false),
+            _ => {}
+        }
+    }
+
+    fn on_diff_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll_diff(3),
+            MouseEventKind::ScrollUp => self.scroll_diff(-3),
+            MouseEventKind::ScrollRight => self.pan_diff(8),
+            MouseEventKind::ScrollLeft => self.pan_diff(-8),
+            _ => {}
+        }
+    }
+
+    fn scroll_diff(&mut self, delta: isize) {
+        let page = self.diff_page();
+        let Some(d) = self.diff.as_mut() else { return };
+        let len = d.lines.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, Vec::len);
+        let max = len.saturating_sub(page) as isize;
+        d.scroll = (d.scroll as isize).saturating_add(delta).clamp(0, max.max(0)) as usize;
+    }
+
+    fn pan_diff(&mut self, delta: isize) {
+        if let Some(d) = self.diff.as_mut() {
+            d.hscroll = (d.hscroll as isize + delta).clamp(0, 10_000) as usize;
+        }
+    }
+
+    fn jump_file(&mut self, forward: bool) {
+        let Some(d) = self.diff.as_mut() else { return };
+        let Some(Ok(lines)) = &d.lines else { return };
+        if let Some(i) = diff::file_jump(lines, d.scroll, forward) {
+            d.scroll = i;
+        } else if !forward {
+            d.scroll = 0;
+        }
+        self.scroll_diff(0);
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -279,26 +530,20 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if wa.contains(pos) {
                     self.focus = Focus::Worktrees;
-                    if let Some(i) =
-                        row_in(wa, self.wt.offset).filter(|&i| i < self.snap.worktrees.len())
-                    {
+                    if let Some(i) = row_in(wa, self.wt.offset).filter(|&i| i < self.snap.worktrees.len()) {
                         self.select_worktree(i);
+                        self.click(Focus::Worktrees, i);
                     }
                 } else if ga.contains(pos) {
                     self.focus = Focus::Graph;
-                    if let Some(i) =
-                        row_in(ga, self.graph.offset).filter(|&i| i < self.snap.graph.rows.len())
-                    {
+                    if let Some(i) = row_in(ga, self.graph.offset).filter(|&i| i < self.snap.graph.rows.len()) {
                         self.graph.sel = i;
+                        self.click(Focus::Graph, i);
                     }
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                let d: isize = if m.kind == MouseEventKind::ScrollDown {
-                    1
-                } else {
-                    -1
-                };
+                let d: isize = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                 if wa.contains(pos) {
                     self.focus = Focus::Worktrees;
                     self.move_sel(d);
@@ -331,7 +576,7 @@ pub fn run(paths: RepoPaths, cfg: Config) -> Result<()> {
     let mut terminal = ratatui::try_init()?;
     let _ = execute!(stdout(), EnableMouseCapture);
 
-    let mut app = App::new(worker, &cfg);
+    let mut app = App::new(worker, tx, &cfg);
     let res = event_loop(&mut terminal, &mut app, &rx);
 
     let _ = execute!(stdout(), DisableMouseCapture);
@@ -339,11 +584,7 @@ pub fn run(paths: RepoPaths, cfg: Config) -> Result<()> {
     res
 }
 
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    rx: &Receiver<UiMsg>,
-) -> Result<()> {
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<UiMsg>) -> Result<()> {
     loop {
         terminal.draw(|f| render::draw(f, app))?;
         let Ok(msg) = rx.recv() else { return Ok(()) };

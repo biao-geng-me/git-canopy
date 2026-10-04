@@ -84,18 +84,11 @@ pub fn display_name(entry: &WorktreeEntry) -> String {
 
 /// The branch other branches are compared against: an explicit choice, else the first of
 /// main/master/trunk/develop that exists locally, else the main worktree's branch.
-pub fn detect_base(
-    explicit: Option<&str>,
-    refs: &[RefEntry],
-    worktrees: &[WorktreeEntry],
-) -> Option<String> {
+pub fn detect_base(explicit: Option<&str>, refs: &[RefEntry], worktrees: &[WorktreeEntry]) -> Option<String> {
     if let Some(b) = explicit {
         return Some(b.to_string());
     }
-    let has = |n: &str| {
-        refs.iter()
-            .any(|r| r.kind == RefKind::Branch && r.name == n)
-    };
+    let has = |n: &str| refs.iter().any(|r| r.kind == RefKind::Branch && r.name == n);
     ["main", "master", "trunk", "develop"]
         .into_iter()
         .find(|n| has(n))
@@ -154,13 +147,7 @@ mod tests {
             detect_base(None, &[branch("master"), branch("main")], &wts).as_deref(),
             Some("main")
         );
-        assert_eq!(
-            detect_base(None, &[branch("master")], &wts).as_deref(),
-            Some("master")
-        );
-        assert_eq!(
-            detect_base(None, &[branch("other")], &wts).as_deref(),
-            Some("dev2")
-        );
+        assert_eq!(detect_base(None, &[branch("master")], &wts).as_deref(), Some("master"));
+        assert_eq!(detect_base(None, &[branch("other")], &wts).as_deref(), Some("dev2"));
     }
 }

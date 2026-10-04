@@ -59,9 +59,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 let v = value("--interval")?;
                 let secs: f64 = v.parse().map_err(|_| format!("invalid interval: {v}"))?;
                 if !(0.1..=3600.0).contains(&secs) {
-                    return Err(format!(
-                        "interval must be between 0.1 and 3600 seconds: {v}"
-                    ));
+                    return Err(format!("interval must be between 0.1 and 3600 seconds: {v}"));
                 }
                 cfg.interval = Duration::from_secs_f64(secs);
             }

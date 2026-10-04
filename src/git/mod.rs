@@ -70,19 +70,13 @@ pub struct RepoPaths {
 
 /// Resolve the repository containing `path`; errors if it is not inside a git repository.
 pub fn discover(path: &Path) -> Result<RepoPaths> {
-    let out = run(
-        path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .with_context(|| format!("not a git repository: {}", path.display()))?;
+    let out = run(path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .with_context(|| format!("not a git repository: {}", path.display()))?;
     let common_dir = PathBuf::from(trim_line(&out));
-    let toplevel = run(
-        path,
-        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-    )
-    .ok()
-    .map(|o| PathBuf::from(trim_line(&o)))
-    .filter(|p| !p.as_os_str().is_empty());
+    let toplevel = run(path, &["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .ok()
+        .map(|o| PathBuf::from(trim_line(&o)))
+        .filter(|p| !p.as_os_str().is_empty());
     Ok(RepoPaths {
         common_dir: canonical(&common_dir),
         toplevel: toplevel.map(|p| canonical(&p)),
@@ -106,9 +100,7 @@ pub fn parse_left_right(out: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn trim_line(out: &[u8]) -> String {
-    String::from_utf8_lossy(out)
-        .trim_end_matches(['\n', '\r'])
-        .to_string()
+    String::from_utf8_lossy(out).trim_end_matches(['\n', '\r']).to_string()
 }
 
 /// Canonicalize if possible, otherwise keep the path as given.

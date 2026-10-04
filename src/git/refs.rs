@@ -26,13 +26,7 @@ const FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(s
 pub fn load(dir: &Path) -> Result<(Vec<RefEntry>, Vec<u8>)> {
     let raw = super::run(
         dir,
-        &[
-            "for-each-ref",
-            FORMAT,
-            "refs/heads",
-            "refs/remotes",
-            "refs/tags",
-        ],
+        &["for-each-ref", FORMAT, "refs/heads", "refs/remotes", "refs/tags"],
     )?;
     Ok((parse(&raw), raw))
 }

@@ -24,11 +24,7 @@ fn reads_fixture_state() {
             "docs"
         ]
     );
-    let by = |n: &str| {
-        wts.iter()
-            .find(|w| canopy::model::display_name(w) == n)
-            .unwrap()
-    };
+    let by = |n: &str| wts.iter().find(|w| canopy::model::display_name(w) == n).unwrap();
     assert!(by("detached").detached);
     assert!(by("gone").prunable.is_some());
     assert!(by("refactor-db").locked.is_some());
@@ -51,10 +47,7 @@ fn reads_fixture_state() {
 
     let admin = worktree::admin_dir(&by("conflict").path).unwrap();
     assert_eq!(worktree::operation(&admin), Some("MERGING"));
-    assert_eq!(
-        worktree::operation(&worktree::admin_dir(&fx.repo()).unwrap()),
-        None
-    );
+    assert_eq!(worktree::operation(&worktree::admin_dir(&fx.repo()).unwrap()), None);
 
     let (rs, _) = refs::load(&fx.repo()).unwrap();
     let tag = rs.iter().find(|r| r.name == "v0.1").unwrap();
@@ -70,11 +63,7 @@ fn reads_fixture_state() {
             .any(|c| c.subject == "Merge branch 'feature-x'" && c.parents.len() == 2)
     );
     // Topological: every parent appears after its child.
-    let pos: std::collections::HashMap<_, _> = commits
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.id.clone(), i))
-        .collect();
+    let pos: std::collections::HashMap<_, _> = commits.iter().enumerate().map(|(i, c)| (c.id.clone(), i)).collect();
     for (i, c) in commits.iter().enumerate() {
         for p in &c.parents {
             assert!(pos[p] > i);
@@ -82,8 +71,5 @@ fn reads_fixture_state() {
     }
 
     let refactor = by("refactor-db").head.clone().unwrap();
-    assert_eq!(
-        git::left_right_count(&fx.repo(), "main", &refactor).unwrap(),
-        (0, 4)
-    );
+    assert_eq!(git::left_right_count(&fx.repo(), "main", &refactor).unwrap(), (0, 4));
 }

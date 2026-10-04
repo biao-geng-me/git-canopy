@@ -20,11 +20,18 @@ const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [main, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
+    let [main, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
+    if app.diff.is_some() {
+        app.areas.diff = main;
+        draw_diff(f, app, main);
+        draw_diff_footer(f, app, footer);
+        if app.help {
+            draw_help(f);
+        }
+        return;
+    }
     let wt_width = worktree_panel_width(app, main.width);
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main);
+    let [left, right] = Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main);
     app.areas.worktrees = left;
     app.areas.graph = right;
     draw_worktrees(f, app, left);
@@ -49,13 +56,7 @@ fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
 }
 
 /// Paint `lines` into `inner`, one per row, highlighting row `sel` across the full width.
-fn paint_rows(
-    f: &mut Frame,
-    inner: Rect,
-    lines: Vec<Line<'static>>,
-    sel: Option<usize>,
-    focused: bool,
-) {
+fn paint_rows(f: &mut Frame, inner: Rect, lines: Vec<Line<'static>>, sel: Option<usize>, focused: bool) {
     for (i, line) in lines.into_iter().enumerate() {
         if i as u16 >= inner.height {
             break;
@@ -215,11 +216,7 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
         .max()
         .unwrap_or(4)
         .min(NAME_MAX);
-    let counts = rows
-        .iter()
-        .map(|r| spans_width(&r.counts))
-        .max()
-        .unwrap_or(0);
+    let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     // borders + marker + gaps
     let natural = 2 + 2 + name + 1 + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
@@ -247,11 +244,7 @@ fn truncate(s: &str, width: usize) -> String {
 
 fn pad(s: String, width: usize) -> String {
     let w = s.width();
-    if w >= width {
-        s
-    } else {
-        s + &" ".repeat(width - w)
-    }
+    if w >= width { s } else { s + &" ".repeat(width - w) }
 }
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
@@ -262,40 +255,24 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     if n > 0 {
         title.push(Span::styled(format!("{n} "), Style::new().fg(C_DIM)));
         if dirty > 0 {
-            title.push(Span::styled(
-                format!("✎{dirty} "),
-                Style::new().fg(C_MODIFIED),
-            ));
+            title.push(Span::styled(format!("✎{dirty} "), Style::new().fg(C_MODIFIED)));
         }
     }
     let block = panel(Line::from(title), focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if n == 0 {
-        f.render_widget(
-            Paragraph::new(Span::styled(" loading…", Style::new().fg(C_DIM))),
-            inner,
-        );
+        f.render_widget(Paragraph::new(Span::styled(" loading…", Style::new().fg(C_DIM))), inner);
         return;
     }
 
     let rows = wt_rows(app);
     let avail = inner.width as usize;
-    let counts_w = rows
-        .iter()
-        .map(|r| spans_width(&r.counts))
-        .max()
-        .unwrap_or(0);
+    let counts_w = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab_w = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
-    let name_natural = rows
-        .iter()
-        .map(|r| r.name.content.width())
-        .max()
-        .unwrap_or(0);
+    let name_natural = rows.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
     let fixed = 2 + 1 + counts_w + if ab_w > 0 { 1 + ab_w } else { 0 };
-    let name_w = name_natural
-        .min(NAME_MAX)
-        .min(avail.saturating_sub(fixed).max(6));
+    let name_w = name_natural.min(NAME_MAX).min(avail.saturating_sub(fixed).max(6));
 
     app.wt.clamp(n);
     app.wt.scroll_into_view(inner.height as usize);
@@ -452,10 +429,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             " loading…"
         };
-        f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::new().fg(C_DIM))),
-            inner,
-        );
+        f.render_widget(Paragraph::new(Span::styled(msg, Style::new().fg(C_DIM))), inner);
         return;
     }
 
@@ -483,10 +457,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     if g.truncated && lines.len() < height {
         lines.push(Line::from(Span::styled(
-            format!(
-                " … older history not loaded yet ({} commits shown)",
-                g.commits.len()
-            ),
+            format!(" … older history not loaded yet ({} commits shown)", g.commits.len()),
             Style::new().fg(C_DIM),
         )));
     }
@@ -516,10 +487,7 @@ fn worktree_details(w: &WorktreeView) -> Line<'static> {
             Style::new().fg(Color::Yellow),
         ));
     }
-    match (
-        &w.branch,
-        w.status.as_ref().and_then(|s| s.upstream.clone()),
-    ) {
+    match (&w.branch, w.status.as_ref().and_then(|s| s.upstream.clone())) {
         (Some(b), Some(up)) => {
             spans.push(sep());
             spans.push(Span::raw(format!("{b} → {up}")));
@@ -532,15 +500,8 @@ fn worktree_details(w: &WorktreeView) -> Line<'static> {
     }
     if let Some(r) = &w.locked {
         spans.push(sep());
-        let r = if r.is_empty() {
-            String::new()
-        } else {
-            format!(": {r}")
-        };
-        spans.push(Span::styled(
-            format!("locked{r}"),
-            Style::new().fg(C_MODIFIED),
-        ));
+        let r = if r.is_empty() { String::new() } else { format!(": {r}") };
+        spans.push(Span::styled(format!("locked{r}"), Style::new().fg(C_MODIFIED)));
     }
     if let Some(e) = &w.status_error {
         spans.push(sep());
@@ -560,24 +521,14 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
             let c = &g.commits[ci];
             let dim = Style::new().fg(C_DIM);
             let mut spans = vec![
-                Span::styled(
-                    c.id[..c.id.len().min(10)].to_string(),
-                    Style::new().fg(Color::Yellow),
-                ),
+                Span::styled(c.id[..c.id.len().min(10)].to_string(), Style::new().fg(Color::Yellow)),
                 Span::styled("  ·  ", dim),
                 Span::raw(c.author.clone()),
                 Span::styled("  ·  ", dim),
-                Span::raw(format!(
-                    "{} ({} ago)",
-                    utc_date(c.time),
-                    age(c.time, now_secs())
-                )),
+                Span::raw(format!("{} ({} ago)", utc_date(c.time), age(c.time, now_secs()))),
             ];
             if c.parents.len() > 1 {
-                spans.push(Span::styled(
-                    format!("  ·  merge of {}", c.parents.len()),
-                    dim,
-                ));
+                spans.push(Span::styled(format!("  ·  merge of {}", c.parents.len()), dim));
             }
             Some(Line::from(spans))
         }
@@ -597,26 +548,159 @@ pub fn utc_date(t: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        secs / 3600,
-        secs % 3600 / 60
-    )
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, secs % 3600 / 60)
+}
+
+/// Style for one line of `git show` / `git diff` output.
+fn diff_line_style(line: &str) -> Style {
+    let b = line.as_bytes();
+    if line.starts_with("diff --git ") || line.starts_with("diff --cc ") {
+        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("commit ") {
+        Style::new().fg(Color::Yellow)
+    } else if line == "---" {
+        Style::new().fg(C_DIM)
+    } else if line.starts_with("+++ ") || line.starts_with("--- ") {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::new().fg(Color::Cyan)
+    } else if b.first() == Some(&b'+') {
+        Style::new().fg(Color::Green)
+    } else if b.first() == Some(&b'-') {
+        Style::new().fg(Color::Red)
+    } else if [
+        "index ",
+        "new file",
+        "deleted file",
+        "similarity ",
+        "rename ",
+        "old mode",
+        "new mode",
+        "Binary ",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
+    {
+        Style::new().fg(C_DIM)
+    } else if line.starts_with("Untracked files") {
+        Style::new().fg(C_UNTRACKED).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    }
+}
+
+/// Diffstat lines (` path | 12 +++--`) get colored plus/minus bars.
+fn stat_line(line: &str) -> Option<Line<'static>> {
+    let (path, rest) = line.rsplit_once(" | ")?;
+    if !line.starts_with(' ') {
+        return None;
+    }
+    let bar_start = rest.find(['+', '-'])?;
+    let (num, bar) = rest.split_at(bar_start);
+    if !bar.chars().all(|c| c == '+' || c == '-') {
+        return None;
+    }
+    let plus = bar.chars().filter(|&c| c == '+').count();
+    Some(Line::from(vec![
+        Span::raw(format!("{path} | {num}")),
+        Span::styled("+".repeat(plus), Style::new().fg(Color::Green)),
+        Span::styled("-".repeat(bar.len() - plus), Style::new().fg(Color::Red)),
+    ]))
+}
+
+/// Drop the first `cols` display columns of `s`.
+fn skip_cols(s: &str, cols: usize) -> &str {
+    if cols == 0 {
+        return s;
+    }
+    let mut w = 0;
+    for (i, c) in s.char_indices() {
+        if w >= cols {
+            return &s[i..];
+        }
+        w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    ""
+}
+
+fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(d) = &app.diff else { return };
+    let height = area.height.saturating_sub(2) as usize;
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(d.title.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+    ]);
+    let position = match &d.lines {
+        Some(Ok(lines)) if !lines.is_empty() => {
+            let end = (d.scroll + height).min(lines.len());
+            format!(" {}–{} of {} ", d.scroll + 1, end, lines.len())
+        }
+        _ => String::new(),
+    };
+    let block = panel(title, true).title_top(Line::styled(position, Style::new().fg(C_DIM)).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let body: Vec<Line> = match &d.lines {
+        None => vec![Line::styled(" loading…", Style::new().fg(C_DIM))],
+        Some(Err(e)) => e
+            .lines()
+            .map(|l| Line::styled(format!(" {l}"), Style::new().fg(C_CONFLICT)))
+            .collect(),
+        Some(Ok(lines)) => lines[d.scroll.min(lines.len())..]
+            .iter()
+            .take(height)
+            .map(|l| {
+                let visible = skip_cols(l, d.hscroll);
+                stat_line(visible).unwrap_or_else(|| Line::styled(visible.to_string(), diff_line_style(l)))
+            })
+            .collect(),
+    };
+    f.render_widget(Paragraph::new(body), inner);
+}
+
+fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
+    let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    if let Some(d) = &app.diff {
+        let mut msg = match &d.target {
+            crate::diff::Target::Worktree { path, .. } => tilde(path),
+            crate::diff::Target::Commit { id, .. } => id.clone(),
+        };
+        if d.hscroll > 0 {
+            msg.push_str(&format!("  ·  scrolled right {} columns", d.hscroll));
+        }
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" {msg}"), Style::new().fg(C_DIM))),
+            details,
+        );
+    }
+    let key = |k: &'static str| Span::styled(k, Style::new().fg(Color::Cyan));
+    let text = |t: &'static str| Span::styled(t, Style::new().fg(C_DIM));
+    let line = Line::from(vec![
+        Span::raw(" "),
+        key("↑↓ PgUp PgDn"),
+        text(" scroll  "),
+        key("n/p"),
+        text(" next/prev file  "),
+        key("←→"),
+        text(" pan  "),
+        key("r"),
+        text(" reload  "),
+        key("Esc"),
+        text(" back"),
+    ]);
+    f.render_widget(Paragraph::new(line), hints);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let [details, hints] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let line = match app.focus {
         Focus::Worktrees => app.snap.worktrees.get(app.wt.sel).map(worktree_details),
         Focus::Graph => graph_details(app),
     };
     if let Some(e) = &app.snap.error {
         let msg = format!(" {}", e.lines().next().unwrap_or(""));
-        f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::new().fg(C_CONFLICT))),
-            details,
-        );
+        f.render_widget(Paragraph::new(Span::styled(msg, Style::new().fg(C_CONFLICT))), details);
     } else if let Some(mut line) = line {
         line.spans.insert(0, Span::raw(" "));
         f.render_widget(Paragraph::new(line), details);
@@ -652,15 +736,22 @@ const HELP: &[(&str, &str)] = &[
     ("PgUp PgDn  ^u ^d", "page / half page"),
     ("g G  Home End", "first / last"),
     ("Tab  ← →  h l", "switch panel"),
-    ("Enter", "diff of commit or worktree"),
+    ("Enter  dbl-click", "diff of commit or worktree"),
     ("r", "refresh now"),
     ("?", "toggle this help"),
     ("q  Ctrl-C", "quit"),
+    ("", ""),
+    ("in diff view:", ""),
+    ("↑ ↓  PgUp PgDn", "scroll"),
+    ("n p  ] [", "next / previous file"),
+    ("← →  h l", "scroll sideways"),
+    ("r", "reload"),
+    ("Esc  q", "back"),
 ];
 
 fn draw_help(f: &mut Frame) {
     let area = f.area();
-    let w = 50.min(area.width);
+    let w = 52.min(area.width);
     let h = (HELP.len() as u16 + 4).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
@@ -672,7 +763,7 @@ fn draw_help(f: &mut Frame) {
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<18}"), Style::new().fg(Color::Cyan)),
+                Span::styled(format!(" {k:<19}"), Style::new().fg(Color::Cyan)),
                 Span::raw(*d),
             ])
         })
@@ -704,5 +795,26 @@ mod tests {
     fn truncation() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+}
+
+#[cfg(test)]
+mod diff_render_tests {
+    use super::*;
+
+    #[test]
+    fn stat_lines() {
+        let l = stat_line(" src/a.rs | 12 +++--").unwrap();
+        assert_eq!(l.spans[1].content, "+++");
+        assert_eq!(l.spans[2].content, "--");
+        assert!(stat_line("+added | line").is_none());
+        assert!(stat_line(" a | Bin 0 -> 12 bytes").is_none());
+    }
+
+    #[test]
+    fn column_skipping() {
+        assert_eq!(skip_cols("abcdef", 2), "cdef");
+        assert_eq!(skip_cols("ab", 5), "");
+        assert_eq!(skip_cols("日本語", 2), "本語");
     }
 }

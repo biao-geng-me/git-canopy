@@ -91,8 +91,7 @@ mod tests {
 
     #[test]
     fn parses_headers_and_entries() {
-        let raw =
-            b"# branch.oid 35d6da7ad1b7d428705681a0acc83773329b029b\0# branch.head feat-auth\0\
+        let raw = b"# branch.oid 35d6da7ad1b7d428705681a0acc83773329b029b\0# branch.head feat-auth\0\
 # branch.upstream origin/feat-auth\0# branch.ab +2 -1\0\
 1 .M N... 100644 100644 100644 044e 044e src/auth.rs\0\
 1 M. N... 100644 100644 100644 f328 341b src/main.rs\0\
@@ -104,10 +103,7 @@ u UU N... 100644 100644 100644 100644 a b c README.md\0\
         assert_eq!(st.branch.as_deref(), Some("feat-auth"));
         assert_eq!(st.upstream.as_deref(), Some("origin/feat-auth"));
         assert_eq!(st.upstream_ab, Some((2, 1)));
-        assert_eq!(
-            (st.staged, st.modified, st.untracked, st.unmerged),
-            (3, 2, 2, 1)
-        );
+        assert_eq!((st.staged, st.modified, st.untracked, st.unmerged), (3, 2, 2, 1));
         assert!(st.is_dirty());
     }
 

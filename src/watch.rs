@@ -251,10 +251,7 @@ impl Worker {
             let mut comps = rel.components().map(|c| c.as_os_str().to_string_lossy());
             let first = comps.next().unwrap_or_default();
             if p.extension().is_some_and(|e| e == "lock")
-                || matches!(
-                    &*first,
-                    "objects" | "logs" | "COMMIT_EDITMSG" | "gc.log" | "FETCH_HEAD"
-                )
+                || matches!(&*first, "objects" | "logs" | "COMMIT_EDITMSG" | "gc.log" | "FETCH_HEAD")
             {
                 continue;
             }
@@ -265,21 +262,13 @@ impl Worker {
                     if comps.next().is_some_and(|c| c == "logs") {
                         continue;
                     }
-                    if let Some(wt) = self
-                        .worktrees
-                        .iter()
-                        .find(|w| w.admin_dir.as_deref() == Some(&admin))
-                    {
+                    if let Some(wt) = self.worktrees.iter().find(|w| w.admin_dir.as_deref() == Some(&admin)) {
                         targets.insert(wt.path.clone());
                     }
                 }
             } else if first != "refs" && first != "packed-refs" {
                 // HEAD, index, MERGE_HEAD, ... of the main worktree.
-                if let Some(wt) = self
-                    .worktrees
-                    .iter()
-                    .find(|w| w.admin_dir.as_deref() == Some(&common))
-                {
+                if let Some(wt) = self.worktrees.iter().find(|w| w.admin_dir.as_deref() == Some(&common)) {
                     targets.insert(wt.path.clone());
                 }
             }
@@ -326,11 +315,7 @@ impl Worker {
         }
         self.fingerprint = fp;
 
-        let mut old: HashMap<PathBuf, WorktreeView> = self
-            .worktrees
-            .drain(..)
-            .map(|w| (w.path.clone(), w))
-            .collect();
+        let mut old: HashMap<PathBuf, WorktreeView> = self.worktrees.drain(..).map(|w| (w.path.clone(), w)).collect();
         let current = self.paths.toplevel.as_deref();
         let mut views: Vec<WorktreeView> = entries
             .iter()
@@ -362,9 +347,7 @@ impl Worker {
             let missing: Vec<String> = views
                 .iter()
                 .filter_map(|v| v.head.clone())
-                .filter(|h| {
-                    *h != base_sha && !self.ab_cache.contains_key(&(base_sha.clone(), h.clone()))
-                })
+                .filter(|h| *h != base_sha && !self.ab_cache.contains_key(&(base_sha.clone(), h.clone())))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -373,8 +356,7 @@ impl Worker {
             });
             for (head, res) in missing.into_iter().zip(results) {
                 if let Some((behind, ahead)) = res {
-                    self.ab_cache
-                        .insert((base_sha.clone(), head), (ahead, behind));
+                    self.ab_cache.insert((base_sha.clone(), head), (ahead, behind));
                 }
             }
             for v in &mut views {
@@ -401,10 +383,7 @@ impl Worker {
                 w.has_worktree() && only.is_none_or(|s| s.contains(&w.path))
             })
             .collect();
-        let paths: Vec<PathBuf> = idx
-            .iter()
-            .map(|&i| self.worktrees[i].path.clone())
-            .collect();
+        let paths: Vec<PathBuf> = idx.iter().map(|&i| self.worktrees[i].path.clone()).collect();
         let results = par_map(&paths, PARALLELISM, |p| git::status::load(p));
         for (i, res) in idx.into_iter().zip(results) {
             let w = &mut self.worktrees[i];
@@ -424,11 +403,7 @@ impl Worker {
     fn refresh_graph(&mut self) {
         let key = (self.fingerprint, self.limit);
         if self.commits_key != Some(key) {
-            let mut heads: Vec<String> = self
-                .worktrees
-                .iter()
-                .filter_map(|w| w.head.clone())
-                .collect();
+            let mut heads: Vec<String> = self.worktrees.iter().filter_map(|w| w.head.clone()).collect();
             heads.sort();
             heads.dedup();
             match git::log::load(self.repo_dir(), self.limit, &heads) {
@@ -454,12 +429,7 @@ impl Worker {
         let gk = h.finish();
         if self.graph_key != Some(gk) {
             let more = self.commits.len() >= self.limit;
-            self.graph = Arc::new(Graph::build(
-                &self.commits,
-                &self.refs,
-                &self.worktrees,
-                more,
-            ));
+            self.graph = Arc::new(Graph::build(&self.commits, &self.refs, &self.worktrees, more));
             self.graph_key = Some(gk);
         }
     }
@@ -518,10 +488,7 @@ mod tests {
     #[test]
     fn par_map_preserves_order() {
         let v: Vec<u32> = (0..50).collect();
-        assert_eq!(
-            par_map(&v, 4, |x| x * 2),
-            v.iter().map(|x| x * 2).collect::<Vec<_>>()
-        );
+        assert_eq!(par_map(&v, 4, |x| x * 2), v.iter().map(|x| x * 2).collect::<Vec<_>>());
         assert_eq!(par_map(&[] as &[u32], 4, |x| *x), Vec::<u32>::new());
     }
 }
