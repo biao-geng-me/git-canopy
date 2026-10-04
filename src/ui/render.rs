@@ -865,7 +865,7 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
 
 /// `60s`, `1.5s`: an interval without a pointless `.0`.
 fn secs(ms: u128) -> String {
-    if ms % 1000 == 0 {
+    if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
         format!("{:.1}s", ms as f64 / 1000.0)
