@@ -1,9 +1,14 @@
 //! Terminal UI. Runs on the main thread and only renders snapshots received over a channel;
 //! all git work happens on the refresh worker (and on short-lived diff threads).
+//!
+//! Both overview panels are expandable lists (see [`inset`]): a row expands in place into its
+//! diff summary, a file into its diff, and Enter opens the full-screen [`DiffView`].
 
 mod diff_view;
+mod inset;
 mod render;
 
+use std::collections::HashMap;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,17 +30,36 @@ use crate::graph::RowKind;
 use crate::model::Snapshot;
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
+use inset::{Entry, Expansion, Item, Key, VLine};
 
 pub enum UiMsg {
     Input(Event),
     Snapshot(Arc<Snapshot>),
-    Diff { id: u64, result: Result<DiffDoc, String> },
+    Diff {
+        id: u64,
+        result: Result<DiffDoc, String>,
+    },
+    Inset {
+        key: Key,
+        req: u64,
+        result: Result<DiffDoc, String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Worktrees,
     Graph,
+}
+
+/// How the two overview panels are arranged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Graph on top, worktrees below, both full width (the default).
+    #[default]
+    Stacked,
+    /// Worktrees on the left, graph on the right.
+    Side,
 }
 
 /// Screen regions from the last render, for mouse hit-testing.
@@ -45,7 +69,7 @@ pub struct Areas {
     pub graph: Rect,
 }
 
-/// A vertically scrolling selection over a list of rows.
+/// A vertically scrolling selection over a list of lines.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ListPos {
     pub sel: usize,
@@ -86,48 +110,77 @@ impl ListPos {
     }
 }
 
-/// Identity of a graph row, stable across refreshes.
+/// One overview panel: its visual lines, cursor and expansion state.
+#[derive(Default)]
+pub struct Panel {
+    pub pos: ListPos,
+    pub exp: Expansion,
+    pub lines: Vec<VLine>,
+}
+
+/// Identity of a visual line, stable across refreshes (for keeping the cursor in place).
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RowKey {
-    Commit(String),
-    Worktree(PathBuf),
+struct LineId {
+    row: Key,
+    item: Option<ItemId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ItemId {
+    Message(usize),
+    File(String),
+    Diff(String, usize),
+    More(String),
+    Other,
+}
+
+struct Click {
+    at: Instant,
+    panel: Focus,
+    line: usize,
+    /// Whether the click expanded/collapsed something (undone if it becomes a double-click).
+    toggled: bool,
 }
 
 pub struct App {
     pub snap: Arc<Snapshot>,
     pub interval_ms: u128,
+    pub layout: LayoutMode,
     pub focus: Focus,
-    pub wt: ListPos,
-    pub graph: ListPos,
+    pub wt: Panel,
+    pub graph: Panel,
+    /// Diffs for insets, by target.
+    pub docs: HashMap<Key, Entry>,
     /// Pending "show this worktree in the graph" request, applied at render time (needs height).
     pub graph_jump: Option<PathBuf>,
     pub diff: Option<DiffView>,
     pub help: bool,
     pub quit: bool,
     pub areas: Areas,
-    next_diff_id: u64,
+    next_id: u64,
     tx: Sender<UiMsg>,
-    /// Last left click (time, panel, row), for double-click detection.
-    last_click: Option<(Instant, Focus, usize)>,
+    last_click: Option<Click>,
     /// Graph row count when "load more" was last requested, to ask only once per page.
     more_requested_at: usize,
     worker: watch::Handle,
 }
 
 impl App {
-    fn new(worker: watch::Handle, tx: Sender<UiMsg>, cfg: &Config) -> Self {
+    fn new(worker: watch::Handle, tx: Sender<UiMsg>, cfg: &Config, layout: LayoutMode) -> Self {
         App {
             snap: Arc::new(Snapshot::default()),
             interval_ms: cfg.interval.as_millis(),
+            layout,
             focus: Focus::Worktrees,
-            wt: ListPos::default(),
-            graph: ListPos::default(),
+            wt: Panel::default(),
+            graph: Panel::default(),
+            docs: HashMap::new(),
             graph_jump: None,
             diff: None,
             help: false,
             quit: false,
             areas: Areas::default(),
-            next_diff_id: 0,
+            next_id: 0,
             tx,
             last_click: None,
             more_requested_at: 0,
@@ -135,113 +188,347 @@ impl App {
         }
     }
 
+    pub fn panel(&self, f: Focus) -> &Panel {
+        match f {
+            Focus::Worktrees => &self.wt,
+            Focus::Graph => &self.graph,
+        }
+    }
+
+    fn panel_mut(&mut self, f: Focus) -> &mut Panel {
+        match f {
+            Focus::Worktrees => &mut self.wt,
+            Focus::Graph => &mut self.graph,
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Keys: what each base row is, and what it expands to
+
+    /// Identity of base row `r` of a panel.
+    pub fn row_key(&self, f: Focus, r: usize) -> Option<Key> {
+        match f {
+            Focus::Worktrees => self.snap.worktrees.get(r).map(|w| Key::Worktree(w.path.clone())),
+            Focus::Graph => {
+                let g = &self.snap.graph;
+                Some(match g.rows.get(r)?.kind {
+                    RowKind::Commit(ci) => Key::Commit(g.commits[ci].id.clone()),
+                    RowKind::Uncommitted(wi) => Key::Worktree(self.snap.worktrees.get(wi)?.path.clone()),
+                })
+            }
+        }
+    }
+
+    /// What base row `r` expands to / diffs: a commit, or a worktree's uncommitted changes.
+    /// A clean worktree shows its HEAD commit.
+    pub fn target(&self, f: Focus, r: usize) -> Option<Key> {
+        match f {
+            Focus::Graph => self.row_key(f, r),
+            Focus::Worktrees => {
+                let w = self.snap.worktrees.get(r)?;
+                if !w.has_worktree() {
+                    return None;
+                }
+                match (&w.status, &w.head) {
+                    (Some(st), Some(h)) if !st.is_dirty() => Some(Key::Commit(h.clone())),
+                    _ => Some(Key::Worktree(w.path.clone())),
+                }
+            }
+        }
+    }
+
+    fn row_of(&self, f: Focus, key: &Key) -> Option<usize> {
+        match (f, key) {
+            (Focus::Worktrees, Key::Worktree(p)) => self.snap.worktrees.iter().position(|w| &w.path == p),
+            (Focus::Worktrees, Key::Commit(_)) => None,
+            (Focus::Graph, Key::Commit(id)) => self.snap.graph.commit_row.get(id).copied(),
+            (Focus::Graph, Key::Worktree(p)) => {
+                let g = &self.snap.graph;
+                g.worktree_row
+                    .get(p)
+                    .copied()
+                    .filter(|&r| matches!(g.rows[r].kind, RowKind::Uncommitted(_)))
+            }
+        }
+    }
+
+    /// The doc for an inset item's row.
+    pub fn row_doc(&self, f: Focus, r: usize) -> Option<&Entry> {
+        self.docs.get(&self.target(f, r)?)
+    }
+
+    fn file_path(&self, f: Focus, r: usize, fi: usize) -> Option<String> {
+        Some(self.row_doc(f, r)?.ok()?.files.get(fi)?.path.clone())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Visual lines
+
+    /// Rebuild both panels' visual lines, requesting docs for newly opened rows.
+    fn rebuild(&mut self) {
+        for f in [Focus::Worktrees, Focus::Graph] {
+            let n = match f {
+                Focus::Worktrees => self.snap.worktrees.len(),
+                Focus::Graph => self.snap.graph.rows.len(),
+            };
+            let opened: Vec<(usize, Key, Key)> = self
+                .panel(f)
+                .exp
+                .keys()
+                .filter_map(|k| {
+                    let r = self.row_of(f, k)?;
+                    Some((r, k.clone(), self.target(f, r)?))
+                })
+                .collect();
+            for (_, _, target) in &opened {
+                self.request_doc(target);
+            }
+            let lines = inset::build(n, &opened, &self.panel(f).exp, &self.docs);
+            let p = self.panel_mut(f);
+            p.lines = lines;
+            p.pos.clamp(p.lines.len());
+        }
+    }
+
+    fn line_id(&self, f: Focus) -> Option<LineId> {
+        let p = self.panel(f);
+        let line = *p.lines.get(p.pos.sel)?;
+        let row = self.row_key(f, line.row())?;
+        let item = match line {
+            VLine::Row(_) => None,
+            VLine::Inset(r, item) => Some(match item {
+                Item::Message(i) => ItemId::Message(i),
+                Item::File(fi) => ItemId::File(self.file_path(f, r, fi)?),
+                Item::Diff(fi, li) => ItemId::Diff(self.file_path(f, r, fi)?, li),
+                Item::More(fi, _) => ItemId::More(self.file_path(f, r, fi)?),
+                Item::Loading | Item::Error | Item::Empty => ItemId::Other,
+            }),
+        };
+        Some(LineId { row, item })
+    }
+
+    /// Put the cursor back on the line with this identity (or its row) after a rebuild,
+    /// shifting the viewport along so the view doesn't jump.
+    fn relocate(&mut self, f: Focus, id: Option<LineId>) {
+        let Some(id) = id else { return };
+        let Some(r) = self.row_of(f, &id.row).or_else(|| match (&id.row, f) {
+            // A worktree that became clean: its uncommitted row is gone, use its HEAD.
+            (Key::Worktree(p), Focus::Graph) => self.snap.graph.worktree_row.get(p).copied(),
+            _ => None,
+        }) else {
+            return;
+        };
+        let p = self.panel(f);
+        let Some(row_idx) = inset::index_of_row(&p.lines, r) else {
+            return;
+        };
+        let same_row = |i: &usize| p.lines.get(*i).is_some_and(|l| l.row() == r);
+        let found = match &id.item {
+            None | Some(ItemId::Other) => Some(row_idx),
+            Some(item) => (row_idx..p.lines.len())
+                .take_while(same_row)
+                .find(|&i| {
+                    let VLine::Inset(_, it) = p.lines[i] else { return false };
+                    match (item, it) {
+                        (ItemId::Message(a), Item::Message(b)) => *a == b,
+                        (ItemId::File(path), Item::File(fi)) => self.file_path(f, r, fi).as_ref() == Some(path),
+                        (ItemId::Diff(path, a), Item::Diff(fi, b)) => {
+                            *a == b && self.file_path(f, r, fi).as_ref() == Some(path)
+                        }
+                        (ItemId::More(path), Item::More(fi, _)) => self.file_path(f, r, fi).as_ref() == Some(path),
+                        _ => false,
+                    }
+                })
+                .or(Some(row_idx)),
+        };
+        if let Some(idx) = found {
+            let p = self.panel_mut(f);
+            let shift = idx as isize - p.pos.sel as isize;
+            p.pos.offset = (p.pos.offset as isize + shift).max(0) as usize;
+            p.pos.sel = idx;
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Docs (diffs) for insets
+
+    fn worktree_stamp(&self, key: &Key) -> Option<(Option<crate::git::status::Status>, Option<i64>)> {
+        let Key::Worktree(p) = key else { return None };
+        let w = self.snap.worktrees.iter().find(|w| &w.path == p)?;
+        Some((w.status.clone(), w.changed_at))
+    }
+
+    fn diff_target(&self, key: &Key) -> Option<diff::Target> {
+        Some(match key {
+            Key::Commit(id) => diff::Target::Commit {
+                dir: self.snap.common_dir.clone(),
+                id: id.clone(),
+            },
+            Key::Worktree(p) => {
+                let w = self.snap.worktrees.iter().find(|w| &w.path == p)?;
+                diff::Target::Worktree {
+                    path: p.clone(),
+                    has_head: w.head.is_some(),
+                }
+            }
+        })
+    }
+
+    /// Start loading `key` unless it is loaded (and fresh) or already loading.
+    fn request_doc(&mut self, key: &Key) {
+        if self.docs.contains_key(key) {
+            return;
+        }
+        let Some(target) = self.diff_target(key) else { return };
+        self.next_id += 1;
+        let req = self.next_id;
+        self.docs.insert(
+            key.clone(),
+            Entry {
+                req,
+                stamp: self.worktree_stamp(key),
+                ..Default::default()
+            },
+        );
+        let (tx, key) = (self.tx.clone(), key.clone());
+        spawn_named("canopy-inset", move || {
+            let result = diff::load(&target).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiMsg::Inset { key, req, result });
+        });
+    }
+
+    /// Worktree docs whose status changed are reloaded if shown, dropped otherwise. Commit docs
+    /// never go stale; the cache is trimmed to what is open when it grows.
+    fn refresh_docs(&mut self) {
+        let stale: Vec<Key> = self
+            .docs
+            .iter()
+            .filter(|(k, e)| matches!(k, Key::Worktree(_)) && e.doc.is_some() && self.worktree_stamp(k) != e.stamp)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            let shown = self.wt.exp.is_open(&key) || self.graph.exp.is_open(&key);
+            if !shown {
+                self.docs.remove(&key);
+                continue;
+            }
+            // Keep showing the old doc until the new one arrives.
+            let Some(target) = self.diff_target(&key) else { continue };
+            self.next_id += 1;
+            let req = self.next_id;
+            let stamp = self.worktree_stamp(&key);
+            if let Some(e) = self.docs.get_mut(&key) {
+                e.req = req;
+                e.stamp = stamp;
+            }
+            let tx = self.tx.clone();
+            spawn_named("canopy-inset", move || {
+                let result = diff::load(&target).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiMsg::Inset { key, req, result });
+            });
+        }
+        if self.docs.len() > 256 {
+            let open: Vec<Key> = self.wt.exp.keys().chain(self.graph.exp.keys()).cloned().collect();
+            self.docs.retain(|k, _| open.contains(k));
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Messages
+
     fn handle(&mut self, msg: UiMsg) {
         match msg {
-            UiMsg::Snapshot(s) => self.on_snapshot(s),
+            UiMsg::Snapshot(s) => {
+                let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
+                self.on_snapshot(s, ids);
+            }
+            UiMsg::Inset { key, req, result } => {
+                let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
+                if let Some(e) = self.docs.get_mut(&key).filter(|e| e.req == req) {
+                    e.set(result);
+                }
+                self.rebuild();
+                self.relocate(Focus::Worktrees, ids.0);
+                self.relocate(Focus::Graph, ids.1);
+            }
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
                     d.loaded(result);
                 }
             }
-            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => match self.diff.as_mut() {
-                Some(d) if !self.help => {
-                    let action = d.on_key(k);
-                    self.diff_action(action);
+            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                match self.diff.as_mut() {
+                    Some(d) if !self.help => {
+                        let action = d.on_key(k);
+                        self.diff_action(action);
+                    }
+                    _ => self.on_key(k),
                 }
-                _ => self.on_key(k),
-            },
-            UiMsg::Input(Event::Mouse(m)) => match self.diff.as_mut() {
-                Some(d) => {
-                    let action = d.on_mouse(m);
-                    self.diff_action(action);
+                self.rebuild();
+            }
+            UiMsg::Input(Event::Mouse(m)) => {
+                match self.diff.as_mut() {
+                    Some(d) => {
+                        let action = d.on_mouse(m);
+                        self.diff_action(action);
+                    }
+                    None => self.on_mouse(m),
                 }
-                None => self.on_mouse(m),
-            },
+                self.rebuild();
+            }
             UiMsg::Input(_) => {}
         }
     }
 
-    fn row_key(&self, row: usize) -> Option<RowKey> {
-        let g = &self.snap.graph;
-        Some(match g.rows.get(row)?.kind {
-            RowKind::Commit(ci) => RowKey::Commit(g.commits[ci].id.clone()),
-            RowKind::Uncommitted(wi) => RowKey::Worktree(self.snap.worktrees.get(wi)?.path.clone()),
-        })
-    }
-
-    fn on_snapshot(&mut self, snap: Arc<Snapshot>) {
+    fn on_snapshot(&mut self, snap: Arc<Snapshot>, ids: (Option<LineId>, Option<LineId>)) {
         let first_wts = self.snap.worktrees.is_empty();
         let first_graph = self.snap.graph.rows.is_empty();
-        let selected_wt = self.snap.worktrees.get(self.wt.sel).map(|w| w.path.clone());
-        let selected_row = self.row_key(self.graph.sel);
-        let old_graph = self.snap.graph.clone();
+        let graph_changed = !Arc::ptr_eq(&self.snap.graph, &snap.graph);
         self.snap = snap;
+        self.refresh_docs();
+        self.rebuild();
 
         if first_wts {
             // Start on the worktree canopy was launched from.
-            if let Some(i) = self.snap.worktrees.iter().position(|w| w.is_current) {
-                self.wt.sel = i;
-                self.wt.follow = true;
+            if let Some(i) = self.snap.worktrees.iter().position(|w| w.is_current)
+                && let Some(idx) = inset::index_of_row(&self.wt.lines, i)
+            {
+                self.wt.pos.sel = idx;
+                self.wt.pos.follow = true;
             }
-        } else if let Some(p) = selected_wt
-            && let Some(i) = self.snap.worktrees.iter().position(|w| w.path == p)
-        {
-            self.wt.sel = i;
+        } else {
+            self.relocate(Focus::Worktrees, ids.0);
         }
-        self.wt.clamp(self.snap.worktrees.len());
-
         if first_graph && !self.snap.graph.rows.is_empty() {
-            self.graph_jump = self.snap.worktrees.get(self.wt.sel).map(|w| w.path.clone());
-        } else if !Arc::ptr_eq(&old_graph, &self.snap.graph) {
-            self.relocate_graph_selection(selected_row, &old_graph);
+            self.graph_jump = self.selected_worktree().map(|w| w.path.clone());
+        } else if graph_changed {
+            self.relocate(Focus::Graph, ids.1);
         }
-        self.graph.clamp(self.snap.graph.rows.len());
 
-        // Keep an open worktree diff in sync when that worktree's status changes.
-        let changed = match &self.diff {
-            Some(DiffView {
-                target: diff::Target::Worktree { path, .. },
-                status,
-                doc: Some(_),
-                ..
-            }) => {
-                let now = self
-                    .snap
-                    .worktrees
-                    .iter()
-                    .find(|w| &w.path == path)
-                    .and_then(|w| w.status.clone());
-                now.is_some() && now != *status
-            }
+        // Keep an open worktree diff in sync when that worktree changes.
+        let stale = match &self.diff {
+            Some(d @ DiffView { doc: Some(_), .. }) => match &d.target {
+                diff::Target::Worktree { path, .. } => {
+                    let now = self.worktree_stamp(&Key::Worktree(path.clone()));
+                    now.is_some_and(|now| now.0.is_some() && Some(now) != d.stamp)
+                }
+                _ => false,
+            },
             _ => false,
         };
-        if changed {
+        if stale {
             self.reload_diff();
         }
     }
 
-    /// Keep the same commit (or uncommitted row) selected when the graph is rebuilt.
-    fn relocate_graph_selection(&mut self, key: Option<RowKey>, old: &crate::graph::Graph) {
-        let g = &self.snap.graph;
-        let found = match &key {
-            Some(RowKey::Commit(id)) => g.commit_row.get(id).copied(),
-            Some(RowKey::Worktree(p)) => g
-                .rows
-                .iter()
-                .position(|r| matches!(r.kind, RowKind::Uncommitted(wi) if self.snap.worktrees.get(wi).is_some_and(|w| &w.path == p)))
-                // The worktree became clean: fall back to its HEAD.
-                .or_else(|| g.worktree_row.get(p).copied()),
-            None => None,
-        };
-        if let Some(row) = found {
-            // Shift the viewport with the row so rows inserted above don't make the view jump.
-            let shift = row as isize - self.graph.sel as isize;
-            self.graph.offset = (self.graph.offset as isize + shift).max(0) as usize;
-            self.graph.sel = row;
-        } else if old.rows.is_empty() {
-            self.graph.sel = 0;
-        }
+    /// The worktree under the worktree panel's cursor.
+    pub fn selected_worktree(&self) -> Option<&crate::model::WorktreeView> {
+        let line = self.wt.lines.get(self.wt.pos.sel)?;
+        self.snap.worktrees.get(line.row())
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Keyboard and mouse
 
     fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -252,20 +539,29 @@ impl App {
                 return;
             }
         }
+        let f = self.focus;
         match k.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('r') => self.worker.request(Request::Refresh),
-            KeyCode::Enter | KeyCode::Char(' ') => self.open_diff(),
+            KeyCode::Char('v') => {
+                self.layout = match self.layout {
+                    LayoutMode::Stacked => LayoutMode::Side,
+                    LayoutMode::Side => LayoutMode::Stacked,
+                };
+                self.panel_mut(Focus::Graph).pos.follow = true;
+            }
+            KeyCode::Enter => self.open_full(f, self.panel(f).pos.sel),
+            KeyCode::Char(' ') => self.space(f),
+            KeyCode::Right | KeyCode::Char('l') => self.expand(f),
+            KeyCode::Left | KeyCode::Char('h') => self.collapse(f),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Worktrees => Focus::Graph,
                     Focus::Graph => Focus::Worktrees,
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Worktrees,
-            KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Graph,
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Char('d') if ctrl => self.move_sel(self.page() as isize / 2),
@@ -287,125 +583,262 @@ impl App {
     }
 
     fn move_sel(&mut self, delta: isize) {
-        match self.focus {
-            Focus::Worktrees => {
-                let before = self.wt.sel;
-                self.wt.move_by(delta, self.snap.worktrees.len());
-                if self.wt.sel != before {
-                    self.select_worktree(self.wt.sel);
-                }
-            }
-            Focus::Graph => {
-                self.graph.move_by(delta, self.snap.graph.rows.len());
-                self.maybe_load_more();
-            }
+        let f = self.focus;
+        let before = self.panel(f).lines.get(self.panel(f).pos.sel).map(|l| l.row());
+        let p = self.panel_mut(f);
+        p.pos.move_by(delta, p.lines.len());
+        let after = p.lines.get(p.pos.sel).map(|l| l.row());
+        match f {
+            Focus::Worktrees if before != after => self.jump_graph_to_selected(),
+            Focus::Graph => self.maybe_load_more(),
+            _ => {}
         }
     }
 
-    /// Select a worktree and show it in the graph.
-    fn select_worktree(&mut self, i: usize) {
-        self.wt.sel = i;
-        self.wt.follow = true;
-        self.graph_jump = self.snap.worktrees.get(i).map(|w| w.path.clone());
+    fn jump_graph_to_selected(&mut self) {
+        self.graph_jump = self.selected_worktree().map(|w| w.path.clone());
     }
 
-    /// Ask the worker for more history when the selection nears the end of what is loaded.
+    /// Ask the worker for more history when the cursor or view nears the end of what is loaded.
     fn maybe_load_more(&mut self) {
-        let g = &self.snap.graph;
-        let rows = g.rows.len();
-        let near_end = self.graph.sel + 2 * self.page() >= rows || self.graph.offset + 2 * self.page() >= rows;
-        if g.truncated && near_end && self.more_requested_at != rows {
+        let rows = self.snap.graph.rows.len();
+        let (len, page) = (self.graph.lines.len(), self.page());
+        let pos = self.graph.pos;
+        let near_end = pos.sel + 2 * page >= len || pos.offset + 2 * page >= len;
+        if self.snap.graph.truncated && near_end && self.more_requested_at != rows {
             self.more_requested_at = rows;
             self.worker.request(Request::LoadMore);
         }
     }
 
-    /// Register a click on a row; a second click on the same row soon after opens its diff.
-    fn click(&mut self, panel: Focus, row: usize) {
-        let now = Instant::now();
-        let double = self
-            .last_click
-            .is_some_and(|(t, p, r)| p == panel && r == row && now.duration_since(t) < Duration::from_millis(400));
-        self.last_click = if double { None } else { Some((now, panel, row)) };
-        if double {
-            self.open_diff();
+    /// Expand or collapse what is at `line`: a row's summary or a file's diff. Returns whether
+    /// anything changed.
+    fn toggle_at(&mut self, f: Focus, line: usize) -> bool {
+        let Some(&l) = self.panel(f).lines.get(line) else {
+            return false;
+        };
+        let Some(rk) = self.row_key(f, l.row()) else {
+            return false;
+        };
+        match l {
+            VLine::Row(r) => {
+                if self.target(f, r).is_none() {
+                    return false;
+                }
+                self.panel_mut(f).exp.toggle(&rk);
+                true
+            }
+            VLine::Inset(r, Item::File(fi)) => {
+                let Some(path) = self.file_path(f, r, fi) else {
+                    return false;
+                };
+                self.panel_mut(f).exp.toggle_file(&rk, &path);
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Open the diff for the current selection: a commit, or a worktree's uncommitted changes.
-    /// A clean worktree shows its HEAD commit instead.
-    fn open_diff(&mut self) {
-        let snap = self.snap.clone();
-        let commit = |id: &str| {
-            let subject = snap
-                .graph
-                .commit_row
-                .get(id)
-                .and_then(|&r| match snap.graph.rows[r].kind {
-                    RowKind::Commit(ci) => Some(snap.graph.commits[ci].subject.clone()),
+    /// Space: toggle a row or file; inside a diff or the message, fold the enclosing section.
+    fn space(&mut self, f: Focus) {
+        let sel = self.panel(f).pos.sel;
+        match self.panel(f).lines.get(sel) {
+            Some(VLine::Row(_)) | Some(VLine::Inset(_, Item::File(_))) => {
+                self.toggle_at(f, sel);
+            }
+            Some(_) => self.collapse(f),
+            None => {}
+        }
+    }
+
+    fn expand(&mut self, f: Focus) {
+        let sel = self.panel(f).pos.sel;
+        let Some(&l) = self.panel(f).lines.get(sel) else { return };
+        let Some(rk) = self.row_key(f, l.row()) else { return };
+        match l {
+            VLine::Row(r) if self.target(f, r).is_some() => self.panel_mut(f).exp.open(&rk),
+            VLine::Inset(r, Item::File(fi)) => {
+                if let Some(path) = self.file_path(f, r, fi)
+                    && !self.panel(f).exp.file_open(&rk, &path)
+                {
+                    self.panel_mut(f).exp.toggle_file(&rk, &path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fold the innermost open section around the cursor and move the cursor to its header.
+    fn collapse(&mut self, f: Focus) {
+        let sel = self.panel(f).pos.sel;
+        let Some(&l) = self.panel(f).lines.get(sel) else { return };
+        let Some(rk) = self.row_key(f, l.row()) else { return };
+        let lines = &self.panel(f).lines;
+        match l {
+            VLine::Row(_) => self.panel_mut(f).exp.close(&rk),
+            VLine::Inset(r, Item::Diff(fi, _) | Item::More(fi, _)) => {
+                let header = (0..sel).rev().find(|&i| lines[i] == VLine::Inset(r, Item::File(fi)));
+                if let Some(path) = self.file_path(f, r, fi) {
+                    self.panel_mut(f).exp.close_file(&rk, &path);
+                }
+                if let Some(h) = header {
+                    self.set_cursor(f, h);
+                }
+            }
+            VLine::Inset(r, _) => {
+                let header = inset::index_of_row(lines, r);
+                self.panel_mut(f).exp.close(&rk);
+                if let Some(h) = header {
+                    self.set_cursor(f, h);
+                }
+            }
+        }
+    }
+
+    fn set_cursor(&mut self, f: Focus, idx: usize) {
+        let p = self.panel_mut(f);
+        p.pos.sel = idx;
+        p.pos.follow = true;
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        let hit = [
+            (Focus::Worktrees, self.areas.worktrees),
+            (Focus::Graph, self.areas.graph),
+        ]
+        .into_iter()
+        .find(|(_, a)| a.contains(pos));
+        let Some((f, area)) = hit else { return };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = f;
+                if m.row <= area.y || m.row + 1 >= area.y + area.height {
+                    return;
+                }
+                let idx = self.panel(f).pos.offset + (m.row - area.y - 1) as usize;
+                if idx >= self.panel(f).lines.len() {
+                    return;
+                }
+                let before = self.panel(f).lines.get(self.panel(f).pos.sel).map(|l| l.row());
+                self.set_cursor(f, idx);
+                if f == Focus::Worktrees && before != Some(self.panel(f).lines[idx].row()) {
+                    self.jump_graph_to_selected();
+                }
+                let now = Instant::now();
+                let double = self
+                    .last_click
+                    .as_ref()
+                    .filter(|c| c.panel == f && c.line == idx && now.duration_since(c.at) < Duration::from_millis(400));
+                if let Some(first) = double {
+                    // Double-click: undo the first click's expand/collapse, open the full view.
+                    if first.toggled {
+                        self.toggle_at(f, idx);
+                    }
+                    self.last_click = None;
+                    self.open_full(f, idx);
+                } else {
+                    let toggled = self.toggle_at(f, idx);
+                    self.last_click = Some(Click {
+                        at: now,
+                        panel: f,
+                        line: idx,
+                        toggled,
+                    });
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let d: isize = if m.kind == MouseEventKind::ScrollDown { 3 } else { -3 };
+                let h = area.height.saturating_sub(2) as usize;
+                let p = self.panel_mut(f);
+                p.pos.scroll_by(d, p.lines.len(), h);
+                if f == Focus::Graph {
+                    self.maybe_load_more();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Full-screen diff view
+
+    /// Open the full diff view for the thing at `line`, focused on the file (and position)
+    /// under the cursor when it is inside an inset.
+    fn open_full(&mut self, f: Focus, line: usize) {
+        let Some(&l) = self.panel(f).lines.get(line) else {
+            return;
+        };
+        let r = l.row();
+        let Some(key) = self.target(f, r) else { return };
+        let Some(target) = self.diff_target(&key) else { return };
+        let title = match &key {
+            Key::Commit(id) => {
+                let short = &id[..id.len().min(7)];
+                let g = &self.snap.graph;
+                let subject = g.commit_row.get(id).and_then(|&row| match g.rows[row].kind {
+                    RowKind::Commit(ci) => Some(g.commits[ci].subject.clone()),
                     RowKind::Uncommitted(_) => None,
                 });
-            let short = &id[..id.len().min(7)];
-            let title = match subject {
-                Some(s) => format!("{short} {s}"),
-                None => short.to_string(),
-            };
-            (
-                title,
-                diff::Target::Commit {
-                    dir: snap.common_dir.clone(),
-                    id: id.to_string(),
-                },
-                None,
-            )
-        };
-        let worktree = |wi: usize| {
-            let w = snap.worktrees.get(wi)?;
-            if !w.has_worktree() {
-                return None;
+                match subject {
+                    Some(s) => format!("{short} {s}"),
+                    None => short.to_string(),
+                }
             }
-            if !w.is_dirty() && w.status.is_some() {
-                return w.head.as_deref().map(commit);
+            Key::Worktree(p) => {
+                let name = self
+                    .snap
+                    .worktrees
+                    .iter()
+                    .find(|w| &w.path == p)
+                    .map(|w| w.name.as_str());
+                format!("[{}] uncommitted changes", name.unwrap_or("?"))
             }
-            let title = format!("[{}] uncommitted changes", w.name);
-            let target = diff::Target::Worktree {
-                path: w.path.clone(),
-                has_head: w.head.is_some(),
-            };
-            Some((title, target, w.status.clone()))
         };
-        let picked = match self.focus {
-            Focus::Worktrees => worktree(self.wt.sel),
-            Focus::Graph => match snap.graph.rows.get(self.graph.sel).map(|r| r.kind) {
-                Some(RowKind::Commit(ci)) => Some(commit(&snap.graph.commits[ci].id)),
-                Some(RowKind::Uncommitted(wi)) => worktree(wi),
-                None => None,
-            },
+        // Where to land: (file, scroll) within the doc.
+        let focus = match l {
+            VLine::Row(_) => None,
+            VLine::Inset(_, Item::Message(_)) => Some((None, 0)),
+            VLine::Inset(_, Item::File(fi)) => self.file_path(f, r, fi).map(|p| (Some(p), 0)),
+            VLine::Inset(_, Item::Diff(fi, li)) => self.file_path(f, r, fi).map(|p| (Some(p), li.saturating_sub(3))),
+            VLine::Inset(_, Item::More(fi, _)) => self.row_doc(f, r).and_then(|e| {
+                let file = e.ok()?.files.get(fi)?;
+                Some((Some(file.path.clone()), inset::diff_start(file) + inset::MAX_INLINE - 3))
+            }),
+            VLine::Inset(_, _) => None,
         };
-        let Some((title, target, status)) = picked else { return };
-        self.next_diff_id += 1;
-        self.diff = Some(DiffView::new(self.next_diff_id, title, target, status));
-        self.spawn_diff_load();
+
+        self.next_id += 1;
+        let mut view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&key));
+        if let Some((file, scroll)) = focus {
+            view.focus_on(file, scroll);
+        }
+        let cached = self.docs.get(&key).filter(|e| self.worktree_stamp(&key) == e.stamp);
+        match cached.and_then(|e| e.ok()) {
+            Some(doc) => {
+                view.loaded(Ok(doc.clone()));
+                self.diff = Some(view);
+            }
+            None => {
+                self.diff = Some(view);
+                self.spawn_diff_load();
+            }
+        }
     }
 
     fn reload_diff(&mut self) {
-        let status = match &self.diff {
-            Some(DiffView {
-                target: diff::Target::Worktree { path, .. },
-                ..
-            }) => self
-                .snap
-                .worktrees
-                .iter()
-                .find(|w| &w.path == path)
-                .and_then(|w| w.status.clone()),
-            _ => None,
+        let stamp = match &self.diff {
+            Some(d) => match &d.target {
+                diff::Target::Worktree { path, .. } => self.worktree_stamp(&Key::Worktree(path.clone())),
+                diff::Target::Commit { .. } => None,
+            },
+            None => return,
         };
+        self.next_id += 1;
         if let Some(d) = self.diff.as_mut() {
-            self.next_diff_id += 1;
-            d.begin_reload(self.next_diff_id);
-            if status.is_some() {
-                d.status = status;
+            d.begin_reload(self.next_id);
+            if stamp.is_some() {
+                d.stamp = stamp;
             }
         }
         self.spawn_diff_load();
@@ -414,13 +847,10 @@ impl App {
     fn spawn_diff_load(&self) {
         let Some(d) = &self.diff else { return };
         let (id, target, tx) = (d.id, d.target.clone(), self.tx.clone());
-        thread::Builder::new()
-            .name("canopy-diff".into())
-            .spawn(move || {
-                let result = diff::load(&target).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(UiMsg::Diff { id, result });
-            })
-            .expect("spawn diff thread");
+        spawn_named("canopy-diff", move || {
+            let result = diff::load(&target).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiMsg::Diff { id, result });
+        });
     }
 
     fn diff_action(&mut self, action: Action) {
@@ -432,49 +862,14 @@ impl App {
             Action::Quit => self.quit = true,
         }
     }
+}
 
-    fn on_mouse(&mut self, m: MouseEvent) {
-        let pos = Position::new(m.column, m.row);
-        let (wa, ga) = (self.areas.worktrees, self.areas.graph);
-        // Row index inside a bordered panel, if the position is on a content row.
-        let row_in = |area: Rect, offset: usize| -> Option<usize> {
-            (area.contains(pos) && m.row > area.y && m.row + 1 < area.y + area.height)
-                .then(|| offset + (m.row - area.y - 1) as usize)
-        };
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if wa.contains(pos) {
-                    self.focus = Focus::Worktrees;
-                    if let Some(i) = row_in(wa, self.wt.offset).filter(|&i| i < self.snap.worktrees.len()) {
-                        self.select_worktree(i);
-                        self.click(Focus::Worktrees, i);
-                    }
-                } else if ga.contains(pos) {
-                    self.focus = Focus::Graph;
-                    if let Some(i) = row_in(ga, self.graph.offset).filter(|&i| i < self.snap.graph.rows.len()) {
-                        self.graph.sel = i;
-                        self.click(Focus::Graph, i);
-                    }
-                }
-            }
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                let d: isize = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
-                if wa.contains(pos) {
-                    self.focus = Focus::Worktrees;
-                    self.move_sel(d);
-                } else if ga.contains(pos) {
-                    let h = ga.height.saturating_sub(2) as usize;
-                    self.graph.scroll_by(3 * d, self.snap.graph.rows.len(), h);
-                    self.maybe_load_more();
-                }
-            }
-            _ => {}
-        }
-    }
+fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
+    thread::Builder::new().name(name.into()).spawn(f).expect("spawn thread");
 }
 
 /// Run the TUI until the user quits.
-pub fn run(paths: RepoPaths, cfg: Config) -> Result<()> {
+pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
     let snap_tx = tx.clone();
@@ -491,7 +886,7 @@ pub fn run(paths: RepoPaths, cfg: Config) -> Result<()> {
     let mut terminal = ratatui::try_init()?;
     let _ = execute!(stdout(), EnableMouseCapture);
 
-    let mut app = App::new(worker, tx, &cfg);
+    let mut app = App::new(worker, tx, &cfg, layout);
     let res = event_loop(&mut terminal, &mut app, &rx);
 
     let _ = execute!(stdout(), DisableMouseCapture);
@@ -517,14 +912,11 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Recei
 }
 
 fn spawn_input(tx: Sender<UiMsg>) {
-    thread::Builder::new()
-        .name("canopy-input".into())
-        .spawn(move || {
-            while let Ok(ev) = event::read() {
-                if tx.send(UiMsg::Input(ev)).is_err() {
-                    break;
-                }
+    spawn_named("canopy-input", move || {
+        while let Ok(ev) = event::read() {
+            if tx.send(UiMsg::Input(ev)).is_err() {
+                break;
             }
-        })
-        .expect("spawn input thread");
+        }
+    });
 }

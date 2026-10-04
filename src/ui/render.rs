@@ -8,7 +8,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::diff_view::Pane;
-use super::{App, Focus};
+use super::inset::{self, Item, VLine};
+use super::{App, Focus, LayoutMode};
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::model::WorktreeView;
 
@@ -30,19 +31,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         return;
     }
-    let [left, right] = if main.width < NARROW {
-        // Narrow terminal (e.g. a popup pane): stack the worktree list above the graph.
-        let want = app.snap.worktrees.len().max(1) as u16 + 2;
+    // Stacked: graph on top, worktrees below, both full width. Narrow terminals always stack.
+    let stacked = app.layout == LayoutMode::Stacked || main.width < NARROW;
+    let (wt_area, graph_area) = if stacked {
+        let want = app.wt.lines.len().max(1) as u16 + 2;
         let h = want.min(main.height / 2).max(3.min(main.height));
-        Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(main)
+        let [top, bottom] = Layout::vertical([Constraint::Min(0), Constraint::Length(h)]).areas(main);
+        (bottom, top)
     } else {
         let wt_width = worktree_panel_width(app, main.width);
-        Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main)
+        let [left, right] = Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main);
+        (left, right)
     };
-    app.areas.worktrees = left;
-    app.areas.graph = right;
-    draw_worktrees(f, app, left);
-    draw_graph(f, app, right);
+    app.areas.worktrees = wt_area;
+    app.areas.graph = graph_area;
+    draw_worktrees(f, app, wt_area, stacked);
+    draw_graph(f, app, graph_area);
     draw_footer(f, app, footer);
     if app.help {
         draw_help(f);
@@ -256,7 +260,165 @@ fn pad(s: String, width: usize) -> String {
     if w >= width { s } else { s + &" ".repeat(width - w) }
 }
 
-fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
+/// Column widths shared by all worktree rows.
+struct WtCols {
+    name: usize,
+    counts: usize,
+    ab: usize,
+    /// "edited 3m" column (wide rows only).
+    activity: usize,
+    /// Path column (wide rows only).
+    path: usize,
+}
+
+fn activity_text(w: &WorktreeView, now: i64) -> Option<String> {
+    w.is_dirty().then_some(())?;
+    Some(format!("edited {}", age(w.changed_at?, now)))
+}
+
+/// Keep the end of a path that does not fit: `…/wt/feat-auth`.
+fn truncate_left(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut w = 1;
+    for c in s.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > width {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out.into_iter().rev().collect()
+}
+
+/// Deepest directory containing all `paths` (when there are at least two).
+fn common_parent<'a>(paths: impl Iterator<Item = &'a std::path::Path>) -> Option<std::path::PathBuf> {
+    let mut paths = paths.peekable();
+    let first = paths.next()?;
+    paths.peek()?;
+    let mut common: std::path::PathBuf = first.parent()?.to_path_buf();
+    for p in paths {
+        while !p.starts_with(&common) {
+            common = common.parent()?.to_path_buf();
+        }
+    }
+    Some(common)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wt_line(
+    row: WtRow,
+    w: &WorktreeView,
+    shown_path: &str,
+    cols: &WtCols,
+    wide: bool,
+    width: usize,
+    now: i64,
+) -> Line<'static> {
+    let dim = Style::new().fg(C_DIM);
+    let mut spans = vec![row.marker, Span::raw(" ")];
+    spans.push(Span::styled(
+        pad(truncate(&row.name.content, cols.name), cols.name),
+        row.name.style,
+    ));
+    spans.push(Span::raw(" "));
+    let cw = spans_width(&row.counts);
+    spans.extend(row.counts);
+    if cols.ab > 0 || wide {
+        spans.push(Span::raw(" ".repeat(cols.counts - cw + 1)));
+        let aw = spans_width(&row.ab);
+        spans.extend(row.ab);
+        if wide {
+            spans.push(Span::raw(" ".repeat(cols.ab - aw + 2)));
+        }
+    }
+    if !wide {
+        return Line::from(spans);
+    }
+
+    // Wide rows: last edit, HEAD commit (sha, age, subject), path on the right.
+    let activity = activity_text(w, now).unwrap_or_default();
+    if cols.activity > 0 {
+        spans.push(Span::styled(pad(activity, cols.activity), Style::new().fg(C_MODIFIED)));
+        spans.push(Span::raw("  "));
+    }
+    let used = spans_width(&spans);
+    let path = truncate_left(shown_path, cols.path);
+    let room = width.saturating_sub(used + cols.path + 2);
+    if let Some(h) = &w.head {
+        let mut head = vec![
+            Span::styled(h[..h.len().min(7)].to_string(), Style::new().fg(Color::Yellow)),
+            Span::styled(
+                format!(" {:>3} ", w.head_time.map(|t| age(t, now)).unwrap_or_default()),
+                dim,
+            ),
+        ];
+        let subject_room = room.saturating_sub(spans_width(&head));
+        if room > 12 {
+            let subject = w.head_subject.clone().unwrap_or_default();
+            head.push(Span::raw(truncate(&subject, subject_room)));
+            spans.extend(head);
+        }
+    }
+    let used = spans_width(&spans);
+    if cols.path > 0 && used + 2 + path.width() <= width {
+        spans.push(Span::raw(" ".repeat(width - used - path.width())));
+        spans.push(Span::styled(path, dim));
+    }
+    Line::from(spans)
+}
+
+/// An inset line's content (without indentation): message, file entry or diff line.
+fn inset_spans(app: &App, f: Focus, r: usize, item: Item) -> Vec<Span<'static>> {
+    let dim = Style::new().fg(C_DIM);
+    let entry = app.row_doc(f, r);
+    let file = |fi: usize| entry.and_then(|e| e.ok()).and_then(|d| d.files.get(fi));
+    match item {
+        Item::Loading => vec![Span::styled("loading…", dim)],
+        Item::Error => {
+            let msg = match entry.and_then(|e| e.doc.as_ref()) {
+                Some(Err(e)) => e.lines().next().unwrap_or("").to_string(),
+                _ => String::new(),
+            };
+            vec![Span::styled(msg, Style::new().fg(C_CONFLICT))]
+        }
+        Item::Empty => vec![Span::styled("no changes", dim)],
+        Item::Message(i) => {
+            let text = entry.and_then(|e| e.message.get(i)).cloned().unwrap_or_default();
+            vec![Span::styled(text, dim.add_modifier(Modifier::ITALIC))]
+        }
+        Item::File(fi) => {
+            let Some(file) = file(fi) else { return vec![] };
+            let open = app
+                .row_key(f, r)
+                .is_some_and(|k| app.panel(f).exp.file_open(&k, &file.path));
+            let mut spans = vec![
+                Span::styled(if open { "▾ " } else { "▸ " }, dim),
+                Span::styled(format!("{} ", file.status), Style::new().fg(status_color(file.status))),
+                Span::raw(file.path.clone()),
+                Span::raw("  "),
+            ];
+            spans.extend(add_del_spans(file.adds, file.dels));
+            spans
+        }
+        Item::Diff(fi, li) => {
+            let Some(line) = file(fi).and_then(|f| f.lines.get(li)) else {
+                return vec![];
+            };
+            vec![Span::raw("  "), Span::styled(line.clone(), diff_line_style(line))]
+        }
+        Item::More(_, n) => vec![Span::styled(
+            format!("  … {n} more lines · Enter for the full diff"),
+            dim,
+        )],
+    }
+}
+
+fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let focused = app.focus == Focus::Worktrees;
     let n = app.snap.worktrees.len();
     let dirty = app.snap.worktrees.iter().filter(|w| w.is_dirty()).count();
@@ -275,35 +437,83 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let now = now_secs();
     let rows = wt_rows(app);
-    let avail = inner.width as usize;
-    let counts_w = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
-    let ab_w = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
+    let width = inner.width as usize;
+    let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
+    let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     let name_natural = rows.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
-    let fixed = 2 + 1 + counts_w + if ab_w > 0 { 1 + ab_w } else { 0 };
-    let name_w = name_natural.min(NAME_MAX).min(avail.saturating_sub(fixed).max(6));
+    let fixed = 2 + 1 + counts + if ab > 0 { 1 + ab } else { 0 };
+    let activity = if wide {
+        app.snap
+            .worktrees
+            .iter()
+            .filter_map(|w| activity_text(w, now))
+            .map(|s| s.width())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let base = common_parent(app.snap.worktrees.iter().map(|w| w.path.as_path()));
+    let shown_path = |w: &WorktreeView| match &base {
+        Some(b) => w
+            .path
+            .strip_prefix(b)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        None => tilde(&w.path),
+    };
+    let path = if wide {
+        let longest = app
+            .snap
+            .worktrees
+            .iter()
+            .map(|w| shown_path(w).width())
+            .max()
+            .unwrap_or(0);
+        longest.min(width / 4)
+    } else {
+        0
+    };
+    let cols = WtCols {
+        name: name_natural.min(NAME_MAX).min(width.saturating_sub(fixed).max(6)),
+        counts,
+        ab,
+        activity,
+        path,
+    };
 
-    app.wt.clamp(n);
-    app.wt.scroll_into_view(inner.height as usize);
-    let lines: Vec<Line> = rows
+    let height = inner.height as usize;
+    app.wt.pos.clamp(app.wt.lines.len());
+    app.wt.pos.scroll_into_view(height);
+    let mut rows: Vec<Option<WtRow>> = rows.into_iter().map(Some).collect();
+    let visible: Vec<VLine> = app
+        .wt
+        .lines
+        .iter()
+        .skip(app.wt.pos.offset)
+        .take(height)
+        .copied()
+        .collect();
+    let lines: Vec<Line> = visible
         .into_iter()
-        .skip(app.wt.offset)
-        .take(inner.height as usize)
-        .map(|r| {
-            let mut spans = vec![r.marker, Span::raw(" ")];
-            let name = pad(truncate(&r.name.content, name_w), name_w);
-            spans.push(Span::styled(name, r.name.style));
-            spans.push(Span::raw(" "));
-            let cw = spans_width(&r.counts);
-            spans.extend(r.counts);
-            if ab_w > 0 {
-                spans.push(Span::raw(" ".repeat(counts_w - cw + 1)));
-                spans.extend(r.ab);
+        .map(|l| match l {
+            VLine::Row(r) => match rows.get_mut(r).and_then(Option::take) {
+                Some(row) => {
+                    let w = &app.snap.worktrees[r];
+                    wt_line(row, w, &shown_path(w), &cols, wide, width, now)
+                }
+                None => Line::default(),
+            },
+            VLine::Inset(r, item) => {
+                let mut spans = vec![Span::raw("    ")];
+                spans.extend(inset_spans(app, Focus::Worktrees, r, item));
+                Line::from(spans)
             }
-            Line::from(spans)
         })
         .collect();
-    let sel = app.wt.sel.checked_sub(app.wt.offset);
+    let sel = app.wt.pos.sel.checked_sub(app.wt.pos.offset);
     paint_rows(f, inner, lines, sel, focused);
 }
 
@@ -355,17 +565,26 @@ fn worktree_label(name: &str) -> Span<'static> {
     )
 }
 
-fn graph_line(app: &App, row: &Row, now: i64) -> Line<'static> {
-    let g = &app.snap.graph;
+fn cells_spans(cells: &[graph::Cell]) -> Vec<Span<'static>> {
     let mut spans: Vec<Span> = Vec::new();
     // Group consecutive cells of the same color into one span.
-    for cell in &row.cells {
+    for cell in cells {
         let style = lane_style(cell.color);
         match spans.last_mut() {
             Some(last) if last.style == style => last.content.to_mut().push(cell.ch),
             _ => spans.push(Span::styled(cell.ch.to_string(), style)),
         }
     }
+    spans
+}
+
+/// Below this panel width the graph leaves out the author column.
+const AUTHOR_MIN_WIDTH: usize = 100;
+const AUTHOR_MAX: usize = 18;
+
+fn graph_line(app: &App, row: &Row, now: i64, width: usize) -> Line<'static> {
+    let g = &app.snap.graph;
+    let mut spans = cells_spans(&row.cells);
     spans.push(Span::raw(" "));
     match row.kind {
         RowKind::Commit(ci) => {
@@ -404,7 +623,18 @@ fn graph_line(app: &App, row: &Row, now: i64) -> Line<'static> {
                 spans.extend(refs);
                 spans.push(Span::styled(") ", Style::new().fg(C_DIM)));
             }
-            spans.push(Span::raw(c.subject.clone()));
+            if width >= AUTHOR_MIN_WIDTH {
+                // Subject, then the author right-aligned.
+                let author = truncate(&c.author, AUTHOR_MAX);
+                let room = width.saturating_sub(spans_width(&spans) + AUTHOR_MAX + 2);
+                let subject = truncate(&c.subject, room);
+                let gap = width.saturating_sub(spans_width(&spans) + subject.width() + author.width());
+                spans.push(Span::raw(subject));
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::styled(author, Style::new().fg(C_DIM)));
+            } else {
+                spans.push(Span::raw(c.subject.clone()));
+            }
         }
         RowKind::Uncommitted(wi) => {
             if let Some(w) = app.snap.worktrees.get(wi) {
@@ -442,27 +672,48 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let len = app.graph.lines.len();
     if let Some(path) = app.graph_jump.take()
         && let Some(&row) = g.worktree_row.get(&path)
+        && let Some(idx) = inset::index_of_row(&app.graph.lines, row)
     {
-        app.graph.sel = row;
-        app.graph.follow = false;
+        let pos = &mut app.graph.pos;
+        pos.sel = idx;
+        pos.follow = false;
         // Only scroll when the row is not comfortably visible; then put it a third from the top.
         let margin = (height / 4).min(3);
-        let off = app.graph.offset;
-        if row < off + margin || row + margin >= off + height {
-            app.graph.offset = row.saturating_sub(height / 3);
+        if idx < pos.offset + margin || idx + margin >= pos.offset + height {
+            pos.offset = idx.saturating_sub(height / 3);
         }
-        app.graph.offset = app.graph.offset.min(g.rows.len().saturating_sub(height));
+        pos.offset = pos.offset.min(len.saturating_sub(height));
     }
-    app.graph.clamp(g.rows.len());
-    app.graph.scroll_into_view(height);
+    app.graph.pos.clamp(len);
+    app.graph.pos.scroll_into_view(height);
 
     let now = now_secs();
-    let mut lines: Vec<Line> = g.rows[app.graph.offset..]
+    let width = inner.width as usize;
+    let visible: Vec<VLine> = app
+        .graph
+        .lines
         .iter()
+        .skip(app.graph.pos.offset)
         .take(height)
-        .map(|r| graph_line(app, r, now))
+        .copied()
+        .collect();
+    let mut lines: Vec<Line> = visible
+        .into_iter()
+        .map(|l| match l {
+            VLine::Row(r) => graph_line(app, &g.rows[r], now, width),
+            VLine::Inset(r, item) => {
+                // Keep drawing the lanes that pass by, then the inset content.
+                let row = &g.rows[r];
+                let indent = row.cells.len().max(row.below.len()) + 1;
+                let mut spans = cells_spans(&row.below);
+                spans.push(Span::raw(" ".repeat(indent - row.below.len() + 1)));
+                spans.extend(inset_spans(app, Focus::Graph, r, item));
+                Line::from(spans)
+            }
+        })
         .collect();
     if g.truncated && lines.len() < height {
         lines.push(Line::from(Span::styled(
@@ -470,7 +721,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
             Style::new().fg(C_DIM),
         )));
     }
-    let sel = app.graph.sel.checked_sub(app.graph.offset);
+    let sel = app.graph.pos.sel.checked_sub(app.graph.pos.offset);
     paint_rows(f, inner, lines, sel, focused);
 }
 
@@ -524,7 +775,8 @@ fn worktree_details(w: &WorktreeView) -> Line<'static> {
 
 fn graph_details(app: &App) -> Option<Line<'static>> {
     let g = &app.snap.graph;
-    match g.rows.get(app.graph.sel)?.kind {
+    let row = app.graph.lines.get(app.graph.pos.sel)?.row();
+    match g.rows.get(row)?.kind {
         RowKind::Uncommitted(wi) => app.snap.worktrees.get(wi).map(worktree_details),
         RowKind::Commit(ci) => {
             let c = &g.commits[ci];
@@ -824,7 +1076,7 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let line = match app.focus {
-        Focus::Worktrees => app.snap.worktrees.get(app.wt.sel).map(worktree_details),
+        Focus::Worktrees => app.selected_worktree().map(worktree_details),
         Focus::Graph => graph_details(app),
     };
     if let Some(e) = &app.snap.error {
@@ -841,10 +1093,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         key("↑↓"),
         text(" move  "),
-        key("Tab"),
-        text(" focus  "),
+        key("Space"),
+        text(" expand  "),
         key("Enter"),
-        text(" diff  "),
+        text(" full diff  "),
+        key("Tab"),
+        text(" panel  "),
+        key("v"),
+        text(" layout  "),
         key("?"),
         text(" help  "),
         key("q"),
@@ -864,11 +1120,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("↑ ↓  j k", "move selection"),
+    ("↑ ↓  j k", "move (through expanded lines too)"),
     ("PgUp PgDn  ^u ^d", "page / half page"),
     ("g G  Home End", "first / last"),
-    ("Tab  ← →  h l", "switch panel"),
-    ("Enter  dbl-click", "diff of commit or worktree"),
+    ("Space  click", "expand / collapse row or file"),
+    ("→ l  ← h", "expand / collapse"),
+    ("Enter  dbl-click", "full diff view"),
+    ("Tab", "switch panel"),
+    ("v", "stacked / side-by-side layout"),
     ("r", "refresh now"),
     ("?", "toggle this help"),
     ("q  Ctrl-C", "quit"),
@@ -885,7 +1144,7 @@ const HELP: &[(&str, &str)] = &[
 
 fn draw_help(f: &mut Frame) {
     let area = f.area();
-    let w = 52.min(area.width);
+    let w = 58.min(area.width);
     let h = (HELP.len() as u16 + 4).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
@@ -923,6 +1182,20 @@ mod tests {
         assert_eq!(age(0, 7200), "2h");
         assert_eq!(age(0, 86400 * 3), "3d");
         assert_eq!(age(0, 86400 * 400), "1y");
+    }
+
+    #[test]
+    fn common_parents() {
+        use std::path::Path;
+        let ps = [
+            Path::new("/x/fx/repo"),
+            Path::new("/x/fx/wt/a"),
+            Path::new("/x/fx/wt/b"),
+        ];
+        assert_eq!(common_parent(ps.into_iter()).unwrap(), Path::new("/x/fx"));
+        let nested = [Path::new("/r"), Path::new("/r/.claude/worktrees/a")];
+        assert_eq!(common_parent(nested.into_iter()).unwrap(), Path::new("/"));
+        assert_eq!(common_parent([Path::new("/only")].into_iter()), None);
     }
 
     #[test]

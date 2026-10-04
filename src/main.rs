@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use canopy::ui::LayoutMode;
 use canopy::watch::Config;
 
 const USAGE: &str = "\
@@ -17,22 +18,25 @@ ARGS:
 OPTIONS:
     -i, --interval <SECS>   status poll interval in seconds (default: 1.5)
         --base <BRANCH>     branch to compare worktrees against (default: main/master/...)
+        --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only
     -h, --help              print help
     -V, --version           print version
 
 KEYS:
-    ↑↓/jk move · Tab switch panel · Enter diff · Esc back · r refresh · ? help · q quit
+    ↑↓/jk move · Space expand · Enter full diff · Tab switch panel · v layout · ? help · q quit
 ";
 
 struct Args {
     path: PathBuf,
     cfg: Config,
+    layout: LayoutMode,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut path: Option<PathBuf> = None;
     let mut cfg = Config::default();
+    let mut layout = LayoutMode::default();
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         let s = arg.to_string_lossy().into_owned();
@@ -65,6 +69,13 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--base" => cfg.base = Some(value("--base")?),
             "--no-watch" => cfg.watch = false,
+            "--layout" => {
+                layout = match value("--layout")?.as_str() {
+                    "stacked" => LayoutMode::Stacked,
+                    "side" => LayoutMode::Side,
+                    other => return Err(format!("invalid layout: {other} (expected stacked or side)")),
+                }
+            }
             f if f.starts_with('-') && f.len() > 1 => return Err(format!("unknown option: {f}")),
             _ => {
                 if path.is_some() {
@@ -75,7 +86,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         }
     }
     let path = path.unwrap_or_else(|| PathBuf::from("."));
-    Ok(Some(Args { path, cfg }))
+    Ok(Some(Args { path, cfg, layout }))
 }
 
 fn main() -> ExitCode {
@@ -98,7 +109,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match canopy::ui::run(paths, args.cfg) {
+    match canopy::ui::run(paths, args.cfg, args.layout) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");

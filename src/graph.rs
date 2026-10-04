@@ -44,6 +44,9 @@ pub enum RowKind {
 pub struct Row {
     pub kind: RowKind,
     pub cells: Vec<Cell>,
+    /// The lanes continuing below this row (`│` per open lane), for drawing content that is
+    /// inserted between this row and the next.
+    pub below: Vec<Cell>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,7 +188,7 @@ struct Item<'a> {
 /// `trunk` (the base branch tip) gets lane 0 reserved from the start, so the base branch is a
 /// straight line on the left instead of wherever topo order happens to put it. The reserved lane
 /// is invisible until the trunk tip (or the uncommitted row right above it) is reached.
-fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<Vec<Cell>> {
+fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<(Vec<Cell>, Vec<Cell>)> {
     let mut lanes: Vec<Option<&str>> = Vec::new();
     let mut phantom = false;
     if let Some(t) = trunk {
@@ -265,7 +268,23 @@ fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<Vec<Cell>> {
         while lanes.last().is_some_and(Option::is_none) {
             lanes.pop();
         }
-        rows.push(row.finish());
+        let blank = Cell {
+            ch: ' ',
+            color: NO_COLOR,
+        };
+        let mut below = vec![blank; (2 * lanes.len()).saturating_sub(1)];
+        for (j, lane) in lanes.iter().enumerate() {
+            if lane.is_some() && !(phantom && j == 0) {
+                below[2 * j] = Cell {
+                    ch: '│',
+                    color: lane_color(j),
+                };
+            }
+        }
+        while below.last().is_some_and(|c| c.ch == ' ') {
+            below.pop();
+        }
+        rows.push((row.finish(), below));
     }
     rows
 }
@@ -345,7 +364,7 @@ impl Graph {
         let rows: Vec<Row> = layout(&items, trunk)
             .into_iter()
             .zip(kinds)
-            .map(|(cells, kind)| Row { kind, cells })
+            .map(|((cells, below), kind)| Row { kind, cells, below })
             .collect();
 
         let mut commit_row = HashMap::new();
@@ -608,6 +627,13 @@ mod tests {
         }];
         let g = Graph::build(&Arc::new(commits), &[branch("main", "m1")], &wts, Some("main"), false);
         assert_eq!(render(&g), ["  ● f1", "◌ │ wt0", "◉ │ m1", "●─╯ a"]);
+    }
+
+    #[test]
+    fn continuation_below_rows() {
+        let g = build(vec![c("d", &["b"]), c("c", &["b"]), c("b", &["a"]), c("a", &[])], &[]);
+        let below: Vec<String> = g.rows.iter().map(|r| r.below.iter().map(|c| c.ch).collect()).collect();
+        assert_eq!(below, ["│", "│ │", "│", ""]);
     }
 
     #[test]

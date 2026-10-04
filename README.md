@@ -15,11 +15,15 @@ tree doing, and which ones are dirty?" on one screen:
 ╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
 ```
 
-- **Left:** one row per worktree: state marker, branch (or directory name when detached), staged `+`,
-  modified `~`, untracked `?` and conflicted `!` counts, ahead/behind the base branch `↑↓` and the
-  upstream `⇡⇣`, and in-progress operations (`MERGING`, `REBASING`, …).
-- **Right:** the commit graph of all branches, remotes and tags. Each worktree's HEAD is labelled
-  `[name]`, and a dirty worktree gets a `◌` "uncommitted" row right above its HEAD.
+- **Worktrees** (bottom): one row per worktree: state marker, branch (or directory name when detached),
+  staged `+`, modified `~`, untracked `?` and conflicted `!` counts, ahead/behind the base branch `↑↓`
+  and the upstream `⇡⇣`, in-progress operations (`MERGING`, `REBASING`, …), when its changed files
+  were last edited, its HEAD commit (sha, age, subject) and its path.
+- **Graph** (top): the commit graph of all branches, remotes and tags, with authors. Each worktree's
+  HEAD is labelled `[name]`, and a dirty worktree gets a `◌` "uncommitted" row right above its HEAD.
+- **Expand in place:** `Space` (or a click) on a commit or worktree unfolds its changed files right
+  there; `Space` on a file unfolds its diff. `Enter` (or a double-click) opens the full diff view.
+- **Layout:** stacked by default; `v` (or `--layout side`) puts the worktrees beside the graph.
 - **Live:** status is polled every 1.5s, and changes to refs, HEADs and indexes are picked up via file
   system events within ~150ms. Refreshing never blocks the UI.
 - **Details on demand:** `Enter` shows `git show` for a commit, or the uncommitted diff (including
@@ -49,6 +53,7 @@ git canopy [OPTIONS] [PATH]
   -i, --interval <SECS>   status poll interval in seconds (default: 1.5)
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
                           develop, or the main worktree's branch)
+      --layout <MODE>     stacked (graph above worktrees, default) or side
       --no-watch          disable file system notifications, poll only
 ```
 
@@ -56,10 +61,13 @@ git canopy [OPTIONS] [PATH]
 
 | Key | Action |
 | --- | --- |
-| `↑` `↓` / `j` `k` | move the selection (selecting a worktree jumps the graph to it) |
+| `↑` `↓` / `j` `k` | move, through expanded lines too (selecting a worktree jumps the graph to it) |
 | `PgUp` `PgDn`, `Ctrl-u` `Ctrl-d`, `g` `G` | page, half page, first, last |
-| `Tab`, `←` `→` / `h` `l` | switch between the worktree list and the graph |
-| `Enter`, double-click | diff of the selected commit or worktree |
+| `Space`, click | expand / collapse a commit or worktree (its files), or a file (its diff) |
+| `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
+| `Enter`, double-click | full diff view, opened at the file and line under the cursor |
+| `Tab` | switch between the graph and the worktree list |
+| `v` | stacked / side-by-side layout |
 | `r` | refresh now |
 | `?` | help |
 | `q`, `Ctrl-C` | quit |

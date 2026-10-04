@@ -21,7 +21,12 @@ pub struct Status {
     pub modified: u32,
     pub untracked: u32,
     pub unmerged: u32,
+    /// Changed paths (first [`MAX_PATHS`]), relative to the worktree root.
+    pub paths: Vec<String>,
 }
+
+/// Cap on [`Status::paths`]; counts stay exact beyond it.
+pub const MAX_PATHS: usize = 256;
 
 impl Status {
     pub fn is_dirty(&self) -> bool {
@@ -43,25 +48,44 @@ pub fn parse(bytes: &[u8]) -> Status {
         };
         match kind {
             b'#' => parse_header(&mut st, &lossy(rest)),
-            b'1' | b'2' => {
-                let xy = rest.get(1..3).unwrap_or(b"..");
-                if xy[0] != b'.' {
-                    st.staged += 1;
+            b'1' | b'2' | b'u' | b'?' if st.paths.len() < MAX_PATHS => {
+                // Fixed field counts before the path: 1 → 8, 2 → 9, u → 10, ? → 1.
+                let fields = match kind {
+                    b'1' => 9,
+                    b'2' => 10,
+                    b'u' => 11,
+                    _ => 2,
+                };
+                if let Some(p) = lossy(rec).splitn(fields, ' ').nth(fields - 1) {
+                    st.paths.push(p.to_string());
                 }
-                if xy[1] != b'.' {
-                    st.modified += 1;
-                }
-                if kind == b'2' {
-                    // Renames/copies carry the original path as a separate record.
-                    recs.next();
-                }
+                count(&mut st, kind, rest, &mut recs);
             }
-            b'u' => st.unmerged += 1,
-            b'?' => st.untracked += 1,
-            _ => {}
+            _ => count(&mut st, kind, rest, &mut recs),
         }
     }
     st
+}
+
+fn count<'a>(st: &mut Status, kind: u8, rest: &[u8], recs: &mut impl Iterator<Item = &'a [u8]>) {
+    match kind {
+        b'1' | b'2' => {
+            let xy = rest.get(1..3).unwrap_or(b"..");
+            if xy[0] != b'.' {
+                st.staged += 1;
+            }
+            if xy[1] != b'.' {
+                st.modified += 1;
+            }
+            if kind == b'2' {
+                // Renames/copies carry the original path as a separate record.
+                recs.next();
+            }
+        }
+        b'u' => st.unmerged += 1,
+        b'?' => st.untracked += 1,
+        _ => {}
+    }
 }
 
 fn parse_header(st: &mut Status, line: &str) {
@@ -105,6 +129,18 @@ u UU N... 100644 100644 100644 100644 a b c README.md\0\
         assert_eq!(st.upstream_ab, Some((2, 1)));
         assert_eq!((st.staged, st.modified, st.untracked, st.unmerged), (3, 2, 2, 1));
         assert!(st.is_dirty());
+        assert_eq!(
+            st.paths,
+            [
+                "src/auth.rs",
+                "src/main.rs",
+                "src/both.rs",
+                "new name.rs",
+                "README.md",
+                "notes.md",
+                "docs/"
+            ]
+        );
     }
 
     #[test]

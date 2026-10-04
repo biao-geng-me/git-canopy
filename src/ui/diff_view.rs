@@ -27,8 +27,8 @@ pub struct DiffView {
     pub id: u64,
     pub title: String,
     pub target: diff::Target,
-    /// For worktree diffs: the status the diff was loaded with; reloaded when it changes.
-    pub status: Option<Status>,
+    /// For worktree diffs: the (status, last edit) the diff was loaded for; reloaded when it changes.
+    pub stamp: Option<(Option<Status>, Option<i64>)>,
     /// `None` while loading.
     pub doc: Option<Result<DiffDoc, String>>,
     /// Selected entry: 0 is the overview, `i` is `files[i - 1]`.
@@ -45,12 +45,12 @@ pub struct DiffView {
 }
 
 impl DiffView {
-    pub fn new(id: u64, title: String, target: diff::Target, status: Option<Status>) -> Self {
+    pub fn new(id: u64, title: String, target: diff::Target, stamp: Option<(Option<Status>, Option<i64>)>) -> Self {
         DiffView {
             id,
             title,
             target,
-            status,
+            stamp,
             doc: None,
             sel: 0,
             list_offset: 0,
@@ -93,6 +93,12 @@ impl DiffView {
 
     pub fn is_commit(&self) -> bool {
         matches!(self.target, diff::Target::Commit { .. })
+    }
+
+    /// Land on `file` (`None` = overview) scrolled to `scroll` once loaded, with the diff focused.
+    pub fn focus_on(&mut self, file: Option<String>, scroll: usize) {
+        self.restore = Some((file, scroll));
+        self.pane = Pane::Body;
     }
 
     /// Mark the view as reloading under a new request id, remembering the current position.

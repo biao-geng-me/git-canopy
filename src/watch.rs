@@ -107,6 +107,8 @@ struct Worker {
     fingerprint: u64,
     base: Option<String>,
     ab_cache: HashMap<(String, String), (u32, u32)>,
+    /// Commit time and subject per HEAD sha.
+    head_cache: HashMap<String, (i64, String)>,
 
     limit: usize,
     commits: Arc<Vec<Commit>>,
@@ -132,6 +134,7 @@ impl Worker {
             fingerprint: 0,
             base: None,
             ab_cache: HashMap::new(),
+            head_cache: HashMap::new(),
             limit,
             commits: Arc::default(),
             commits_key: None,
@@ -327,6 +330,7 @@ impl Worker {
                     v.status = prev.status;
                     v.status_error = prev.status_error;
                     v.op = prev.op;
+                    v.changed_at = prev.changed_at;
                     v.admin_dir = prev.admin_dir;
                 }
                 if v.admin_dir.is_none() && v.has_worktree() {
@@ -370,6 +374,28 @@ impl Worker {
         if self.ab_cache.len() > 4096 {
             self.ab_cache.clear();
         }
+
+        let missing: Vec<String> = views
+            .iter()
+            .filter_map(|v| v.head.clone())
+            .filter(|h| !self.head_cache.contains_key(h))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if self.head_cache.len() > 4096 {
+            self.head_cache.clear();
+        }
+        if let Ok(described) = git::log::describe(&dir, &missing) {
+            for (id, time, subject) in described {
+                self.head_cache.insert(id, (time, subject));
+            }
+        }
+        for v in &mut views {
+            if let Some((time, subject)) = v.head.as_ref().and_then(|h| self.head_cache.get(h)) {
+                v.head_time = Some(*time);
+                v.head_subject = Some(subject.clone());
+            }
+        }
         self.worktrees = views;
         self.refs = refs;
         true
@@ -389,6 +415,7 @@ impl Worker {
             let w = &mut self.worktrees[i];
             match res {
                 Ok(st) => {
+                    w.changed_at = last_edited(&w.path, &st.paths);
                     w.status = Some(st);
                     w.status_error = None;
                 }
@@ -458,6 +485,16 @@ impl Worker {
             error: self.error.clone(),
         }));
     }
+}
+
+/// Newest mtime among the changed paths (deleted files are skipped), as unix seconds.
+fn last_edited(root: &Path, paths: &[String]) -> Option<i64> {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::symlink_metadata(root.join(p)).ok()?.modified().ok())
+        .max()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
 }
 
 /// Map `f` over `items` with at most `max` threads, preserving order.

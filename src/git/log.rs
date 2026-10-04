@@ -45,6 +45,39 @@ pub fn load(dir: &Path, limit: usize, heads: &[String]) -> Result<Vec<Commit>> {
     Ok(parse(&raw))
 }
 
+/// Commit time and subject of exactly the given commits (no history walk), in one process.
+pub fn describe(dir: &Path, ids: &[String]) -> Result<Vec<(String, i64, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<String> = [
+        "log",
+        "--no-walk=unsorted",
+        "-z",
+        "--no-show-signature",
+        "--format=%H%x00%ct%x00%s",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(ids.iter().cloned());
+    args.push("--".into());
+    let raw = super::run(dir, &args)?;
+    let recs: Vec<&[u8]> = split_nul(&raw).collect();
+    Ok(recs
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|f| {
+            (
+                lossy(f[0]).trim().to_string(),
+                lossy(f[1]).trim().parse().unwrap_or(0),
+                lossy(f[2]),
+            )
+        })
+        .collect())
+}
+
 pub fn parse(bytes: &[u8]) -> Vec<Commit> {
     let recs: Vec<&[u8]> = split_nul(bytes).collect();
     recs.as_chunks::<FIELDS>()
