@@ -1,6 +1,7 @@
 //! Terminal UI. Runs on the main thread and only renders snapshots received over a channel;
 //! all git work happens on the refresh worker (and on short-lived diff threads).
 
+mod diff_view;
 mod render;
 
 use std::io::stdout;
@@ -18,35 +19,17 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::{Position, Rect};
 
-use crate::diff;
+use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
-use crate::git::status::Status;
 use crate::graph::RowKind;
 use crate::model::Snapshot;
 use crate::watch::{self, Config, Request};
+use diff_view::{Action, DiffView};
 
 pub enum UiMsg {
     Input(Event),
     Snapshot(Arc<Snapshot>),
-    Diff {
-        id: u64,
-        result: Result<Vec<String>, String>,
-    },
-}
-
-/// The full-screen diff view.
-pub struct DiffView {
-    pub id: u64,
-    pub title: String,
-    pub target: diff::Target,
-    /// `None` while loading.
-    pub lines: Option<Result<Vec<String>, String>>,
-    pub scroll: usize,
-    pub hscroll: usize,
-    /// For worktree diffs: the status the diff was loaded with; reloaded when it changes.
-    pub status: Option<Status>,
-    /// Keep the scroll position across the next load (reloads), instead of starting at the top.
-    keep_scroll: bool,
+    Diff { id: u64, result: Result<DiffDoc, String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +43,6 @@ pub enum Focus {
 pub struct Areas {
     pub worktrees: Rect,
     pub graph: Rect,
-    pub diff: Rect,
 }
 
 /// A vertically scrolling selection over a list of rows.
@@ -158,28 +140,23 @@ impl App {
             UiMsg::Snapshot(s) => self.on_snapshot(s),
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
-                    if !d.keep_scroll {
-                        d.scroll = 0;
-                    }
-                    d.keep_scroll = false;
-                    d.lines = Some(result);
-                    self.scroll_diff(0);
+                    d.loaded(result);
                 }
             }
-            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                if self.diff.is_some() && !self.help {
-                    self.on_diff_key(k)
-                } else {
-                    self.on_key(k)
+            UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => match self.diff.as_mut() {
+                Some(d) if !self.help => {
+                    let action = d.on_key(k);
+                    self.diff_action(action);
                 }
-            }
-            UiMsg::Input(Event::Mouse(m)) => {
-                if self.diff.is_some() {
-                    self.on_diff_mouse(m)
-                } else {
-                    self.on_mouse(m)
+                _ => self.on_key(k),
+            },
+            UiMsg::Input(Event::Mouse(m)) => match self.diff.as_mut() {
+                Some(d) => {
+                    let action = d.on_mouse(m);
+                    self.diff_action(action);
                 }
-            }
+                None => self.on_mouse(m),
+            },
             UiMsg::Input(_) => {}
         }
     }
@@ -225,7 +202,7 @@ impl App {
             Some(DiffView {
                 target: diff::Target::Worktree { path, .. },
                 status,
-                lines: Some(_),
+                doc: Some(_),
                 ..
             }) => {
                 let now = self
@@ -407,16 +384,7 @@ impl App {
         };
         let Some((title, target, status)) = picked else { return };
         self.next_diff_id += 1;
-        self.diff = Some(DiffView {
-            id: self.next_diff_id,
-            title,
-            target,
-            lines: None,
-            scroll: 0,
-            hscroll: 0,
-            status,
-            keep_scroll: false,
-        });
+        self.diff = Some(DiffView::new(self.next_diff_id, title, target, status));
         self.spawn_diff_load();
     }
 
@@ -435,8 +403,7 @@ impl App {
         };
         if let Some(d) = self.diff.as_mut() {
             self.next_diff_id += 1;
-            d.id = self.next_diff_id;
-            d.keep_scroll = true;
+            d.begin_reload(self.next_diff_id);
             if status.is_some() {
                 d.status = status;
             }
@@ -456,67 +423,14 @@ impl App {
             .expect("spawn diff thread");
     }
 
-    fn diff_page(&self) -> usize {
-        (self.areas.diff.height.saturating_sub(2) as usize).max(1)
-    }
-
-    fn on_diff_key(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.diff_page() as isize;
-        match k.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.diff = None,
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('r') => self.reload_diff(),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => self.scroll_diff(1),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_diff(-1),
-            KeyCode::Char('d') if ctrl => self.scroll_diff(page / 2),
-            KeyCode::Char('u') if ctrl => self.scroll_diff(-page / 2),
-            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => self.scroll_diff(page),
-            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_diff(-page),
-            KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(isize::MIN),
-            KeyCode::End | KeyCode::Char('G') => self.scroll_diff(isize::MAX),
-            KeyCode::Right | KeyCode::Char('l') => self.pan_diff(8),
-            KeyCode::Left | KeyCode::Char('h') => self.pan_diff(-8),
-            KeyCode::Char('n') | KeyCode::Char(']') => self.jump_file(true),
-            KeyCode::Char('p') | KeyCode::Char('N') | KeyCode::Char('[') => self.jump_file(false),
-            _ => {}
+    fn diff_action(&mut self, action: Action) {
+        match action {
+            Action::None => {}
+            Action::Close => self.diff = None,
+            Action::Reload => self.reload_diff(),
+            Action::Help => self.help = true,
+            Action::Quit => self.quit = true,
         }
-    }
-
-    fn on_diff_mouse(&mut self, m: MouseEvent) {
-        match m.kind {
-            MouseEventKind::ScrollDown => self.scroll_diff(3),
-            MouseEventKind::ScrollUp => self.scroll_diff(-3),
-            MouseEventKind::ScrollRight => self.pan_diff(8),
-            MouseEventKind::ScrollLeft => self.pan_diff(-8),
-            _ => {}
-        }
-    }
-
-    fn scroll_diff(&mut self, delta: isize) {
-        let page = self.diff_page();
-        let Some(d) = self.diff.as_mut() else { return };
-        let len = d.lines.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, Vec::len);
-        let max = len.saturating_sub(page) as isize;
-        d.scroll = (d.scroll as isize).saturating_add(delta).clamp(0, max.max(0)) as usize;
-    }
-
-    fn pan_diff(&mut self, delta: isize) {
-        if let Some(d) = self.diff.as_mut() {
-            d.hscroll = (d.hscroll as isize + delta).clamp(0, 10_000) as usize;
-        }
-    }
-
-    fn jump_file(&mut self, forward: bool) {
-        let Some(d) = self.diff.as_mut() else { return };
-        let Some(Ok(lines)) = &d.lines else { return };
-        if let Some(i) = diff::file_jump(lines, d.scroll, forward) {
-            d.scroll = i;
-        } else if !forward {
-            d.scroll = 0;
-        }
-        self.scroll_diff(0);
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {

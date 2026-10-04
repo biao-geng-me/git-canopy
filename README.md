@@ -64,9 +64,12 @@ git canopy [OPTIONS] [PATH]
 | `?` | help |
 | `q`, `Ctrl-C` | quit |
 
-In the diff view: `↑` `↓` `PgUp` `PgDn` `Space` scroll, `n` / `p` jump to the next/previous file, `←` `→`
-scroll sideways, `r` reloads, `Esc` or `q` goes back. A worktree diff reloads by itself when that
-worktree's status changes.
+The diff view lists the changed files on top (status, path, `+`/`-` counts; the first entry is the
+commit message and diffstat, or a summary for a worktree) and shows the selected file's diff below.
+`↑` `↓` pick a file, `Enter` or `Tab` moves into the diff where `↑` `↓` scroll, `Esc` or `Tab` goes back
+to the list. Anywhere: `n` / `p` next/previous file, `PgUp` `PgDn` `Space` scroll the diff, `←` `→` scroll
+sideways, `r` reloads, `q` goes back to the overview. A worktree diff reloads by itself when that
+worktree's status changes, keeping the selected file and scroll position.
 
 The mouse works too: click to select, wheel to scroll.
 

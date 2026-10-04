@@ -15,37 +15,61 @@ fn commit_and_worktree_diffs() {
             .unwrap()
     };
 
-    let lines = diff::load(&Target::Commit {
+    let doc = diff::load(&Target::Commit {
         dir: common_dir,
         id: head("refactor-db"),
     })
     .unwrap();
-    assert!(lines[0].starts_with("commit "));
-    assert!(lines.iter().any(|l| l.contains("db: refactor step 4")));
-    assert!(lines.iter().any(|l| l == "+// step 4"));
+    assert!(doc.overview[0].starts_with("commit "));
+    assert!(doc.overview.iter().any(|l| l.contains("db: refactor step 4")));
+    assert_eq!(doc.files.len(), 1);
+    assert_eq!(
+        (doc.files[0].path.as_str(), doc.files[0].status, doc.files[0].adds),
+        ("src/db.rs", 'M', 1)
+    );
+    assert!(doc.files[0].lines.iter().any(|l| l == "+// step 4"));
 
-    let lines = diff::load(&Target::Worktree {
+    let doc = diff::load(&Target::Worktree {
         path: fx.wt("feat-auth"),
         has_head: true,
     })
     .unwrap();
-    assert!(lines.iter().any(|l| l == "+// wip"), "unstaged change");
-    assert!(lines.iter().any(|l| l == "+pub struct Token;"), "staged new file");
-    assert!(lines.iter().any(|l| l == "Untracked files (1):"));
-    assert!(lines.iter().any(|l| l == "+scratch"), "untracked file content");
+    let files: Vec<_> = doc.files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+    assert_eq!(
+        files,
+        [
+            ("src/auth.rs", 'M'),
+            ("src/lib.rs", 'M'),
+            ("src/main.rs", 'M'),
+            ("src/session.rs", 'A'),
+            ("src/token.rs", 'A'),
+            ("notes.md", '?'),
+        ]
+    );
+    assert!(doc.files[0].lines.iter().any(|l| l == "+// wip"), "unstaged change");
+    assert!(
+        doc.files[4].lines.iter().any(|l| l == "+pub struct Token;"),
+        "staged new file"
+    );
+    assert!(
+        doc.files[5].lines.iter().any(|l| l == "+scratch"),
+        "untracked file content"
+    );
+    assert!(doc.overview.iter().any(|l| l == "Untracked files (1):"));
 
-    let lines = diff::load(&Target::Worktree {
+    let doc = diff::load(&Target::Worktree {
         path: fx.wt("untracked-only"),
         has_head: true,
     })
     .unwrap();
-    assert!(lines.iter().any(|l| l == "Untracked files (2):"));
-    assert!(lines.iter().any(|l| l == "+# Guide"));
+    let files: Vec<_> = doc.files.iter().map(|f| (f.path.as_str(), f.adds)).collect();
+    assert_eq!(files, [("TODO", 1), ("docs/guide.md", 3)]);
 
-    let lines = diff::load(&Target::Worktree {
+    let doc = diff::load(&Target::Worktree {
         path: fx.wt("refactor-db"),
         has_head: true,
     })
     .unwrap();
-    assert_eq!(lines, ["No uncommitted changes."]);
+    assert_eq!(doc.overview, ["No uncommitted changes."]);
+    assert!(doc.files.is_empty());
 }

@@ -101,6 +101,8 @@ fn glyph(bits: u8) -> char {
 struct RowCells {
     bits: Vec<u8>,
     colors: Vec<u8>,
+    /// Color of a horizontal pipe passing *through* a lane slot (not ending there).
+    passing: Vec<Option<u8>>,
     node: Option<(usize, char, u8)>,
 }
 
@@ -109,6 +111,7 @@ impl RowCells {
         if self.bits.len() <= slot {
             self.bits.resize(slot + 1, 0);
             self.colors.resize(slot + 1, NO_COLOR);
+            self.passing.resize(slot + 1, None);
         }
         if self.bits[slot] == 0 {
             self.colors[slot] = color;
@@ -125,16 +128,26 @@ impl RowCells {
         self.set(2 * lo, R, color);
         for slot in 2 * lo + 1..2 * hi {
             self.set(slot, L | R, color);
+            if slot % 2 == 0 {
+                self.passing[slot].get_or_insert(color);
+            }
         }
         self.set(2 * hi, L, color);
     }
 
     fn finish(self) -> Vec<Cell> {
-        let mut cells: Vec<Cell> = self
-            .bits
-            .iter()
-            .zip(&self.colors)
-            .map(|(&b, &c)| Cell { ch: glyph(b), color: c })
+        let mut cells: Vec<Cell> = (0..self.bits.len())
+            .map(|i| match (self.bits[i], self.passing[i]) {
+                // A pipe crossing an unrelated lane: keep the connection continuous and break
+                // the lane instead of drawing an ambiguous `┼`.
+                (b, Some(hcolor)) if b == U | D | L | R => Cell {
+                    ch: '─', color: hcolor
+                },
+                (b, _) => Cell {
+                    ch: glyph(b),
+                    color: self.colors[i],
+                },
+            })
             .collect();
         if let Some((lane, ch, color)) = self.node {
             let slot = 2 * lane;
@@ -595,5 +608,26 @@ mod tests {
         }];
         let g = Graph::build(&Arc::new(commits), &[branch("main", "m1")], &wts, Some("main"), false);
         assert_eq!(render(&g), ["  ● f1", "◌ │ wt0", "◉ │ m1", "●─╯ a"]);
+    }
+
+    #[test]
+    fn crossing_breaks_the_passing_lane() {
+        // r's lane merges into a (lane 0) across q's lane, which continues to z.
+        let g = build(
+            vec![
+                c("p", &["a"]),
+                c("q", &["z"]),
+                c("r", &["a"]),
+                c("a", &["z"]),
+                c("z", &[]),
+            ],
+            &[],
+        );
+        assert_eq!(render(&g), ["● p", "│ ● q", "│ │ ● r", "●───╯ a", "●─╯ z"]);
+        let row = &g.rows[3].cells;
+        assert_eq!(
+            row[2].color, row[4].color,
+            "crossing cell takes the merging pipe's color"
+        );
     }
 }

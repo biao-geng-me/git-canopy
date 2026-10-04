@@ -1,5 +1,6 @@
 //! Loading diffs for the diff view: a commit (`git show`) or a worktree's uncommitted changes
-//! (`git diff HEAD` plus untracked files). Runs off the UI thread.
+//! (`git diff-index HEAD` plus untracked files), split into an overview and one section per file.
+//! Runs off the UI thread.
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -17,27 +18,50 @@ pub enum Target {
     Worktree { path: PathBuf, has_head: bool },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    /// `M`odified, `A`dded, `D`eleted, `R`enamed, `C`opied, `U`nmerged (combined diff), `?` untracked.
+    pub status: char,
+    pub adds: usize,
+    pub dels: usize,
+    /// The file's section, starting with its `diff --git` header.
+    pub lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffDoc {
+    /// Everything before the first file: commit header and message, diffstat, untracked list.
+    pub overview: Vec<String>,
+    pub files: Vec<FileDiff>,
+}
+
 /// Untracked files shown with content; the rest are only listed.
 const MAX_UNTRACKED_SHOWN: usize = 50;
 const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
 const MAX_UNTRACKED_LINES: usize = 500;
 
-const COMMON: &[&str] = &["--no-color", "--no-ext-diff", "--stat", "-p"];
-
-pub fn load(target: &Target) -> Result<Vec<String>> {
-    let text = match target {
+pub fn load(target: &Target) -> Result<DiffDoc> {
+    match target {
         Target::Commit { dir, id } => {
-            let mut args = vec!["show", "--no-show-signature", "--format=fuller"];
-            args.extend(COMMON);
-            args.extend([id.as_str(), "--"]);
-            String::from_utf8_lossy(&git::run(dir, &args)?).into_owned()
+            let args = [
+                "show",
+                "--no-show-signature",
+                "--format=fuller",
+                "--no-color",
+                "--no-ext-diff",
+                "--stat",
+                "-p",
+                id,
+                "--",
+            ];
+            Ok(parse(&String::from_utf8_lossy(&git::run(dir, &args)?)))
         }
-        Target::Worktree { path, has_head } => worktree_diff(path, *has_head)?,
-    };
-    Ok(sanitize(&text))
+        Target::Worktree { path, has_head } => worktree_diff(path, *has_head),
+    }
 }
 
-fn worktree_diff(wt: &Path, has_head: bool) -> Result<String> {
+fn worktree_diff(wt: &Path, has_head: bool) -> Result<DiffDoc> {
     // Plumbing on purpose: porcelain `git diff` refreshes and rewrites the index (taking
     // index.lock) when it finds stat-dirty files, even with --no-optional-locks. `diff-index`
     // never writes, and skips files whose content is unchanged.
@@ -49,62 +73,176 @@ fn worktree_diff(wt: &Path, has_head: bool) -> Result<String> {
         String::from_utf8_lossy(&out).trim().to_string()
     };
     let raw = git::run(wt, &["diff-index", "-p", "--stat", "-M", &base, "--"])?;
-    let mut out = String::from_utf8_lossy(&raw).into_owned();
+    let mut doc = parse(&String::from_utf8_lossy(&raw));
+    while doc.overview.last().is_some_and(|l| l.is_empty()) {
+        doc.overview.pop();
+    }
 
     let raw = git::run(wt, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     let untracked: Vec<String> = git::split_nul(&raw).map(git::lossy).collect();
     if !untracked.is_empty() {
-        if !out.is_empty() && !out.ends_with("\n\n") {
-            out.push('\n');
+        if !doc.overview.is_empty() {
+            doc.overview.push(String::new());
         }
-        let _ = writeln!(out, "Untracked files ({}):", untracked.len());
-        for f in &untracked {
-            let _ = writeln!(out, "    {f}");
-        }
-        for f in untracked.iter().take(MAX_UNTRACKED_SHOWN) {
-            out.push('\n');
-            out.push_str(&untracked_as_diff(wt, f));
-        }
-        if untracked.len() > MAX_UNTRACKED_SHOWN {
-            let _ = writeln!(
-                out,
-                "\n… {} more untracked files not shown",
-                untracked.len() - MAX_UNTRACKED_SHOWN
-            );
+        doc.overview.push(format!("Untracked files ({}):", untracked.len()));
+        doc.overview.extend(untracked.iter().map(|f| format!("    {f}")));
+        for (i, f) in untracked.iter().enumerate() {
+            doc.files.push(if i < MAX_UNTRACKED_SHOWN {
+                untracked_file(wt, f)
+            } else {
+                FileDiff {
+                    path: f.clone(),
+                    status: '?',
+                    adds: 0,
+                    dels: 0,
+                    lines: vec![format!(
+                        "(content not shown: more than {MAX_UNTRACKED_SHOWN} untracked files)"
+                    )],
+                }
+            });
         }
     }
-    if out.trim().is_empty() {
-        out.push_str("No uncommitted changes.\n");
+    if doc.overview.is_empty() && doc.files.is_empty() {
+        doc.overview.push("No uncommitted changes.".into());
     }
-    Ok(out)
+    Ok(doc)
 }
 
-/// Render an untracked file as a new-file diff, read directly from disk (no git process per file).
-fn untracked_as_diff(wt: &Path, name: &str) -> String {
+/// An untracked file as a new-file section, read directly from disk (no git process per file).
+fn untracked_file(wt: &Path, name: &str) -> FileDiff {
     let mut out = format!("diff --git a/{name} b/{name}\nnew file (untracked)\n");
-    let path = wt.join(name);
+    let mut adds = 0;
     let mut buf = Vec::new();
-    let size = match std::fs::File::open(&path).and_then(|f| {
+    let read = std::fs::File::open(wt.join(name)).and_then(|f| {
         let size = f.metadata()?.len();
         f.take(MAX_UNTRACKED_BYTES).read_to_end(&mut buf)?;
         Ok(size)
-    }) {
-        Ok(s) => s,
-        Err(e) => return out + &format!("(cannot read: {e})\n"),
-    };
-    if buf[..buf.len().min(8000)].contains(&0) {
-        return out + &format!("Binary file ({size} bytes)\n");
+    });
+    match read {
+        Err(e) => {
+            let _ = writeln!(out, "(cannot read: {e})");
+        }
+        Ok(size) if buf[..buf.len().min(8000)].contains(&0) => {
+            let _ = writeln!(out, "Binary file ({size} bytes)");
+        }
+        Ok(size) => {
+            let text = String::from_utf8_lossy(&buf);
+            let lines: Vec<&str> = text.lines().collect();
+            let _ = write!(out, "--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n", lines.len());
+            for l in lines.iter().take(MAX_UNTRACKED_LINES) {
+                let _ = writeln!(out, "+{l}");
+            }
+            adds = lines.len();
+            if lines.len() > MAX_UNTRACKED_LINES || size > MAX_UNTRACKED_BYTES {
+                out.push_str("… (truncated)\n");
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<&str> = text.lines().collect();
-    let _ = write!(out, "--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n", lines.len());
-    for l in lines.iter().take(MAX_UNTRACKED_LINES) {
-        let _ = writeln!(out, "+{l}");
+    FileDiff {
+        path: name.to_string(),
+        status: '?',
+        adds,
+        dels: 0,
+        lines: sanitize(&out),
     }
-    if lines.len() > MAX_UNTRACKED_LINES || size > MAX_UNTRACKED_BYTES {
-        out.push_str("… (truncated)\n");
+}
+
+fn is_file_header(line: &str) -> bool {
+    line.starts_with("diff --git ") || line.starts_with("diff --cc ") || line.starts_with("diff --combined ")
+}
+
+/// Split `git show` / `git diff` output into the overview and per-file sections.
+pub fn parse(text: &str) -> DiffDoc {
+    let mut doc = DiffDoc::default();
+    let mut current: Option<Vec<String>> = None;
+    for line in sanitize(text) {
+        if is_file_header(&line) {
+            if let Some(lines) = current.take() {
+                doc.files.push(file_section(lines));
+            }
+            current = Some(vec![line]);
+        } else if let Some(lines) = current.as_mut() {
+            lines.push(line);
+        } else {
+            doc.overview.push(line);
+        }
     }
-    out
+    if let Some(lines) = current {
+        doc.files.push(file_section(lines));
+    }
+    doc
+}
+
+fn file_section(lines: Vec<String>) -> FileDiff {
+    let header = &lines[0];
+    let combined = !header.starts_with("diff --git ");
+    let mut status = if combined { 'U' } else { 'M' };
+    let mut path: Option<String> = None;
+    let mut old_path: Option<String> = None;
+    let (mut adds, mut dels) = (0, 0);
+    let mut in_hunks = false;
+    for l in &lines[1..] {
+        if in_hunks {
+            match l.as_bytes().first() {
+                Some(b'+') => adds += 1,
+                Some(b'-') => dels += 1,
+                _ => {}
+            }
+            continue;
+        }
+        if l.starts_with("@@") {
+            in_hunks = true;
+        } else if l.starts_with("new file") {
+            status = 'A';
+        } else if l.starts_with("deleted file") {
+            status = 'D';
+        } else if let Some(p) = l.strip_prefix("rename to ") {
+            status = 'R';
+            path = Some(p.to_string());
+        } else if let Some(p) = l.strip_prefix("copy to ") {
+            status = 'C';
+            path = Some(p.to_string());
+        } else if let Some(p) = l.strip_prefix("+++ ") {
+            if p != "/dev/null" && path.is_none() {
+                path = Some(p.strip_prefix("b/").unwrap_or(p).to_string());
+            }
+        } else if let Some(p) = l.strip_prefix("--- ") {
+            old_path = Some(p.strip_prefix("a/").unwrap_or(p).to_string());
+        }
+    }
+    let path = path
+        .or_else(|| old_path.filter(|p| p != "/dev/null"))
+        .unwrap_or_else(|| header_path(header));
+    FileDiff {
+        path,
+        status,
+        adds,
+        dels,
+        lines,
+    }
+}
+
+/// Path from a `diff --git a/P b/P` (or `diff --cc P`) header, used when there are no `+++`
+/// lines (binary files, mode-only changes).
+fn header_path(header: &str) -> String {
+    if let Some(p) = header
+        .strip_prefix("diff --cc ")
+        .or_else(|| header.strip_prefix("diff --combined "))
+    {
+        return p.to_string();
+    }
+    let rest = header.strip_prefix("diff --git ").unwrap_or(header);
+    // Unrenamed: "a/P b/P", so both halves are equal.
+    let n = rest.len();
+    if n >= 5 && (n - 5).is_multiple_of(2) {
+        let half = (n - 5) / 2;
+        if let (Some(a), Some(b)) = (rest.get(2..2 + half), rest.get(half + 5..))
+            && a == b
+        {
+            return a.to_string();
+        }
+    }
+    rest.to_string()
 }
 
 /// Expand tabs and replace control characters so every line renders predictably.
@@ -136,16 +274,6 @@ pub fn sanitize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Index of the next (`forward`) or previous file header relative to `from`.
-pub fn file_jump(lines: &[String], from: usize, forward: bool) -> Option<usize> {
-    let is_header = |l: &String| l.starts_with("diff --git ") || l.starts_with("diff --cc ");
-    if forward {
-        (from + 1..lines.len()).find(|&i| is_header(&lines[i]))
-    } else {
-        (0..from).rev().find(|&i| is_header(&lines[i]))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,16 +284,69 @@ mod tests {
         assert_eq!(sanitize("ab\tc"), vec!["ab  c"]);
     }
 
+    const SHOW: &str = "commit abc
+Author: A
+
+    subject
+---
+ a.rs | 2 +-
+ 2 files changed
+
+diff --git a/a.rs b/a.rs
+index 1..2 100644
+--- a/a.rs
++++ b/a.rs
+@@ -1,2 +1,2 @@
+-old
++new
++++not a header
+ ctx
+diff --git a/old name.txt b/new name.txt
+similarity index 90%
+rename from old name.txt
+rename to new name.txt
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/img.png b/img.png
+new file mode 100644
+Binary files /dev/null and b/img.png differ
+diff --cc conflict.rs
+index 1,2..3
+@@@ -1,1 -1,1 +1,1 @@@
+";
+
     #[test]
-    fn jumps_between_files() {
-        let lines: Vec<String> = ["commit x", "diff --git a/a b/a", "+1", "diff --git a/b b/b", "+2"]
+    fn splits_files() {
+        let doc = parse(SHOW);
+        assert_eq!(doc.overview[0], "commit abc");
+        assert_eq!(doc.overview.last().unwrap(), "");
+        let summary: Vec<_> = doc
+            .files
             .iter()
-            .map(|s| s.to_string())
+            .map(|f| (f.path.as_str(), f.status, f.adds, f.dels))
             .collect();
-        assert_eq!(file_jump(&lines, 0, true), Some(1));
-        assert_eq!(file_jump(&lines, 1, true), Some(3));
-        assert_eq!(file_jump(&lines, 3, true), None);
-        assert_eq!(file_jump(&lines, 4, false), Some(3));
-        assert_eq!(file_jump(&lines, 1, false), None);
+        assert_eq!(
+            summary,
+            [
+                ("a.rs", 'M', 2, 1),
+                ("new name.txt", 'R', 0, 0),
+                ("gone.txt", 'D', 0, 1),
+                ("img.png", 'A', 0, 0),
+                ("conflict.rs", 'U', 0, 0),
+            ]
+        );
+        assert_eq!(doc.files[0].lines[0], "diff --git a/a.rs b/a.rs");
+        assert_eq!(doc.files[0].lines.len(), 9);
+    }
+
+    #[test]
+    fn header_paths() {
+        assert_eq!(header_path("diff --git a/x y.rs b/x y.rs"), "x y.rs");
+        assert_eq!(header_path("diff --cc m.rs"), "m.rs");
+        assert_eq!(header_path("diff --git a/a b/b"), "a/a b/b");
     }
 }

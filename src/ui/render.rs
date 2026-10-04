@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::diff_view::Pane;
 use super::{App, Focus};
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::model::WorktreeView;
@@ -22,7 +23,6 @@ const SEL_UNFOCUSED: Color = Color::Indexed(235);
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
     if app.diff.is_some() {
-        app.areas.diff = main;
         draw_diff(f, app, main);
         draw_diff_footer(f, app, footer);
         if app.help {
@@ -632,31 +632,145 @@ fn skip_cols(s: &str, cols: usize) -> &str {
     ""
 }
 
+fn status_color(status: char) -> Color {
+    match status {
+        'A' => Color::Green,
+        'D' => Color::Red,
+        'R' | 'C' => Color::Blue,
+        'U' => C_CONFLICT,
+        '?' => C_UNTRACKED,
+        _ => Color::Yellow,
+    }
+}
+
+/// `+12 -3` with colors (zero sides omitted).
+fn add_del_spans(adds: usize, dels: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if adds > 0 {
+        out.push(Span::styled(format!("+{adds}"), Style::new().fg(Color::Green)));
+    }
+    if dels > 0 {
+        if !out.is_empty() {
+            out.push(Span::raw(" "));
+        }
+        out.push(Span::styled(format!("-{dels}"), Style::new().fg(Color::Red)));
+    }
+    out
+}
+
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(d) = &app.diff else { return };
-    let height = area.height.saturating_sub(2) as usize;
+    let Some(d) = app.diff.as_mut() else { return };
+    let dim = Style::new().fg(C_DIM);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled(d.title.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(d.title.clone(), bold),
         Span::raw(" "),
     ]);
-    let position = match &d.lines {
-        Some(Ok(lines)) if !lines.is_empty() => {
-            let end = (d.scroll + height).min(lines.len());
-            format!(" {}–{} of {} ", d.scroll + 1, end, lines.len())
+
+    // File list on top (only when there are files), the selected entry's diff below.
+    let body_area = if d.has_files() {
+        let want = d.entries() as u16 + 2;
+        let h = want
+            .min((area.height * 2 / 5).max(5))
+            .min(area.height.saturating_sub(3));
+        let [list, body] = Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(area);
+        d.list_area = list;
+
+        let (adds, dels) = d.files().iter().fold((0, 0), |(a, r), f| (a + f.adds, r + f.dels));
+        let n = d.files().len();
+        let mut summary = vec![Span::styled(
+            format!(" {n} file{} ", if n == 1 { "" } else { "s" }),
+            dim,
+        )];
+        summary.extend(add_del_spans(adds, dels));
+        summary.push(Span::raw(" "));
+        let block = panel(title.clone(), d.pane == Pane::Files).title_top(Line::from(summary).right_aligned());
+        let inner = block.inner(list);
+        f.render_widget(block, list);
+
+        let rows = inner.height as usize;
+        if d.sel < d.list_offset {
+            d.list_offset = d.sel;
+        } else if rows > 0 && d.sel >= d.list_offset + rows {
+            d.list_offset = d.sel + 1 - rows;
         }
-        _ => String::new(),
+        let overview_label = if d.is_commit() {
+            "commit message & stats"
+        } else {
+            "summary"
+        };
+        let width = inner.width as usize;
+        // Counts form a column right after the longest path (not pinned to the far edge).
+        let counts_w = d
+            .files()
+            .iter()
+            .map(|f| spans_width(&add_del_spans(f.adds, f.dels)))
+            .max()
+            .unwrap_or(0);
+        let longest = d.files().iter().map(|f| f.path.width()).max().unwrap_or(0);
+        let path_w = longest.min(width.saturating_sub(4 + counts_w + 2));
+        let lines: Vec<Line> = (d.list_offset..d.entries())
+            .take(rows)
+            .map(|i| match i.checked_sub(1).map(|fi| &d.files()[fi]) {
+                None => Line::from(vec![Span::styled(" ≡ ", dim), Span::styled(overview_label, dim)]),
+                Some(file) => {
+                    let counts = add_del_spans(file.adds, file.dels);
+                    let path = pad(truncate(&file.path, path_w), path_w);
+                    let mut spans = vec![
+                        Span::styled(format!(" {} ", file.status), Style::new().fg(status_color(file.status))),
+                        Span::raw(" "),
+                        Span::raw(path),
+                        Span::raw("  "),
+                    ];
+                    spans.extend(counts);
+                    Line::from(spans)
+                }
+            })
+            .collect();
+        let sel = d.sel.checked_sub(d.list_offset);
+        paint_rows(f, inner, lines, sel, d.pane == Pane::Files);
+        body
+    } else {
+        d.list_area = Rect::default();
+        area
     };
-    let block = panel(title, true).title_top(Line::styled(position, Style::new().fg(C_DIM)).right_aligned());
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let body: Vec<Line> = match &d.lines {
-        None => vec![Line::styled(" loading…", Style::new().fg(C_DIM))],
+    d.body_area = body_area;
+
+    let height = body_area.height.saturating_sub(2) as usize;
+    let body = d.body();
+    let label: Vec<Span> = match d.selected_file() {
+        _ if !d.has_files() => title.spans.clone(),
+        Some(file) => vec![
+            Span::raw(" "),
+            Span::styled(file.status.to_string(), Style::new().fg(status_color(file.status))),
+            Span::raw(" "),
+            Span::styled(file.path.clone(), bold),
+            Span::raw(" "),
+        ],
+        None => vec![
+            Span::raw(" "),
+            Span::styled(if d.is_commit() { "commit" } else { "summary" }, bold),
+            Span::raw(" "),
+        ],
+    };
+    let position = if body.len() > height {
+        let end = (d.scroll + height).min(body.len());
+        format!(" {}–{} of {} ", d.scroll + 1, end, body.len())
+    } else {
+        String::new()
+    };
+    let focused = d.pane == Pane::Body || !d.has_files();
+    let block = panel(Line::from(label), focused).title_top(Line::styled(position, dim).right_aligned());
+    let inner = block.inner(body_area);
+    f.render_widget(block, body_area);
+    let lines: Vec<Line> = match &d.doc {
+        None => vec![Line::styled(" loading…", dim)],
         Some(Err(e)) => e
             .lines()
             .map(|l| Line::styled(format!(" {l}"), Style::new().fg(C_CONFLICT)))
             .collect(),
-        Some(Ok(lines)) => lines[d.scroll.min(lines.len())..]
+        Some(Ok(_)) => body[d.scroll.min(body.len())..]
             .iter()
             .take(height)
             .map(|l| {
@@ -665,40 +779,46 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect(),
     };
-    f.render_widget(Paragraph::new(body), inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
     let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    if let Some(d) = &app.diff {
-        let mut msg = match &d.target {
-            crate::diff::Target::Worktree { path, .. } => tilde(path),
-            crate::diff::Target::Commit { id, .. } => id.clone(),
-        };
-        if d.hscroll > 0 {
-            msg.push_str(&format!("  ·  scrolled right {} columns", d.hscroll));
-        }
-        f.render_widget(
-            Paragraph::new(Span::styled(format!(" {msg}"), Style::new().fg(C_DIM))),
-            details,
-        );
+    let Some(d) = &app.diff else { return };
+    let mut msg = match &d.target {
+        crate::diff::Target::Worktree { path, .. } => tilde(path),
+        crate::diff::Target::Commit { id, .. } => id.clone(),
+    };
+    if d.hscroll > 0 {
+        msg.push_str(&format!("  ·  scrolled right {} columns", d.hscroll));
     }
+    f.render_widget(
+        Paragraph::new(Span::styled(format!(" {msg}"), Style::new().fg(C_DIM))),
+        details,
+    );
+
     let key = |k: &'static str| Span::styled(k, Style::new().fg(Color::Cyan));
     let text = |t: &'static str| Span::styled(t, Style::new().fg(C_DIM));
-    let line = Line::from(vec![
-        Span::raw(" "),
-        key("↑↓ PgUp PgDn"),
-        text(" scroll  "),
-        key("n/p"),
-        text(" next/prev file  "),
+    let mut spans = vec![Span::raw(" ")];
+    if d.pane == Pane::Files && d.has_files() {
+        spans.extend([key("↑↓"), text(" file  "), key("Enter/Tab"), text(" into diff  ")]);
+    } else {
+        spans.extend([key("↑↓"), text(" scroll  ")]);
+        if d.has_files() {
+            spans.extend([key("n/p"), text(" file  "), key("Tab"), text(" file list  ")]);
+        }
+    }
+    spans.extend([
+        key("PgUp/PgDn"),
+        text(" page  "),
         key("←→"),
         text(" pan  "),
         key("r"),
         text(" reload  "),
-        key("Esc"),
+        key("q"),
         text(" back"),
     ]);
-    f.render_widget(Paragraph::new(line), hints);
+    f.render_widget(Paragraph::new(Line::from(spans)), hints);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -754,11 +874,13 @@ const HELP: &[(&str, &str)] = &[
     ("q  Ctrl-C", "quit"),
     ("", ""),
     ("in diff view:", ""),
-    ("↑ ↓  PgUp PgDn", "scroll"),
+    ("↑ ↓  j k", "pick file / scroll diff"),
+    ("Tab  Enter  Esc", "file list ⇄ diff"),
     ("n p  ] [", "next / previous file"),
+    ("PgUp PgDn  Space", "scroll diff"),
     ("← →  h l", "scroll sideways"),
     ("r", "reload"),
-    ("Esc  q", "back"),
+    ("q", "back"),
 ];
 
 fn draw_help(f: &mut Frame) {

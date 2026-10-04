@@ -113,6 +113,10 @@ UI thread only renders snapshots received over a channel.
   `for-each-ref` (not `%D`), so they don't depend on which worktree canopy runs in.
 - **One row per commit:** lanes are drawn lazygit-style (`│ ╯ ╮ ┴ ┤ …`, two cells per lane) with no
   connector-only rows — denser overview than `git log --graph`. Lane colors are per column.
+- **Crossings:** where a merge/branch pipe passes through an unrelated lane, the pipe stays continuous
+  (`─`, in the pipe's color) and the lane is broken for that one cell, instead of an ambiguous `┼`.
+  Nerd Fonts' branch-drawing range (U+F5D0–U+F60D, from kitty) has arcs and connected nodes but no
+  bridge/hop glyph, so plain box drawing is used and works in any font.
 - **Trunk lane:** lane 0 is reserved for the base branch tip from the top of the graph (invisible until
   the tip row), so the base branch is a straight line on the left and agent branches stack to the right.
   A dirty base worktree's `◌` row sits on that lane directly above the tip.
@@ -133,6 +137,10 @@ UI thread only renders snapshots received over a channel.
   files, even with `--no-optional-locks`. The plumbing never writes. Untracked files are listed via
   `ls-files --others --exclude-standard` and read from disk directly (first 50, 256 KiB / 500 lines each).
   Unborn HEAD diffs against the empty tree (`hash-object -t tree --stdin`, nothing written).
+- **Diff view is per file:** `diff::load` returns a `DiffDoc` (overview = everything before the first
+  `diff --git`, i.e. commit header/message/stat or the worktree stat + untracked list; then one
+  `FileDiff` per file with path, status letter, +/- counts). Untracked files are appended as `?` entries.
+  The view (`ui/diff_view.rs`) has a file-list pane and a body pane; it opens on the first file.
 - **Enter on a clean worktree** shows its HEAD commit (there's no worktree diff to show).
 - **Narrow terminals** (< 72 columns, e.g. a popup pane) stack the worktree list above the graph.
 - **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width.
