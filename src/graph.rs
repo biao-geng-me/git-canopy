@@ -168,12 +168,27 @@ struct Item<'a> {
 }
 
 /// Lay out `items` (topologically ordered, children first) into rows of cells.
-fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
+///
+/// `trunk` (the base branch tip) gets lane 0 reserved from the start, so the base branch is a
+/// straight line on the left instead of wherever topo order happens to put it. The reserved lane
+/// is invisible until the trunk tip (or the uncommitted row right above it) is reached.
+fn layout<'a>(items: &[Item<'a>], trunk: Option<&'a str>) -> Vec<Vec<Cell>> {
     let mut lanes: Vec<Option<&str>> = Vec::new();
+    let mut phantom = false;
+    if let Some(t) = trunk {
+        lanes.push(Some(t));
+        phantom = true;
+    }
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
         let mut row = RowCells::default();
-        let col = match lanes.iter().position(|l| *l == Some(item.id)) {
+        let on_trunk = phantom && item.node == NODE_UNCOMMITTED && item.parents.first().map(String::as_str) == trunk;
+        let found = if on_trunk {
+            Some(0)
+        } else {
+            lanes.iter().position(|l| *l == Some(item.id))
+        };
+        let col = match found {
             Some(c) => c,
             None => match lanes.iter().position(Option::is_none) {
                 Some(c) => c,
@@ -187,6 +202,9 @@ fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
         // Pipes coming from the row above: continue, or end at this commit.
         let mut freed = HashSet::new();
         for (j, lane) in lanes.iter().enumerate() {
+            if phantom && j == 0 {
+                continue;
+            }
             match lane {
                 Some(id) if *id == item.id => {
                     row.set(2 * j, U, lane_color(j));
@@ -203,6 +221,9 @@ fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
             lanes[j] = None;
         }
         row.node = Some((col, item.node, lane_color(col)));
+        if col == 0 {
+            phantom = false;
+        }
 
         // Pipes going down to the parents.
         match item.parents.split_first() {
@@ -237,7 +258,14 @@ fn layout(items: &[Item]) -> Vec<Vec<Cell>> {
 }
 
 impl Graph {
-    pub fn build(commits: &Arc<Vec<Commit>>, refs: &[RefEntry], worktrees: &[WorktreeView], truncated: bool) -> Graph {
+    /// `base` is the base branch name; its lane is kept leftmost.
+    pub fn build(
+        commits: &Arc<Vec<Commit>>,
+        refs: &[RefEntry],
+        worktrees: &[WorktreeView],
+        base: Option<&str>,
+        truncated: bool,
+    ) -> Graph {
         let commit_idx: HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
 
         // Uncommitted rows go directly above their HEAD commit (or on top if it is not loaded).
@@ -297,7 +325,11 @@ impl Graph {
             })
             .collect();
 
-        let rows: Vec<Row> = layout(&items)
+        let trunk = base
+            .and_then(|b| refs.iter().find(|r| r.kind == RefKind::Branch && r.name == b))
+            .map(|r| r.target.as_str())
+            .filter(|t| commit_idx.contains_key(t));
+        let rows: Vec<Row> = layout(&items, trunk)
             .into_iter()
             .zip(kinds)
             .map(|(cells, kind)| Row { kind, cells })
@@ -402,7 +434,15 @@ mod tests {
     }
 
     fn build(commits: Vec<Commit>, wts: &[WorktreeView]) -> Graph {
-        Graph::build(&Arc::new(commits), &[], wts, false)
+        Graph::build(&Arc::new(commits), &[], wts, None, false)
+    }
+
+    fn branch(name: &str, target: &str) -> RefEntry {
+        RefEntry {
+            kind: RefKind::Branch,
+            name: name.into(),
+            target: target.into(),
+        }
     }
 
     #[test]
@@ -509,7 +549,7 @@ mod tests {
             branch: Some("main".into()),
             ..Default::default()
         }];
-        let g = Graph::build(&commits, &refs, &wts, false);
+        let g = Graph::build(&commits, &refs, &wts, None, false);
         let texts = |i: usize| {
             g.labels[i]
                 .iter()
@@ -527,5 +567,33 @@ mod tests {
     fn missing_parent_keeps_lane_open() {
         let g = build(vec![c("b", &["zz"]), c("a", &["yy"])], &[]);
         assert_eq!(render(&g), ["● b", "│ ● a"]);
+    }
+
+    #[test]
+    fn base_branch_keeps_leftmost_lane() {
+        // Topo order lists the feature branch first; without a trunk it would take lane 0.
+        let commits = vec![c("f2", &["f1"]), c("f1", &["a"]), c("m1", &["a"]), c("a", &[])];
+        let g = build(commits.clone(), &[]);
+        assert_eq!(render(&g), ["● f2", "● f1", "│ ● m1", "●─╯ a"]);
+        let g = Graph::build(&Arc::new(commits), &[branch("main", "m1")], &[], Some("main"), false);
+        assert_eq!(render(&g), ["  ● f2", "  ● f1", "● │ m1", "●─╯ a"]);
+    }
+
+    #[test]
+    fn dirty_base_worktree_sits_on_trunk() {
+        let commits = vec![c("f1", &["a"]), c("m1", &["a"]), c("a", &[])];
+        let wts = vec![WorktreeView {
+            path: "/w/main".into(),
+            name: "main".into(),
+            head: Some("m1".into()),
+            branch: Some("main".into()),
+            status: Some(Status {
+                untracked: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let g = Graph::build(&Arc::new(commits), &[branch("main", "m1")], &wts, Some("main"), false);
+        assert_eq!(render(&g), ["  ● f1", "◌ │ wt0", "◉ │ m1", "●─╯ a"]);
     }
 }

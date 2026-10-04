@@ -204,6 +204,7 @@ impl App {
             // Start on the worktree canopy was launched from.
             if let Some(i) = self.snap.worktrees.iter().position(|w| w.is_current) {
                 self.wt.sel = i;
+                self.wt.follow = true;
             }
         } else if let Some(p) = selected_wt
             && let Some(i) = self.snap.worktrees.iter().position(|w| w.path == p)

@@ -38,18 +38,18 @@ pub fn load(target: &Target) -> Result<Vec<String>> {
 }
 
 fn worktree_diff(wt: &Path, has_head: bool) -> Result<String> {
-    let mut out = String::new();
-    if has_head {
-        let mut args = vec!["diff"];
-        args.extend(COMMON);
-        args.extend(["HEAD", "--"]);
-        out.push_str(&String::from_utf8_lossy(&git::run(wt, &args)?));
+    // Plumbing on purpose: porcelain `git diff` refreshes and rewrites the index (taking
+    // index.lock) when it finds stat-dirty files, even with --no-optional-locks. `diff-index`
+    // never writes, and skips files whose content is unchanged.
+    let base = if has_head {
+        "HEAD".to_string()
     } else {
-        // Unborn branch: nothing to diff against, show what is staged.
-        let mut args = vec!["diff", "--cached"];
-        args.extend(COMMON);
-        out.push_str(&String::from_utf8_lossy(&git::run(wt, &args)?));
-    }
+        // Unborn branch: compare against the empty tree (computed, not written).
+        let out = git::run(wt, &["hash-object", "-t", "tree", "--stdin"])?;
+        String::from_utf8_lossy(&out).trim().to_string()
+    };
+    let raw = git::run(wt, &["diff-index", "-p", "--stat", "-M", &base, "--"])?;
+    let mut out = String::from_utf8_lossy(&raw).into_owned();
 
     let raw = git::run(wt, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     let untracked: Vec<String> = git::split_nul(&raw).map(git::lossy).collect();

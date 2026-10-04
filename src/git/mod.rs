@@ -70,8 +70,14 @@ pub struct RepoPaths {
 
 /// Resolve the repository containing `path`; errors if it is not inside a git repository.
 pub fn discover(path: &Path) -> Result<RepoPaths> {
-    let out = run(path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .with_context(|| format!("not a git repository: {}", path.display()))?;
+    let out = run(path, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map_err(|e| {
+        // Plain message for the common case; keep git's words for anything else (e.g. safe.directory).
+        if e.to_string().contains("not a git repository") {
+            anyhow::anyhow!("not a git repository: {}", path.display())
+        } else {
+            e.context(format!("cannot open repository at {}", path.display()))
+        }
+    })?;
     let common_dir = PathBuf::from(trim_line(&out));
     let toplevel = run(path, &["rev-parse", "--path-format=absolute", "--show-toplevel"])
         .ok()

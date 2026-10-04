@@ -429,7 +429,13 @@ impl Worker {
         let gk = h.finish();
         if self.graph_key != Some(gk) {
             let more = self.commits.len() >= self.limit;
-            self.graph = Arc::new(Graph::build(&self.commits, &self.refs, &self.worktrees, more));
+            self.graph = Arc::new(Graph::build(
+                &self.commits,
+                &self.refs,
+                &self.worktrees,
+                self.base.as_deref(),
+                more,
+            ));
             self.graph_key = Some(gk);
         }
     }

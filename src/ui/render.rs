@@ -30,8 +30,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         return;
     }
-    let wt_width = worktree_panel_width(app, main.width);
-    let [left, right] = Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main);
+    let [left, right] = if main.width < NARROW {
+        // Narrow terminal (e.g. a popup pane): stack the worktree list above the graph.
+        let want = app.snap.worktrees.len().max(1) as u16 + 2;
+        let h = want.min(main.height / 2).max(3.min(main.height));
+        Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(main)
+    } else {
+        let wt_width = worktree_panel_width(app, main.width);
+        Layout::horizontal([Constraint::Length(wt_width), Constraint::Min(10)]).areas(main)
+    };
     app.areas.worktrees = left;
     app.areas.graph = right;
     draw_worktrees(f, app, left);
@@ -207,6 +214,8 @@ fn wt_rows(app: &App) -> Vec<WtRow> {
 }
 
 const NAME_MAX: usize = 28;
+/// Below this width the panels are stacked vertically.
+const NARROW: u16 = 72;
 
 fn worktree_panel_width(app: &App, total: u16) -> u16 {
     let rows = wt_rows(app);
@@ -220,8 +229,8 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     // borders + marker + gaps
     let natural = 2 + 2 + name + 1 + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
-    let max = (total as usize * 45 / 100).max(20);
-    natural.clamp(24, max) as u16
+    let max = total as usize * 45 / 100;
+    natural.max(24).min(max) as u16
 }
 
 fn truncate(s: &str, width: usize) -> String {
@@ -721,14 +730,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         key("q"),
         text(" quit"),
     ]);
+    let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
     let mode = if app.snap.watching {
         format!("live · poll {:.1}s ", app.interval_ms as f64 / 1000.0)
     } else {
         format!("polling {:.1}s ", app.interval_ms as f64 / 1000.0)
     };
-    let right = Line::from(Span::styled(mode, Style::new().fg(C_DIM))).right_aligned();
-    f.render_widget(Paragraph::new(right), hints);
+    if left_width + mode.width() < hints.width as usize {
+        let right = Line::from(Span::styled(mode, Style::new().fg(C_DIM))).right_aligned();
+        f.render_widget(Paragraph::new(right), hints);
+    }
 }
 
 const HELP: &[(&str, &str)] = &[

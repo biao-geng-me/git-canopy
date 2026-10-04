@@ -113,6 +113,9 @@ UI thread only renders snapshots received over a channel.
   `for-each-ref` (not `%D`), so they don't depend on which worktree canopy runs in.
 - **One row per commit:** lanes are drawn lazygit-style (`│ ╯ ╮ ┴ ┤ …`, two cells per lane) with no
   connector-only rows — denser overview than `git log --graph`. Lane colors are per column.
+- **Trunk lane:** lane 0 is reserved for the base branch tip from the top of the graph (invisible until
+  the tip row), so the base branch is a straight line on the left and agent branches stack to the right.
+  A dirty base worktree's `◌` row sits on that lane directly above the tip.
 - **Uncommitted rows** are synthetic commits whose only parent is the worktree HEAD, inserted right above
   it, so the normal lane logic connects them (they get their own lane when the HEAD has children).
 - **Worktree name** = branch name, or the directory name when detached. In the graph a branch that is
@@ -125,3 +128,19 @@ UI thread only renders snapshots received over a channel.
   refs fingerprint gates the log/graph reload, so polling alone covers repos where fs events don't fire.
   fs events only reduce latency. Startup publishes three snapshots: worktree list, + statuses, + graph.
 - **Repo-wide git commands run with `-C <common dir>`**, which works for bare and non-bare repos alike.
+- **Worktree diff uses `git diff-index -p --stat -M HEAD`, not `git diff HEAD`.** Verified on git 2.43:
+  porcelain `git diff` refreshes and rewrites the index (taking `index.lock`) when it sees stat-dirty
+  files, even with `--no-optional-locks`. The plumbing never writes. Untracked files are listed via
+  `ls-files --others --exclude-standard` and read from disk directly (first 50, 256 KiB / 500 lines each).
+  Unborn HEAD diffs against the empty tree (`hash-object -t tree --stdin`, nothing written).
+- **Enter on a clean worktree** shows its HEAD commit (there's no worktree diff to show).
+- **Narrow terminals** (< 72 columns, e.g. a popup pane) stack the worktree list above the graph.
+- **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width.
+  ratatui is used with default features off (`crossterm`, `layout-cache`) and its crossterm re-export.
+- **Static binary:** the default glibc build links libc dynamically; `--target x86_64-unknown-linux-musl`
+  gives a fully static ~1.2 MB binary (no C deps, works out of the box with rustup's musl target).
+- **Perf baseline** (`scripts/mkbigrepo.sh`, 20k commits, 16 worktrees, no commit-graph, WSL2): worktree
+  list ~25 ms, all statuses ~35 ms, graph ~100 ms after start (`cargo run --release --example startup`).
+- **Testing:** integration tests build a fresh fixture under `std::env::temp_dir()` per test
+  (`tests/common`), never inside the repo. The TUI was exercised by driving it in a private tmux server
+  (`tmux -L <name>`), including injected SGR mouse sequences.
