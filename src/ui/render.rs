@@ -638,27 +638,20 @@ pub(super) fn inset_text(app: &App, r: usize, width: usize) -> Option<InsetText>
     }
     let g = &app.snap.graph;
     let row = g.rows.get(r)?;
-    let (subject_col, subject) = match row.kind {
-        RowKind::Commit(ci) => {
-            let col = spans_width(&commit_prefix(app, row, ci, now_secs()));
-            let room = subject_room(col, width);
-            (
-                col,
-                inset::wrap(&g.commits[ci].subject, room, width.saturating_sub(col)),
-            )
-        }
-        RowKind::Uncommitted(_) => (0, Vec::new()),
-    };
+    // Continuation lines of the subject start at the same column as the message body.
     let body = width.saturating_sub(inset_col(row));
+    let subject = match row.kind {
+        RowKind::Commit(ci) => {
+            let room = subject_room(spans_width(&commit_prefix(app, row, ci, now_secs())), width);
+            inset::wrap(&g.commits[ci].subject, room, body)
+        }
+        RowKind::Uncommitted(_) => Vec::new(),
+    };
     let message = app
         .row_doc(Focus::Graph, r)
         .filter(|e| e.doc.is_some())
         .map(|e| e.message.iter().flat_map(|l| inset::wrap(l, body, body)).collect());
-    Some(InsetText {
-        subject_col,
-        subject,
-        message,
-    })
+    Some(InsetText { subject, message })
 }
 
 fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
@@ -764,7 +757,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
                 let (col, content) = match (item, text) {
                     (Item::Subject(k), Some(t)) => {
                         let line = t.subject.get(k).cloned().unwrap_or_default();
-                        (t.subject_col, vec![Span::raw(line)])
+                        (inset_col(row), vec![Span::raw(line)])
                     }
                     (Item::Message(i), Some(InsetText { message: Some(m), .. })) => {
                         let line = m.get(i).cloned().unwrap_or_default();

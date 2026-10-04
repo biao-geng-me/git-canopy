@@ -148,8 +148,8 @@ UI thread only renders snapshots received over a channel.
   always stack. The worktree panel takes the height it needs, up to half the screen. Paths are shown
   relative to the worktrees' common parent directory.
 - **Insets (expand in place), graph only:** the graph is a flat list of visual lines (`ui/inset.rs`):
-  base rows plus, for open rows, the subject's wrapped continuation lines (aligned under the subject,
-  which is not truncated while open), the message body wrapped to the panel width, one line per
+  base rows plus, for open rows, the subject's wrapped continuation lines (starting at the message
+  body's column; the subject is not truncated while open), the message body wrapped to the panel width, one line per
   file, and for open files their diff
   from the first hunk (max 200 lines, then "… n more"). The cursor moves over every visual line
   (magit-style). Space/click toggles a row or file; Space/← inside a diff folds the enclosing section;

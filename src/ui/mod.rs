@@ -123,8 +123,6 @@ pub struct Panel {
 /// Wrapped text of an open graph row.
 #[derive(Clone, Debug, Default)]
 pub struct InsetText {
-    /// Column where the subject starts (continuation lines align to it).
-    pub subject_col: usize,
     /// The subject: the first line goes on the row, the rest on continuation lines.
     pub subject: Vec<String>,
     /// The message body wrapped to the inset width, once loaded.
