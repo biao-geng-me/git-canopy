@@ -100,7 +100,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match canopy::ui::run(paths, args.path, args.cfg) {
+    match canopy::ui::run(paths, args.cfg) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");

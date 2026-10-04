@@ -29,7 +29,7 @@ fn run(watch_fs: bool) {
     let cfg = Config {
         interval: Duration::from_millis(300),
         watch: watch_fs,
-        base: None,
+        ..Config::default()
     };
     let (tx, rx) = mpsc::channel();
     let _h = watch::spawn(paths, cfg, move |s| {
@@ -81,4 +81,43 @@ fn live_refresh_with_fs_watch() {
 #[test]
 fn live_refresh_polling_only() {
     run(false);
+}
+
+#[test]
+fn graph_loads_more_history_on_request() {
+    let fx = common::Fixture::new();
+    let paths = canopy::git::discover(&fx.repo()).unwrap();
+    let cfg = Config {
+        interval: Duration::from_secs(60),
+        page: 5,
+        ..Config::default()
+    };
+    let (tx, rx) = mpsc::channel();
+    let h = watch::spawn(paths, cfg, move |s| {
+        let _ = tx.send(s);
+    });
+    let s = wait_for(&rx, Duration::from_secs(10), |s| {
+        !s.graph.commits.is_empty()
+    });
+    assert_eq!(s.graph.commits.len(), 5);
+    assert!(s.graph.truncated);
+    h.request(watch::Request::LoadMore);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| {
+        s.graph.commits.len() == 10
+    });
+    assert!(s.graph.truncated);
+    for _ in 0..3 {
+        h.request(watch::Request::LoadMore);
+    }
+    let s = wait_for(&rx, Duration::from_secs(10), |s| !s.graph.truncated);
+    assert!(s.graph.commits.len() < 25);
+    // Every dirty worktree whose HEAD is loaded has an uncommitted row.
+    let dirty = s.worktrees.iter().filter(|w| w.is_dirty()).count();
+    let pseudo = s
+        .graph
+        .rows
+        .iter()
+        .filter(|r| matches!(r.kind, canopy::graph::RowKind::Uncommitted(_)))
+        .count();
+    assert_eq!(pseudo, dirty);
 }

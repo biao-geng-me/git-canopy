@@ -105,3 +105,23 @@ UI thread only renders snapshots received over a channel.
 - Commit after each milestone (small, descriptive messages). No remote is configured; don't push.
 - Keep `cargo clippy` clean and `cargo test` green.
 - README.md for users; this file for design intent — update it when design decisions change.
+
+## Design decisions (made during implementation)
+
+- **Graph sources:** `git log --branches --remotes --tags <worktree HEADs>` instead of `--all`, so stash
+  and notes refs don't add noise; detached worktree HEADs are passed explicitly. Labels come from
+  `for-each-ref` (not `%D`), so they don't depend on which worktree canopy runs in.
+- **One row per commit:** lanes are drawn lazygit-style (`│ ╯ ╮ ┴ ┤ …`, two cells per lane) with no
+  connector-only rows — denser overview than `git log --graph`. Lane colors are per column.
+- **Uncommitted rows** are synthetic commits whose only parent is the worktree HEAD, inserted right above
+  it, so the normal lane logic connects them (they get their own lane when the HEAD has children).
+- **Worktree name** = branch name, or the directory name when detached. In the graph a branch that is
+  checked out in a worktree is shown only as `[name]` (cyan); other refs as `(branch, remote, tag: x)`.
+  Prunable worktrees don't get `[name]` labels.
+- **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/
+  develop, else the main worktree's branch), computed with `rev-list --left-right --count` and cached
+  per (base sha, head sha). `⇡a ⇣b` vs upstream from status. The base worktree shows upstream only.
+- **Refresh:** every poll tick re-runs `worktree list` + `for-each-ref` (cheap) and all statuses; the
+  refs fingerprint gates the log/graph reload, so polling alone covers repos where fs events don't fire.
+  fs events only reduce latency. Startup publishes three snapshots: worktree list, + statuses, + graph.
+- **Repo-wide git commands run with `-C <common dir>`**, which works for bare and non-bare repos alike.

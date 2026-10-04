@@ -25,7 +25,7 @@ use crate::model::{self, Snapshot, WorktreeView};
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// Max concurrent git processes for per-worktree work.
 const PARALLELISM: usize = 6;
-/// Commits loaded initially and per "load more" step.
+/// Default for [`Config::page`].
 pub const GRAPH_PAGE: usize = 1000;
 
 #[derive(Clone, Debug)]
@@ -35,6 +35,8 @@ pub struct Config {
     pub watch: bool,
     /// Branch to compare worktrees against; auto-detected when `None`.
     pub base: Option<String>,
+    /// Commits loaded initially and per "load more" step.
+    pub page: usize,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             interval: Duration::from_millis(1500),
             watch: true,
             base: None,
+            page: GRAPH_PAGE,
         }
     }
 }
@@ -117,6 +120,7 @@ struct Worker {
 
 impl Worker {
     fn new(paths: RepoPaths, cfg: Config, emit: Box<dyn Fn(Arc<Snapshot>) + Send>) -> Self {
+        let limit = cfg.page.max(1);
         Worker {
             paths,
             cfg,
@@ -128,7 +132,7 @@ impl Worker {
             fingerprint: 0,
             base: None,
             ab_cache: HashMap::new(),
-            limit: GRAPH_PAGE,
+            limit,
             commits: Arc::default(),
             commits_key: None,
             graph: Arc::default(),
@@ -209,7 +213,7 @@ impl Worker {
                 }
                 Ok(Msg::Req(Request::LoadMore)) => {
                     if self.commits.len() >= self.limit {
-                        self.limit += GRAPH_PAGE;
+                        self.limit += self.cfg.page.max(1);
                         self.refresh_graph();
                         self.publish();
                     }
