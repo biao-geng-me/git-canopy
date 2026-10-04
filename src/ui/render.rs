@@ -500,7 +500,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     if n > 0 {
         title.push(Span::styled(format!("{n} "), Style::new().fg(C_DIM)));
         if dirty > 0 {
-            title.push(Span::styled(format!("✎{dirty} "), Style::new().fg(C_MODIFIED)));
+            title.push(Span::styled(format!("✎ {dirty} "), Style::new().fg(C_MODIFIED)));
         }
     }
     let block = panel(Line::from(title), focused);
