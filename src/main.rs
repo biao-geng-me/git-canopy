@@ -16,7 +16,9 @@ ARGS:
     PATH    any directory inside the repository (default: current directory)
 
 OPTIONS:
-    -i, --interval <SECS>   status poll interval in seconds (default: 60)
+    -i, --interval <SECS>   poll interval in seconds for worktrees that can't be watched (default:
+                            60); watched worktrees are re-checked every 10 minutes regardless
+        --no-poll           never poll; update only on file events and manual refresh (r)
         --base <BRANCH>     branch to compare worktrees against (default: main/master/...)
         --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only
@@ -69,6 +71,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--base" => cfg.base = Some(value("--base")?),
             "--no-watch" => cfg.watch = false,
+            "--no-poll" => cfg.poll = false,
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
                     "stacked" => LayoutMode::Stacked,

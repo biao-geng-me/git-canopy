@@ -1,9 +1,20 @@
-//! Background refresh: polling + filesystem watching.
+//! Background refresh: file system watching + (spread out) polling.
 //!
-//! One worker thread owns all repository state. It polls every worktree's status on an interval
-//! (working-tree edits never touch `.git`), and reacts quickly to fs events in the common git dir
-//! (refs, HEADs, indexes). Each change produces a new immutable [`Snapshot`] handed to `emit`.
+//! One worker thread owns all repository state and produces immutable [`Snapshot`]s for `emit`.
+//!
+//! - **Git dir events** (refs, HEADs, indexes in the common dir) refresh refs and the affected
+//!   worktree's status within ~150 ms.
+//! - **Worktree events**: each worktree's directories are watched (minus `.git`, ignored and
+//!   nested repos, see [`trees`]); an edit runs `git status` for that worktree only, at most once
+//!   per [`MIN_GAP`].
+//! - **Polling** catches what events miss: unwatched worktrees every `interval`, watched ones
+//!   every [`FALLBACK`] (changes from other machines on network filesystems). Polls are spread
+//!   over the interval, one worktree at a time, instead of all at once. `poll: false` disables
+//!   polling entirely (manual refresh only).
+//!
 //! Refs are fingerprinted so the log/graph is only recomputed when something actually moved.
+
+mod trees;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -17,21 +28,33 @@ use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::fsinfo::{self, Events};
 use crate::git::{self, RepoPaths, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
 use crate::model::{self, Snapshot, WorktreeView};
+use trees::TreeWatch;
 
 /// Coalesce bursts of fs events (git writes several files per operation).
 const DEBOUNCE: Duration = Duration::from_millis(150);
-/// Max concurrent git processes for per-worktree work.
+/// Minimum time between edit-triggered statuses of one worktree (a busy agent or build).
+pub const MIN_GAP: Duration = Duration::from_secs(2);
+/// Poll period for watched worktrees (at least `interval`): catches changes events miss, e.g.
+/// edits made from another machine on a network filesystem.
+pub const FALLBACK: Duration = Duration::from_secs(600);
+/// Worktrees with more directories than this are polled instead of watched.
+const MAX_WATCH_DIRS: usize = 10_000;
+/// Max concurrent git processes for startup and manual refreshes.
 const PARALLELISM: usize = 6;
 /// Default for [`Config::page`].
 pub const GRAPH_PAGE: usize = 1000;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Poll period for worktrees that can't be watched, and for refs.
     pub interval: Duration,
-    /// Use fs notifications in addition to polling.
+    /// Poll at all; without it, updates come from fs events and manual refreshes only.
+    pub poll: bool,
+    /// Use fs notifications (git dir and worktrees).
     pub watch: bool,
     /// Branch to compare worktrees against; auto-detected when `None`.
     pub base: Option<String>,
@@ -43,6 +66,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             interval: Duration::from_secs(60),
+            poll: true,
             watch: true,
             base: None,
             page: GRAPH_PAGE,
@@ -100,6 +124,18 @@ struct Worker {
     emit: Box<dyn Fn(Arc<Snapshot>) + Send>,
     watcher: Option<RecommendedWatcher>,
     watched_worktrees_dir: bool,
+    /// Watched worktrees, by path.
+    trees: HashMap<PathBuf, TreeWatch>,
+    /// Worktrees that couldn't be watched (too big, unreliable fs, watch limit); polled instead.
+    unwatchable: HashSet<PathBuf>,
+
+    /// Next poll per worktree.
+    due: HashMap<PathBuf, Instant>,
+    refs_due: Instant,
+    /// Last status run per worktree, for rate-limiting edit-triggered statuses.
+    last_status: HashMap<PathBuf, Instant>,
+    /// Edit-triggered statuses waiting out [`MIN_GAP`].
+    deferred: HashMap<PathBuf, Instant>,
 
     worktrees: Vec<WorktreeView>,
     refs: Vec<RefEntry>,
@@ -123,12 +159,19 @@ struct Worker {
 impl Worker {
     fn new(paths: RepoPaths, cfg: Config, emit: Box<dyn Fn(Arc<Snapshot>) + Send>) -> Self {
         let limit = cfg.page.max(1);
+        let refs_due = Instant::now() + cfg.interval;
         Worker {
             paths,
             cfg,
             emit,
             watcher: None,
             watched_worktrees_dir: false,
+            trees: HashMap::new(),
+            unwatchable: HashSet::new(),
+            due: HashMap::new(),
+            refs_due,
+            last_status: HashMap::new(),
+            deferred: HashMap::new(),
             worktrees: Vec::new(),
             refs: Vec::new(),
             fingerprint: 0,
@@ -151,8 +194,14 @@ impl Worker {
     }
 
     fn start_watcher(&mut self, tx: Sender<Msg>) {
+        let common = self.paths.common_dir.clone();
+        if fsinfo::events_at(&common) == Events::Unreliable {
+            return; // e.g. WSL2 /mnt/c: watches "work" but never fire. Poll instead.
+        }
         let handler = move |res: notify::Result<notify::Event>| {
+            // Access events include our own `git status` opening files: never react to them.
             if let Ok(ev) = res
+                && !ev.kind.is_access()
                 && !ev.paths.is_empty()
             {
                 let _ = tx.send(Msg::Fs(ev.paths));
@@ -161,7 +210,6 @@ impl Worker {
         let Ok(mut watcher) = notify::recommended_watcher(handler) else {
             return; // Polling still covers everything, just with more latency.
         };
-        let common = self.paths.common_dir.clone();
         if watcher.watch(&common, RecursiveMode::NonRecursive).is_err() {
             return;
         }
@@ -187,11 +235,93 @@ impl Worker {
         }
     }
 
+    /// Start watching new worktrees' directories and stop watching removed ones.
+    fn sync_tree_watches(&mut self) {
+        let Some(watcher) = self.watcher.as_mut() else { return };
+        let current: HashSet<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.has_worktree())
+            .map(|w| w.path.clone())
+            .collect();
+        self.trees.retain(|path, tw| {
+            let keep = current.contains(path);
+            if !keep {
+                for d in &tw.dirs {
+                    let _ = watcher.unwatch(d);
+                }
+            }
+            keep
+        });
+        let new: Vec<PathBuf> = current
+            .into_iter()
+            .filter(|p| !self.trees.contains_key(p) && !self.unwatchable.contains(p))
+            .collect();
+        // Walking the trees is the slow part: do it in parallel, then add the watches.
+        let plans = par_map(&new, PARALLELISM, |p| plan_tree(p));
+        for (path, plan) in new.into_iter().zip(plans) {
+            match plan.and_then(|(ignored, dirs)| watch_dirs(watcher, ignored, dirs)) {
+                Some(tw) => {
+                    self.trees.insert(path, tw);
+                }
+                None => {
+                    self.unwatchable.insert(path);
+                }
+            }
+        }
+    }
+
+    /// Watch a directory that appeared inside a watched worktree (unless it is ignored).
+    fn watch_new_dir(&mut self, root: &Path, dir: &Path) {
+        let (Some(watcher), Some(tw)) = (self.watcher.as_mut(), self.trees.get_mut(root)) else {
+            return;
+        };
+        let ignored = trees::ignored_dirs(root, dir);
+        let budget = MAX_WATCH_DIRS.saturating_sub(tw.dirs.len());
+        let dirs = trees::dirs_to_watch(dir, &ignored, budget).unwrap_or_default();
+        tw.ignored.extend(ignored);
+        for d in dirs {
+            if !tw.dirs.contains(&d) && watcher.watch(&d, RecursiveMode::NonRecursive).is_ok() {
+                tw.dirs.insert(d);
+            }
+        }
+    }
+
+    /// How often a worktree is polled: watched ones only as a fallback.
+    fn period(&self, wt: &Path) -> Duration {
+        if self.trees.contains_key(wt) {
+            FALLBACK.max(self.cfg.interval)
+        } else {
+            self.cfg.interval
+        }
+    }
+
+    /// Give worktrees without a poll slot one, spread evenly over their period.
+    fn schedule(&mut self) {
+        let live: HashSet<&PathBuf> = self.worktrees.iter().map(|w| &w.path).collect();
+        self.due.retain(|p, _| live.contains(p));
+        self.deferred.retain(|p, _| live.contains(p));
+        let new: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.has_worktree() && !self.due.contains_key(&w.path))
+            .map(|w| w.path.clone())
+            .collect();
+        let now = Instant::now();
+        for (i, p) in new.iter().enumerate() {
+            let slot = trees::stagger(now, self.period(p), new.len())[i];
+            self.due.insert(p.clone(), slot);
+        }
+    }
+
     fn initial_load(&mut self) {
         // Worktree list first (fast), then statuses, then the graph: the overview fills in
-        // progressively instead of waiting on the slowest piece.
+        // progressively instead of waiting on the slowest piece. Worktree watches go in before
+        // the first statuses, so no edit can slip in between the two unnoticed.
         self.refresh_refs(false);
         self.publish();
+        self.sync_tree_watches();
+        self.schedule();
         self.refresh_status(None);
         self.statuses_loaded = true;
         self.publish();
@@ -200,20 +330,25 @@ impl Worker {
     }
 
     fn run(&mut self, rx: mpsc::Receiver<Msg>) {
-        let mut next_poll = Instant::now() + self.cfg.interval;
         let mut pending: Vec<PathBuf> = Vec::new();
         let mut debounce_until: Option<Instant> = None;
         loop {
-            let deadline = debounce_until.map_or(next_poll, |d| d.min(next_poll));
+            let mut deadline = Instant::now() + Duration::from_secs(86_400);
+            let mut consider = |t: Instant| deadline = deadline.min(t);
+            if let Some(d) = debounce_until {
+                consider(d);
+            }
+            self.deferred.values().copied().for_each(&mut consider);
+            if self.cfg.poll {
+                consider(self.refs_due);
+                self.due.values().copied().for_each(&mut consider);
+            }
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(Msg::Fs(paths)) => {
                     pending.extend(paths);
                     debounce_until.get_or_insert_with(|| Instant::now() + DEBOUNCE);
                 }
-                Ok(Msg::Req(Request::Refresh)) => {
-                    self.full_refresh();
-                    next_poll = Instant::now() + self.cfg.interval;
-                }
+                Ok(Msg::Req(Request::Refresh)) => self.full_refresh(),
                 Ok(Msg::Req(Request::LoadMore)) => {
                     if self.commits.len() >= self.limit {
                         self.limit += self.cfg.page.max(1);
@@ -229,15 +364,61 @@ impl Worker {
                 debounce_until = None;
                 self.on_fs_events(std::mem::take(&mut pending));
             }
-            if now >= next_poll {
-                self.full_refresh();
-                next_poll = Instant::now() + self.cfg.interval;
-            }
+            self.run_due(now);
         }
     }
 
+    /// Run whatever is due: deferred edit statuses, the refs poll, worktree polls.
+    fn run_due(&mut self, now: Instant) {
+        let mut targets: HashSet<PathBuf> = self
+            .deferred
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.deferred.retain(|p, _| !targets.contains(p));
+        let mut changed = false;
+        if self.cfg.poll {
+            if now >= self.refs_due {
+                self.refs_due = now + self.cfg.interval;
+                if self.refresh_refs(false) {
+                    changed = true;
+                    self.after_worktree_list_change(&mut targets);
+                }
+            }
+            targets.extend(self.due.iter().filter(|(_, t)| **t <= now).map(|(p, _)| p.clone()));
+        }
+        // Polls run one worktree at a time: spreading the load is the point.
+        for p in targets {
+            let one = HashSet::from([p]);
+            changed |= self.refresh_status_with(Some(&one), 1);
+        }
+        if changed {
+            self.refresh_graph();
+            self.publish();
+        }
+    }
+
+    /// New worktrees need a watch, a poll slot and a first status.
+    fn after_worktree_list_change(&mut self, targets: &mut HashSet<PathBuf>) {
+        self.ensure_worktrees_watch();
+        self.sync_tree_watches();
+        self.schedule();
+        targets.extend(
+            self.worktrees
+                .iter()
+                .filter(|w| w.status.is_none() && w.has_worktree())
+                .map(|w| w.path.clone()),
+        );
+    }
+
     fn full_refresh(&mut self) {
+        // A manual refresh also retries worktrees that couldn't be watched before.
+        self.unwatchable.clear();
         self.refresh_refs(false);
+        self.sync_tree_watches();
+        self.due.clear();
+        self.schedule();
         self.refresh_status(None);
         self.refresh_graph();
         self.publish();
@@ -246,9 +427,28 @@ impl Worker {
     fn on_fs_events(&mut self, paths: Vec<PathBuf>) {
         let common = self.paths.common_dir.clone();
         let mut targets: HashSet<PathBuf> = HashSet::new();
-        let mut relevant = false;
+        let mut edited: HashSet<PathBuf> = HashSet::new();
+        let mut new_dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut git_relevant = false;
         for p in &paths {
             let Ok(rel) = p.strip_prefix(&common) else {
+                // A working-tree edit in a watched worktree (deepest root wins for nested ones).
+                let Some(root) = self
+                    .trees
+                    .keys()
+                    .filter(|r| p.starts_with(r))
+                    .max_by_key(|r| r.as_os_str().len())
+                else {
+                    continue;
+                };
+                let tw = &self.trees[root];
+                if tw.is_noise(root, p) {
+                    continue;
+                }
+                if p.is_dir() && !tw.dirs.contains(p) {
+                    new_dirs.push((root.clone(), p.clone()));
+                }
+                edited.insert(root.clone());
                 continue;
             };
             let mut comps = rel.components().map(|c| c.as_os_str().to_string_lossy());
@@ -258,7 +458,7 @@ impl Worker {
             {
                 continue;
             }
-            relevant = true;
+            git_relevant = true;
             if first == "worktrees" {
                 if let Some(name) = comps.next() {
                     let admin = common.join("worktrees").join(&*name);
@@ -276,22 +476,32 @@ impl Worker {
                 }
             }
         }
-        if !relevant {
-            return;
+        for (root, dir) in new_dirs {
+            self.watch_new_dir(&root, &dir);
         }
-        self.ensure_worktrees_watch();
-        let changed = self.refresh_refs(false);
-        // New worktrees (no status yet) need one too.
-        targets.extend(
-            self.worktrees
-                .iter()
-                .filter(|w| w.status.is_none() && w.has_worktree())
-                .map(|w| w.path.clone()),
-        );
+
+        // Edits: right away unless this worktree was checked very recently.
+        let now = Instant::now();
+        for root in edited {
+            match self.last_status.get(&root) {
+                Some(&t) if now.duration_since(t) < MIN_GAP => {
+                    self.deferred.entry(root).or_insert(t + MIN_GAP);
+                }
+                _ => {
+                    targets.insert(root);
+                }
+            }
+        }
+
+        let mut changed = false;
+        if git_relevant && self.refresh_refs(false) {
+            changed = true;
+            self.after_worktree_list_change(&mut targets);
+        }
         if !targets.is_empty() {
-            self.refresh_status(Some(&targets));
+            changed |= self.refresh_status(Some(&targets));
         }
-        if changed || !targets.is_empty() {
+        if changed {
             self.refresh_graph();
             self.publish();
         }
@@ -400,8 +610,13 @@ impl Worker {
         true
     }
 
-    /// Run `git status` for the given worktrees (all when `None`), in parallel.
-    fn refresh_status(&mut self, only: Option<&HashSet<PathBuf>>) {
+    /// Run `git status` for the given worktrees (all when `None`), in parallel. Returns whether
+    /// anything visible changed.
+    fn refresh_status(&mut self, only: Option<&HashSet<PathBuf>>) -> bool {
+        self.refresh_status_with(only, PARALLELISM)
+    }
+
+    fn refresh_status_with(&mut self, only: Option<&HashSet<PathBuf>>, parallelism: usize) -> bool {
         let idx: Vec<usize> = (0..self.worktrees.len())
             .filter(|&i| {
                 let w = &self.worktrees[i];
@@ -409,9 +624,21 @@ impl Worker {
             })
             .collect();
         let paths: Vec<PathBuf> = idx.iter().map(|&i| self.worktrees[i].path.clone()).collect();
-        let results = par_map(&paths, PARALLELISM, |p| git::status::load(p));
+        let results = par_map(&paths, parallelism, |p| git::status::load(p));
+        let now = Instant::now();
+        let mut changed = false;
         for (i, res) in idx.into_iter().zip(results) {
+            let period = self.period(&self.worktrees[i].path);
             let w = &mut self.worktrees[i];
+            // A status run near a poll slot makes that poll redundant: skip to the next slot,
+            // keeping the slot's phase so polls stay spread out.
+            self.last_status.insert(w.path.clone(), now);
+            if let Some(due) = self.due.get_mut(&w.path) {
+                while *due < now + period / 2 {
+                    *due += period;
+                }
+            }
+            let before = (w.status.clone(), w.changed_at, w.status_error.clone(), w.op);
             match res {
                 Ok(st) => {
                     w.changed_at = last_edited(&w.path, &st.paths);
@@ -421,7 +648,9 @@ impl Worker {
                 Err(e) => w.status_error = Some(format!("{e:#}")),
             }
             w.op = w.admin_dir.as_deref().and_then(git::worktree::operation);
+            changed |= before != (w.status.clone(), w.changed_at, w.status_error.clone(), w.op);
         }
+        changed
     }
 
     /// Reload the log if refs or the limit changed, and re-layout if anything it depends on
@@ -477,13 +706,50 @@ impl Worker {
             repo_name,
             common_dir: self.paths.common_dir.clone(),
             base: self.base.clone(),
-            worktrees: self.worktrees.clone(),
+            worktrees: self
+                .worktrees
+                .iter()
+                .map(|w| WorktreeView {
+                    watched: self.trees.contains_key(&w.path),
+                    ..w.clone()
+                })
+                .collect(),
             graph: self.graph.clone(),
             watching: self.watcher.is_some(),
+            polling: self.cfg.poll,
             statuses_loaded: self.statuses_loaded,
             error: self.error.clone(),
         }));
     }
+}
+
+/// The ignored dirs and the directories to watch for a worktree (see [`trees::dirs_to_watch`]);
+/// `None` if it is on a filesystem without working events or too big to watch.
+fn plan_tree(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if fsinfo::events_at(root) == Events::Unreliable {
+        return None;
+    }
+    let ignored = trees::ignored_dirs(root, root);
+    let dirs = trees::dirs_to_watch(root, &ignored, MAX_WATCH_DIRS)?;
+    Some((ignored, dirs))
+}
+
+/// Watch `dirs`; `None` (and nothing left watched) if any watch fails, e.g. the inotify limit.
+fn watch_dirs(watcher: &mut RecommendedWatcher, ignored: Vec<PathBuf>, dirs: Vec<PathBuf>) -> Option<TreeWatch> {
+    let mut tw = TreeWatch {
+        dirs: HashSet::new(),
+        ignored,
+    };
+    for d in dirs {
+        if watcher.watch(&d, RecursiveMode::NonRecursive).is_err() {
+            for w in &tw.dirs {
+                let _ = watcher.unwatch(w);
+            }
+            return None;
+        }
+        tw.dirs.insert(d);
+    }
+    Some(tw)
 }
 
 /// Newest mtime among the changed paths (deleted files are skipped), as unix seconds.

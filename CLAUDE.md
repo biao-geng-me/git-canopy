@@ -80,11 +80,16 @@ Editing a file does NOT touch `.git`, so watching `.git` alone misses new dirty 
    `packed-refs`, `HEAD`, and each linked worktree's admin dir `<common>/worktrees/<name>/` (its `HEAD`,
    `index`). Watch directories, not files (git writes via `*.lock` + rename); ignore `*.lock`; debounce
    ~150ms. On event → reload refs/graph and the affected worktree's status.
-2. Poll `status` per worktree every 60s (configurable; was 1.5s, see decisions) on a background thread
-   for working-tree edits.
-   Run status calls in parallel with a small bound.
-3. Fallback to pure polling if watching fails (e.g. WSL2 repos under `/mnt/c` where inotify doesn't fire).
-   The dev machine is WSL2.
+2. fs watch on each worktree's directories (one non-recursive watch per dir; skip `.git`, git-ignored
+   dirs from `ls-files -o -i --directory`, nested repos; new dirs get watched as they appear). An edit
+   runs `git status` for that worktree only, at most once per 2s (`MIN_GAP`). Set up before the first
+   status pass so no edit slips in between.
+3. Poll as a safety net, spread out: each worktree has its own slot, run one at a time. Unwatched
+   worktrees every `--interval` (60s), watched ones every 10 min (`FALLBACK`; network filesystems only
+   report this machine's changes). `--no-poll` disables polling (events + `r` only).
+4. Pure polling where events can't work: the filesystem type comes from `/proc/self/mountinfo`
+   (`fsinfo.rs`); 9p/drvfs (WSL2 `/mnt/c`), virtiofs and FUSE aren't watched at all. Worktrees over
+   10k dirs or past the inotify limit are polled too. The dev machine is WSL2.
 One shared cache per common dir; don't redo graph work when refs haven't changed (fingerprint refs).
 UI thread only renders snapshots received over a channel.
 
@@ -131,6 +136,12 @@ UI thread only renders snapshots received over a channel.
   uncommitted row's lane inherits the color of the lane it joins, so a worktree keeps its color whether
   dirty or clean. `[name]`, branch and remote labels use their row's lane color (`Row::color`), tags
   stay yellow, and the worktree list colors each name like its graph row.
+- **Load on network filesystems (HPC):** each poll is ~1 metadata op per tracked file per worktree,
+  which matters for the metadata server, hence worktree watching + 10-min fallback + staggering +
+  `--no-poll`. Notify's inotify mask includes OPEN, so our own `git status` produces access events:
+  the handler drops all access events (otherwise an endless status loop). Verified with strace: 30
+  writes into an ignored `target/` → 0 statuses; 25 edits over 5 s → 4 statuses; `-i 8` with 8
+  worktrees → one status per second, evenly spread.
 - **Poll interval 60s by default** (user's call; `r` refreshes on demand, `-i` overrides). Measured
   cost of one `git status --no-optional-locks`: ~1 stat per tracked file + a readdir per directory,
   no content reads (e.g. 755 file syscalls for a 500-file tree, ~5 ms). Caveat: canopy never

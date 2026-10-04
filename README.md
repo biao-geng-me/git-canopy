@@ -25,9 +25,12 @@ tree doing, and which ones are dirty?" on one screen:
   subject and message (wrapped) and its changed files right there; `Space` on a file unfolds its diff.
   `Esc` folds back. `Enter` (or a double-click) opens the full diff view.
 - **Layout:** stacked by default; `v` (or `--layout side`) puts the worktrees beside the graph.
-- **Live:** commits, checkouts, staging and other git operations show up within ~150ms via file system
-  events on the git dir. Plain file edits (which don't touch `.git`) show up at the next status poll,
-  every 60s by default (`-i` to change), or immediately with `r`. Refreshing never blocks the UI.
+- **Live:** git operations (commits, checkouts, staging) show up within ~150ms via file system events
+  on the git dir, and file edits within ~150ms via events on each worktree's directories (git-ignored
+  directories like `target/` are not watched, and a busy worktree is re-checked at most every 2s).
+  Polling is only a safety net: worktrees that can't be watched every 60s (`-i`), watched ones every
+  10 minutes, spread out one worktree at a time. `--no-poll` turns it off; `r` refreshes now.
+  The footer shows e.g. `watching 8/9 · poll 60s`. Refreshing never blocks the UI.
 - **Details on demand:** `Enter` shows `git show` for a commit, or the uncommitted diff (including
   untracked files) for a worktree.
 
@@ -56,6 +59,7 @@ git canopy [OPTIONS] [PATH]
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
                           develop, or the main worktree's branch)
       --layout <MODE>     stacked (graph above worktrees, default) or side
+      --no-poll           never poll; update on file system events and `r` only
       --no-watch          disable file system notifications, poll only
 ```
 
@@ -106,8 +110,10 @@ changes.
 
 ## Notes
 
-- On WSL2, repositories under `/mnt/c` don't deliver file system events, so everything updates at the
-  poll interval there; consider `-i 5` (status over 9p is slow, so not much lower).
+- Where file system events don't work (WSL2's `/mnt/c`, other 9p/FUSE mounts; detected from
+  `/proc/self/mountinfo`) everything is polled at `-i`. On network filesystems (NFS, Lustre, GPFS, …)
+  events only report changes made from this machine, so agents on other nodes show up at the
+  10-minute fallback poll (or `r`). Worktrees with over 10k directories are polled instead of watched.
 - Cost of a poll: per worktree one `git status`, which stats every tracked file and lists the
   directories (metadata only, normally served from the kernel's cache, no file contents), plus two
   cheap repo-wide commands.

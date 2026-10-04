@@ -105,3 +105,71 @@ fn graph_loads_more_history_on_request() {
         .count();
     assert_eq!(pseudo, dirty);
 }
+
+fn spawn(fx: &common::Fixture, cfg: Config) -> (watch::Handle, mpsc::Receiver<std::sync::Arc<Snapshot>>) {
+    let paths = canopy::git::discover(&fx.repo()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let h = watch::spawn(paths, cfg, move |s| {
+        let _ = tx.send(s);
+    });
+    (h, rx)
+}
+
+fn find(s: &Snapshot, name: &str) -> canopy::model::WorktreeView {
+    s.worktrees.iter().find(|w| w.name == name).cloned().unwrap()
+}
+
+#[test]
+fn worktree_edits_are_seen_without_polling() {
+    let fx = common::Fixture::new();
+    // Polling effectively off: only the worktree watch can notice the edit.
+    let cfg = Config {
+        interval: Duration::from_secs(3600),
+        ..Config::default()
+    };
+    let (_h, rx) = spawn(&fx, cfg);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| s.worktrees.iter().any(|w| w.watched));
+    let watched: Vec<_> = s
+        .worktrees
+        .iter()
+        .filter(|w| w.has_worktree())
+        .map(|w| w.watched)
+        .collect();
+    assert!(
+        watched.iter().all(|&w| w),
+        "every live worktree is watched: {watched:?}"
+    );
+
+    std::fs::write(fx.wt("refactor-db").join("src/db.rs"), "changed\n").unwrap();
+    wait_for(&rx, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+
+    // A new directory gets watched too: a file created inside it is noticed.
+    std::fs::create_dir_all(fx.wt("detached").join("new/deeper")).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(fx.wt("detached").join("new/deeper/file.txt"), "x").unwrap();
+    wait_for(&rx, Duration::from_secs(5), |s| find(s, "detached").is_dirty());
+}
+
+#[test]
+fn no_poll_updates_only_on_events_or_refresh() {
+    let fx = common::Fixture::new();
+    let cfg = Config {
+        interval: Duration::from_millis(200),
+        poll: false,
+        watch: false,
+        ..Config::default()
+    };
+    let (h, rx) = spawn(&fx, cfg);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| {
+        s.statuses_loaded && !s.graph.rows.is_empty()
+    });
+    assert!(!s.polling);
+    while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+
+    std::fs::write(fx.wt("refactor-db").join("new.txt"), "x").unwrap();
+    let quiet = rx.recv_timeout(Duration::from_millis(1500));
+    assert!(quiet.is_err(), "no polling: nothing may refresh by itself");
+
+    h.request(watch::Request::Refresh);
+    wait_for(&rx, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+}

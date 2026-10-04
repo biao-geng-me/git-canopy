@@ -4,6 +4,7 @@
 //! `watch` (background refresh), `ui` (ratatui front end, renders snapshots only).
 
 pub mod diff;
+pub mod fsinfo;
 pub mod git;
 pub mod graph;
 pub mod model;

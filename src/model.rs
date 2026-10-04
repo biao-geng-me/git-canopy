@@ -38,6 +38,8 @@ pub struct WorktreeView {
     pub head_time: Option<i64>,
     /// Newest modification time (unix seconds) among the changed files: "last edited".
     pub changed_at: Option<i64>,
+    /// Its directories are watched for edits (otherwise only polled).
+    pub watched: bool,
 }
 
 impl WorktreeView {
@@ -110,6 +112,8 @@ pub struct Snapshot {
     pub graph: Arc<Graph>,
     /// Whether filesystem events are being watched (otherwise polling only).
     pub watching: bool,
+    /// Whether periodic polling is on.
+    pub polling: bool,
     /// True once every worktree's status has been loaded at least once.
     pub statuses_loaded: bool,
     /// Last refresh error that is not specific to a worktree.

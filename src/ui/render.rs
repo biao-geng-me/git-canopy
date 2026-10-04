@@ -803,7 +803,7 @@ pub fn tilde(p: &std::path::Path) -> String {
     }
 }
 
-fn worktree_details(w: &WorktreeView) -> Line<'static> {
+fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
     let dim = Style::new().fg(C_DIM);
     let mut spans = vec![Span::raw(tilde(&w.path))];
     let sep = || Span::styled("  ·  ", dim);
@@ -825,6 +825,10 @@ fn worktree_details(w: &WorktreeView) -> Line<'static> {
         }
         _ => {}
     }
+    if watching && !w.watched && w.has_worktree() {
+        spans.push(sep());
+        spans.push(Span::styled("not watched: polled", dim));
+    }
     if let Some(r) = &w.locked {
         spans.push(sep());
         let r = if r.is_empty() { String::new() } else { format!(": {r}") };
@@ -844,7 +848,11 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
     let g = &app.snap.graph;
     let row = app.graph.lines.get(app.graph.pos.sel)?.row();
     match g.rows.get(row)?.kind {
-        RowKind::Uncommitted(wi) => app.snap.worktrees.get(wi).map(worktree_details),
+        RowKind::Uncommitted(wi) => app
+            .snap
+            .worktrees
+            .get(wi)
+            .map(|w| worktree_details(w, app.snap.watching)),
         RowKind::Commit(ci) => {
             let c = &g.commits[ci];
             let dim = Style::new().fg(C_DIM);
@@ -861,6 +869,25 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
             Some(Line::from(spans))
         }
     }
+}
+
+/// Footer summary of how the view stays fresh: `watching 8/9 · poll 60s`, `no poll`, ….
+fn refresh_mode(app: &App) -> String {
+    let trees = app.snap.worktrees.iter().filter(|w| w.has_worktree()).count();
+    let watched = app.snap.worktrees.iter().filter(|w| w.watched).count();
+    let watch = if !app.snap.watching {
+        String::new()
+    } else if watched > 0 {
+        format!("watching {watched}/{trees} · ")
+    } else {
+        "watching git · ".into()
+    };
+    let poll = if app.snap.polling {
+        format!("poll {}", secs(app.interval_ms))
+    } else {
+        "no poll (r)".into()
+    };
+    format!("{watch}{poll} ")
 }
 
 /// `60s`, `1.5s`: an interval without a pointless `.0`.
@@ -1152,7 +1179,7 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let line = match app.focus {
-        Focus::Worktrees => app.selected_worktree().map(worktree_details),
+        Focus::Worktrees => app.selected_worktree().map(|w| worktree_details(w, app.snap.watching)),
         Focus::Graph => graph_details(app),
     };
     if let Some(e) = &app.snap.error {
@@ -1184,11 +1211,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     ]);
     let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
-    let mode = if app.snap.watching {
-        format!("live · poll {} ", secs(app.interval_ms))
-    } else {
-        format!("polling {} ", secs(app.interval_ms))
-    };
+    let mode = refresh_mode(app);
     if left_width + mode.width() < hints.width as usize {
         let right = Line::from(Span::styled(mode, Style::new().fg(C_DIM))).right_aligned();
         f.render_widget(Paragraph::new(right), hints);
