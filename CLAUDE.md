@@ -93,6 +93,42 @@ Editing a file does NOT touch `.git`, so watching `.git` alone misses new dirty 
 One shared cache per common dir; don't redo graph work when refs haven't changed (fingerprint refs).
 UI thread only renders snapshots received over a channel.
 
+## herdr agent activity
+
+Goal: see at a glance whether an agent is working in each worktree, and above all whether one is
+**blocked waiting for the user**. Works when canopy runs standalone in any terminal, not only inside
+herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns it off.
+
+- **Transport:** talk to the herdr server directly over its Unix socket with newline-delimited JSON
+  (one request per line, responses echo `id`). No shelling out to the `herdr` binary. Socket path:
+  `HERDR_SOCKET_PATH`, else `HERDR_SESSION=<name>` → `~/.config/herdr/sessions/<name>/herdr.sock`, else
+  `~/.config/herdr/herdr.sock`. No socket / connection refused → hidden, retried with backoff.
+- **Reads (protocol 22 / herdr 0.9.3, shapes from `herdr api schema --json`):** `agent.list` →
+  `result.agents[]` with `pane_id`, `workspace_id`, `agent`, `name`, `agent_status`
+  (`idle|working|blocked|done|unknown`), `cwd`, `foreground_cwd`; `workspace.list` →
+  `result.workspaces[]` with optional `worktree.checkout_path`.
+- **Mapping agent → worktree:** longest path-prefix match of the agent's `foreground_cwd` (else `cwd`),
+  canonicalized, against the canonical worktree paths; if nothing matches, its workspace's
+  `checkout_path`. Agents outside this repo are ignored.
+- **Live updates:** a second connection does `events.subscribe` for pane/workspace/worktree lifecycle
+  events plus `pane.agent_status_changed` per agent pane (that subscription requires a `pane_id`).
+  Per herdr's docs: subscribe first, then do authoritative reads; events are only invalidation signals
+  that trigger another `agent.list` + `workspace.list` (bursts are coalesced). When the set of agent
+  panes changes, resubscribe. On `events_lost` (error on the subscription, which herdr then closes),
+  EOF or a broken socket: reconnect with backoff. If subscribing is rejected twice, poll `agent.list`
+  every 2s instead.
+- **Display:** a marker per worktree by its most urgent agent state — `◆ blocked` (bold red),
+  `▶ working`, `✓ done`, `· idle` — with `×N` when several agents share a worktree; the same glyph on
+  the worktree's `[name]` label in the graph; footer `herdr: 3 agents, 1 blocked`.
+- **The only write-like call:** `a` on a worktree sends `agent.focus` for its (most urgent) agent so
+  herdr jumps to that pane. canopy never prompts, sends keys to, starts or stops agents.
+- **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
+- **Learned from the live server:** herdr answers one request per connection and then closes it, so
+  every request opens a fresh connection; only the subscription connection stays open. Tests run the
+  client against a fake server on a temporary socket (events, `events_lost`, focus, unreachable); the
+  live check against the real server used only `agent.list`, `workspace.list` and `events.subscribe`
+  (`cargo run --example herdr`).
+
 ## Milestones
 
 1. Scaffold: cargo project, module layout (git layer / model / ui / watch), CI-free `cargo test` setup,

@@ -7,6 +7,7 @@ pub mod diff;
 pub mod fsinfo;
 pub mod git;
 pub mod graph;
+pub mod herdr;
 pub mod model;
 pub mod ui;
 pub mod watch;

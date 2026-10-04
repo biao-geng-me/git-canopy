@@ -55,12 +55,14 @@ canopy [OPTIONS] [PATH]
 git canopy [OPTIONS] [PATH]
 
   PATH                    any directory inside the repository (default: current directory)
-  -i, --interval <SECS>   status poll interval in seconds (default: 60)
+  -i, --interval <SECS>   poll interval for worktrees that can't be watched (default: 60);
+                          watched worktrees are re-checked every 10 minutes regardless
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
                           develop, or the main worktree's branch)
       --layout <MODE>     stacked (graph above worktrees, default) or side
       --no-poll           never poll; update on file system events and `r` only
       --no-watch          disable file system notifications, poll only
+      --no-herdr          don't show herdr agent activity
 ```
 
 ### Keys
@@ -82,6 +84,7 @@ once, on its `◌` row.
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
 | `Tab` | switch between the graph and the worktree list |
 | `v` | stacked / side-by-side layout |
+| `a` | herdr: jump to the selected worktree's agent pane |
 | `r` | refresh now |
 | `?` | help |
 | `q`, `Ctrl-C` | quit |
@@ -108,6 +111,22 @@ The mouse works too: click to select, wheel to scroll.
 In the graph, `◉` marks a commit that is some worktree's HEAD, `○` a merge commit and `◌` uncommitted
 changes.
 
+## herdr agent activity
+
+When a [herdr](https://herdr.dev) server is reachable, canopy shows which worktrees have a coding agent
+in them, and above all which agent is **blocked waiting for you**. It works in any terminal, not only
+inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns it off).
+
+- Worktree rows get `◆ blocked` (bold red), `▶ working`, `✓ done` or `· idle` for their most urgent
+  agent, plus `×N` when several agents share a worktree; the graph's `[name]` labels get the same mark.
+- The footer sums it up: `herdr: 3 agents, 1 blocked`.
+- `a` asks herdr to focus that worktree's agent pane. That is the only thing canopy ever asks herdr to
+  do; it never prompts, sends keys to, starts or stops agents.
+
+An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
+of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, `HERDR_SESSION`, or
+`~/.config/herdr/herdr.sock`), follows its event stream, and reconnects if herdr restarts.
+
 ## Notes
 
 - Where file system events don't work (WSL2's `/mnt/c`, other 9p/FUSE mounts; detected from
@@ -127,6 +146,7 @@ cargo clippy --all-targets
 scripts/mkfixture.sh [DIR]       # throwaway repo with worktrees in every interesting state
 scripts/mkbigrepo.sh [DIR]       # 20k commits, 15 worktrees, for performance checks
 cargo run --release --example startup -- DIR/repo   # time to first worktree list / statuses / graph
+cargo run --example herdr -- . 30                      # what canopy sees from herdr (read-only calls)
 ```
 
 See `CLAUDE.md` for the design notes.

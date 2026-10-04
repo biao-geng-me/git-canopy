@@ -27,6 +27,7 @@ use ratatui::layout::{Position, Rect};
 use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
 use crate::graph::RowKind;
+use crate::herdr;
 use crate::model::Snapshot;
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
@@ -44,6 +45,8 @@ pub enum UiMsg {
         req: u64,
         result: Result<DiffDoc, String>,
     },
+    /// What herdr reports; `None` when herdr isn't reachable.
+    Herdr(Option<Arc<herdr::View>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +166,10 @@ pub struct App {
     pub graph: Panel,
     /// Diffs for insets, by target.
     pub docs: HashMap<Key, Entry>,
+    /// herdr agent activity (`None`: herdr not reachable or disabled).
+    pub herdr: Option<Arc<herdr::View>>,
+    /// herdr agents per worktree (indexes into `herdr.agents`), parallel to the snapshot's worktrees.
+    pub agents: Vec<Vec<usize>>,
     /// Pending "show this worktree in the graph" request, applied at render time (needs height).
     pub graph_jump: Option<PathBuf>,
     pub diff: Option<DiffView>,
@@ -189,6 +196,8 @@ impl App {
             wt: Panel::default(),
             graph: Panel::default(),
             docs: HashMap::new(),
+            herdr: None,
+            agents: Vec::new(),
             graph_jump: None,
             diff: None,
             help: false,
@@ -516,6 +525,10 @@ impl App {
                 self.relocate(Focus::Worktrees, ids.0);
                 self.relocate(Focus::Graph, ids.1);
             }
+            UiMsg::Herdr(view) => {
+                self.herdr = view;
+                self.map_agents();
+            }
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
                     d.loaded(result);
@@ -550,6 +563,7 @@ impl App {
         let first_graph = self.snap.graph.rows.is_empty();
         let graph_changed = !Arc::ptr_eq(&self.snap.graph, &snap.graph);
         self.snap = snap;
+        self.map_agents();
         self.refresh_docs();
         self.rebuild();
 
@@ -586,6 +600,63 @@ impl App {
         }
     }
 
+    /// Match herdr agents to worktrees (after either side changed).
+    fn map_agents(&mut self) {
+        self.agents = match &self.herdr {
+            Some(view) => {
+                let paths: Vec<PathBuf> = self.snap.worktrees.iter().map(|w| w.path.clone()).collect();
+                herdr::assign(view, &paths)
+            }
+            None => Vec::new(),
+        };
+    }
+
+    /// The agents working in worktree `wi`, summarized.
+    pub fn agent_activity(&self, wi: usize) -> Option<herdr::Activity> {
+        herdr::activity(self.herdr.as_ref()?, self.agents.get(wi)?)
+    }
+
+    /// How many of this repo's agents are in `state`.
+    pub fn agents_in_state(&self, state: herdr::AgentState) -> usize {
+        let Some(view) = &self.herdr else { return 0 };
+        self.agents
+            .iter()
+            .flatten()
+            .filter(|&&i| view.agents[i].state == state)
+            .count()
+    }
+
+    /// `a`: ask herdr to focus the pane of the selected worktree's most urgent agent.
+    fn focus_agent(&mut self) {
+        let Some(view) = &self.herdr else { return };
+        let wi = match self.focus {
+            Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
+            Focus::Graph => self.graph_row_worktree(),
+        };
+        let agent = wi
+            .and_then(|wi| self.agents.get(wi))
+            .and_then(|ids| ids.iter().map(|&i| &view.agents[i]).max_by_key(|a| a.state));
+        if let Some(a) = agent {
+            herdr::focus(a.pane_id.clone());
+        }
+    }
+
+    /// The worktree a graph row belongs to: its uncommitted row, or a commit labelled with it.
+    fn graph_row_worktree(&self) -> Option<usize> {
+        let r = self.graph.lines.get(self.graph.pos.sel)?.row();
+        let g = &self.snap.graph;
+        match g.rows.get(r)?.kind {
+            RowKind::Uncommitted(wi) => Some(wi),
+            RowKind::Commit(ci) => {
+                let id = &g.commits[ci].id;
+                let here = |wi: &usize| self.snap.worktrees[*wi].head.as_ref() == Some(id);
+                let mut candidates = (0..self.snap.worktrees.len()).filter(here);
+                let first = candidates.clone().next();
+                candidates.find(|&wi| self.agent_activity(wi).is_some()).or(first)
+            }
+        }
+    }
+
     /// The worktree under the worktree panel's cursor.
     pub fn selected_worktree(&self) -> Option<&crate::model::WorktreeView> {
         let line = self.wt.lines.get(self.wt.pos.sel)?;
@@ -610,6 +681,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('r') => self.worker.request(Request::Refresh),
+            KeyCode::Char('a') => self.focus_agent(),
             KeyCode::Char('v') => {
                 self.layout = match self.layout {
                     LayoutMode::Stacked => LayoutMode::Side,
@@ -980,9 +1052,15 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
 }
 
 /// Run the TUI until the user quits.
-pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode) -> Result<()> {
+pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
+    if with_herdr {
+        let herdr_tx = tx.clone();
+        herdr::spawn(move |view| {
+            let _ = herdr_tx.send(UiMsg::Herdr(view));
+        });
+    }
     let snap_tx = tx.clone();
     let worker = watch::spawn(paths, cfg.clone(), move |s| {
         let _ = snap_tx.send(UiMsg::Snapshot(s));

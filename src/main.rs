@@ -22,6 +22,7 @@ OPTIONS:
         --base <BRANCH>     branch to compare worktrees against (default: main/master/...)
         --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only
+        --no-herdr          don't show herdr agent activity
     -h, --help              print help
     -V, --version           print version
 
@@ -33,12 +34,14 @@ struct Args {
     path: PathBuf,
     cfg: Config,
     layout: LayoutMode,
+    herdr: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut path: Option<PathBuf> = None;
     let mut cfg = Config::default();
     let mut layout = LayoutMode::default();
+    let mut herdr = true;
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         let s = arg.to_string_lossy().into_owned();
@@ -72,6 +75,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--base" => cfg.base = Some(value("--base")?),
             "--no-watch" => cfg.watch = false,
             "--no-poll" => cfg.poll = false,
+            "--no-herdr" => herdr = false,
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
                     "stacked" => LayoutMode::Stacked,
@@ -89,7 +93,12 @@ fn parse_args() -> Result<Option<Args>, String> {
         }
     }
     let path = path.unwrap_or_else(|| PathBuf::from("."));
-    Ok(Some(Args { path, cfg, layout }))
+    Ok(Some(Args {
+        path,
+        cfg,
+        layout,
+        herdr,
+    }))
 }
 
 fn main() -> ExitCode {
@@ -112,7 +121,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match canopy::ui::run(paths, args.cfg, args.layout) {
+    match canopy::ui::run(paths, args.cfg, args.layout, args.herdr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");

@@ -11,6 +11,7 @@ use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
 use super::{App, Focus, InsetText, LayoutMode};
 use crate::graph::{self, LabelKind, Row, RowKind};
+use crate::herdr::{self, AgentState};
 use crate::model::WorktreeView;
 
 pub const C_STAGED: Color = Color::Green;
@@ -94,6 +95,8 @@ fn paint_rows(f: &mut Frame, inner: Rect, lines: Vec<Line<'static>>, sel: Option
 struct WtRow {
     marker: Span<'static>,
     name: Span<'static>,
+    /// herdr agent marker (empty when no agent works here).
+    agent: Vec<Span<'static>>,
     counts: Vec<Span<'static>>,
     ab: Vec<Span<'static>>,
 }
@@ -196,12 +199,35 @@ fn ab_spans(w: &WorktreeView, base: Option<&str>) -> Vec<Span<'static>> {
     spaced
 }
 
-fn wt_rows(app: &App) -> Vec<WtRow> {
+/// Marker for the agents in a worktree: `◆ blocked`, `▶ working ×2`, … (glyph only when not
+/// `wide`). Blocked is bold red: the agent needs the user.
+pub fn agent_spans(act: herdr::Activity, wide: bool) -> Vec<Span<'static>> {
+    let (glyph, style) = match act.state {
+        AgentState::Blocked => ("◆", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        AgentState::Working => ("▶", Style::new().fg(Color::LightCyan)),
+        AgentState::Done => ("✓", Style::new().fg(Color::Green)),
+        AgentState::Idle => ("·", Style::new().fg(C_DIM)),
+        AgentState::Unknown => ("?", Style::new().fg(C_DIM)),
+    };
+    let mut text = glyph.to_string();
+    if wide {
+        text.push(' ');
+        text.push_str(act.state.word());
+    }
+    let mut spans = vec![Span::styled(text, style)];
+    if act.count > 1 {
+        spans.push(Span::styled(format!(" ×{}", act.count), Style::new().fg(C_DIM)));
+    }
+    spans
+}
+
+fn wt_rows(app: &App, wide: bool) -> Vec<WtRow> {
     let base = app.snap.base.as_deref();
     app.snap
         .worktrees
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(wi, w)| {
             // Named in the same color as its lane in the graph.
             let mut style = worktree_color(app, w).map_or(Style::new(), lane_style);
             if w.is_current {
@@ -213,6 +239,7 @@ fn wt_rows(app: &App) -> Vec<WtRow> {
             WtRow {
                 marker: marker(w),
                 name: Span::styled(w.name.clone(), style),
+                agent: app.agent_activity(wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
                 counts: count_spans(w),
                 ab: ab_spans(w, base),
             }
@@ -225,7 +252,7 @@ const NAME_MAX: usize = 28;
 const NARROW: u16 = 72;
 
 fn worktree_panel_width(app: &App, total: u16) -> u16 {
-    let rows = wt_rows(app);
+    let rows = wt_rows(app, false);
     let name = rows
         .iter()
         .map(|r| r.name.content.width())
@@ -234,8 +261,10 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
         .min(NAME_MAX);
     let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
+    let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
     // borders + marker + gaps
-    let natural = 2 + 2 + name + 1 + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
+    let natural =
+        2 + 2 + name + 1 + if agent > 0 { agent + 1 } else { 0 } + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
     let max = total as usize * 45 / 100;
     natural.max(24).min(max) as u16
 }
@@ -266,6 +295,8 @@ fn pad(s: String, width: usize) -> String {
 /// Column widths shared by all worktree rows.
 struct WtCols {
     name: usize,
+    /// herdr agent marker column (0 when no worktree has an agent).
+    agent: usize,
     counts: usize,
     ab: usize,
     /// "edited 3m" column (wide rows only).
@@ -329,6 +360,11 @@ fn wt_line(
         row.name.style,
     ));
     spans.push(Span::raw(" "));
+    if cols.agent > 0 {
+        let aw = spans_width(&row.agent);
+        spans.extend(row.agent);
+        spans.push(Span::raw(" ".repeat(cols.agent - aw + 1)));
+    }
     let cw = spans_width(&row.counts);
     spans.extend(row.counts);
     if cols.ab > 0 || wide {
@@ -438,7 +474,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     }
 
     let now = now_secs();
-    let rows = wt_rows(app);
+    let rows = wt_rows(app, wide);
     let width = inner.width as usize;
     let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
@@ -476,8 +512,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     } else {
         0
     };
+    let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
     let cols = WtCols {
-        name: name_natural.min(NAME_MAX).min(width.saturating_sub(fixed).max(6)),
+        name: name_natural
+            .min(NAME_MAX)
+            .min(width.saturating_sub(fixed + agent).max(6)),
+        agent,
         counts,
         ab,
         activity,
@@ -610,6 +650,14 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
         match l.kind {
             LabelKind::Worktree => {
                 spans.push(worktree_label(&l.text, row.color));
+                let wi = app
+                    .snap
+                    .worktrees
+                    .iter()
+                    .position(|w| w.name == l.text && w.prunable.is_none());
+                if let Some(act) = wi.and_then(|wi| app.agent_activity(wi)) {
+                    spans.extend(agent_spans(act, false));
+                }
                 spans.push(Span::raw(" "));
             }
             kind => {
@@ -693,6 +741,9 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
             spans.push(Span::raw(" "));
             if let Some(w) = app.snap.worktrees.get(wi) {
                 spans.push(worktree_label(&w.name, row.color));
+                if let Some(act) = app.agent_activity(wi) {
+                    spans.extend(agent_spans(act, false));
+                }
                 spans.push(Span::raw(" "));
                 spans.extend(count_spans(w));
                 spans.push(Span::styled(
@@ -869,6 +920,37 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
             Some(Line::from(spans))
         }
     }
+}
+
+/// `herdr: 3 agents, 1 blocked · ` for the agents working in this repo's worktrees (empty when
+/// herdr isn't connected).
+fn herdr_summary(app: &App) -> Vec<Span<'static>> {
+    if app.herdr.is_none() {
+        return Vec::new();
+    }
+    let dim = Style::new().fg(C_DIM);
+    let acts: Vec<herdr::Activity> = (0..app.snap.worktrees.len())
+        .filter_map(|i| app.agent_activity(i))
+        .collect();
+    let total: usize = acts.iter().map(|a| a.count).sum();
+    let blocked = app.agents_in_state(AgentState::Blocked);
+    let mut spans = vec![Span::styled(
+        match total {
+            0 => "herdr: no agents".to_string(),
+            1 => "herdr: 1 agent".to_string(),
+            n => format!("herdr: {n} agents"),
+        },
+        dim,
+    )];
+    if blocked > 0 {
+        spans.push(Span::styled(", ", dim));
+        spans.push(Span::styled(
+            format!("{blocked} blocked"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(" · ", dim));
+    spans
 }
 
 /// Footer summary of how the view stays fresh: `watching 8/9 · poll 60s`, `no poll`, ….
@@ -1211,10 +1293,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     ]);
     let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
-    let mode = refresh_mode(app);
-    if left_width + mode.width() < hints.width as usize {
-        let right = Line::from(Span::styled(mode, Style::new().fg(C_DIM))).right_aligned();
-        f.render_widget(Paragraph::new(right), hints);
+    let mut right = herdr_summary(app);
+    right.push(Span::styled(refresh_mode(app), Style::new().fg(C_DIM)));
+    if left_width + spans_width(&right) < hints.width as usize {
+        f.render_widget(Paragraph::new(Line::from(right).right_aligned()), hints);
     }
 }
 
@@ -1228,6 +1310,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter  dbl-click", "full diff view"),
     ("Tab", "switch panel"),
     ("v", "stacked / side-by-side layout"),
+    ("a", "jump to the worktree's agent in herdr"),
     ("r", "refresh now"),
     ("?", "toggle this help"),
     ("q  Ctrl-C", "quit"),
