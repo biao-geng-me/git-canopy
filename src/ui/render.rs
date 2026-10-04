@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::diff_view::Pane;
@@ -25,7 +25,13 @@ const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [main, footer] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
+    let [main, rule, footer] =
+        Layout::vertical([Constraint::Min(2), Constraint::Length(1), Constraint::Length(2)]).areas(f.area());
+    // The footer gets the same plain rule as the panes above it.
+    f.render_widget(
+        Block::new().borders(Borders::TOP).border_style(border_style(false)),
+        rule,
+    );
     if app.diff.is_some() {
         draw_diff(f, app, main);
         draw_diff_footer(f, app, footer);
@@ -37,8 +43,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Stacked: graph on top, worktrees below, both full width. Narrow terminals always stack.
     let stacked = app.layout == LayoutMode::Stacked || main.width < NARROW;
     let (wt_area, graph_area) = if stacked {
-        let want = app.wt.lines.len().max(1) as u16 + 2;
-        let h = want.min(main.height / 2).max(3.min(main.height));
+        let want = app.wt.lines.len().max(1) as u16 + CHROME;
+        let h = want.min(main.height / 2).max(2.min(main.height));
         let [top, bottom] = Layout::vertical([Constraint::Min(0), Constraint::Length(h)]).areas(main);
         (bottom, top)
     } else {
@@ -56,17 +62,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
-    let border = if focused {
+fn border_style(focused: bool) -> Style {
+    if focused {
         Style::new().fg(Color::Cyan)
     } else {
         Style::new().fg(C_DIM)
-    };
+    }
+}
+
+/// A pane: a horizontal rule on top carrying the title, no side lines (they add clutter inside
+/// tmux/herdr, which draw their own); one blank column on each side instead. See [`content`].
+fn panel(title: Line<'static>, focused: bool) -> Block<'static> {
     Block::new()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border)
+        .borders(Borders::TOP)
+        .border_style(border_style(focused))
+        .padding(Padding::horizontal(1))
         .title(title)
+}
+
+/// Rows a [`panel`] uses for its rule.
+pub const CHROME: u16 = 1;
+
+/// The content area of a [`panel`] drawn in `area` (for hit-testing and paging).
+pub fn content(area: Rect) -> Rect {
+    panel(Line::default(), false).inner(area)
 }
 
 /// Paint `lines` into `inner`, one per row, highlighting row `sel` across the full width.
@@ -262,7 +281,7 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
     let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
-    // borders + marker + gaps
+    // side margins + marker + gaps
     let natural =
         2 + 2 + name + 1 + if agent > 0 { agent + 1 } else { 0 } + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
     let max = total as usize * 45 / 100;
@@ -1107,7 +1126,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     // File list on top (only when there are files), the selected entry's diff below.
     let body_area = if d.has_files() {
-        let want = d.entries() as u16 + 2;
+        let want = d.entries() as u16 + CHROME;
         let h = want
             .min((area.height * 2 / 5).max(5))
             .min(area.height.saturating_sub(3));
@@ -1174,7 +1193,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     };
     d.body_area = body_area;
 
-    let height = body_area.height.saturating_sub(2) as usize;
+    let height = content(body_area).height as usize;
     let body = d.body();
     let label: Vec<Span> = match d.selected_file() {
         _ if !d.has_files() => title.spans.clone(),
@@ -1327,7 +1346,8 @@ const HELP: &[(&str, &str)] = &[
 
 fn draw_help(f: &mut Frame) {
     let area = f.area();
-    let w = 58.min(area.width);
+    let widest = HELP.iter().map(|(_, d)| d.width()).max().unwrap_or(0) as u16;
+    let w = (1 + 19 + widest + 3).min(area.width); // " key  description " + frame
     let h = (HELP.len() as u16 + 4).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
@@ -1345,11 +1365,13 @@ fn draw_help(f: &mut Frame) {
         })
         .collect();
     f.render_widget(Clear, rect);
-    let block = panel(Line::from(" keys "), true);
-    f.render_widget(
-        Paragraph::new(lines).block(block.padding(ratatui::widgets::Padding::vertical(1))),
-        rect,
-    );
+    // A popup over other content keeps a full frame.
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(true))
+        .title(" keys ")
+        .padding(Padding::vertical(1));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 #[cfg(test)]

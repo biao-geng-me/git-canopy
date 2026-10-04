@@ -154,7 +154,7 @@ impl DiffView {
     }
 
     fn page(&self) -> isize {
-        (self.body_area.height.saturating_sub(2) as isize).max(1)
+        (super::render::content(self.body_area).height as isize).max(1)
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -212,9 +212,9 @@ impl DiffView {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if over_list => {
                 self.pane = Pane::Files;
-                let a = self.list_area;
-                if m.row > a.y && m.row + 1 < a.y + a.height {
-                    self.select(self.list_offset + (m.row - a.y - 1) as usize);
+                let a = super::render::content(self.list_area);
+                if a.contains(pos) {
+                    self.select(self.list_offset + (m.row - a.y) as usize);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.body_area.contains(pos) => self.pane = Pane::Body,
@@ -254,7 +254,7 @@ mod tests {
             },
             None,
         );
-        v.body_area = Rect::new(0, 0, 80, 12); // 10 body rows
+        v.body_area = Rect::new(0, 0, 80, 11); // 10 body rows under the title rule
         v.loaded(Ok(DiffDoc {
             overview: vec!["commit x".into()],
             files: vec![file("a", 50), file("b", 3)],

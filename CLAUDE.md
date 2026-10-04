@@ -186,6 +186,10 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   git command refreshes the index. fs events still give ~150 ms latency for anything touching `.git`;
   only pure working-tree edits wait for the poll.
 - **Remote labels are gray** (`C_REMOTE`, not a lane color); local branches and `[name]` use lane colors.
+- **Pane chrome:** each pane has only a horizontal rule on top carrying its title (cyan when focused),
+  plus a plain rule above the footer; no side lines, those columns stay blank (`render::panel`, with
+  `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
+  boxes were visual clutter. Only the `?` popup keeps a full frame, since it floats over content.
 - **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
   the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/

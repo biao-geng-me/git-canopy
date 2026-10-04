@@ -736,7 +736,7 @@ impl App {
             Focus::Worktrees => self.areas.worktrees,
             Focus::Graph => self.areas.graph,
         };
-        (area.height.saturating_sub(2) as usize).max(1)
+        (render::content(area).height as usize).max(1)
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -896,10 +896,11 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.focus = f;
-                if m.row <= area.y || m.row + 1 >= area.y + area.height {
-                    return;
+                let inner = render::content(area);
+                if !inner.contains(pos) {
+                    return; // the title rule or a side margin
                 }
-                let idx = self.panel(f).pos.offset + (m.row - area.y - 1) as usize;
+                let idx = self.panel(f).pos.offset + (m.row - inner.y) as usize;
                 if idx >= self.panel(f).lines.len() {
                     return;
                 }
@@ -932,7 +933,7 @@ impl App {
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let d: isize = if m.kind == MouseEventKind::ScrollDown { 3 } else { -3 };
-                let h = area.height.saturating_sub(2) as usize;
+                let h = render::content(area).height as usize;
                 let p = self.panel_mut(f);
                 p.pos.scroll_by(d, p.lines.len(), h);
                 if f == Focus::Graph {
