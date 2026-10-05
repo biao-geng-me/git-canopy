@@ -53,7 +53,7 @@ pub enum UiMsg {
     TermOutput,
     /// The inset shell with this id exited.
     TermExited(u64),
-    /// Neither a herdr pane nor a tmux popup could show a shell in this worktree: use the inset.
+    /// Neither herdr nor tmux could split a pane for a shell in this worktree: use the inset.
     ShellInset(PathBuf),
 }
 
@@ -968,9 +968,8 @@ impl App {
         None
     }
 
-    /// A shell in worktree `path`: a herdr pane split below canopy's if canopy runs in herdr, else
-    /// a tmux popup inside tmux, else an inset below the graph. Tried off the UI thread
-    /// (`display-popup` blocks until the popup closes).
+    /// A shell in worktree `path`: a pane split below canopy's if canopy runs in herdr or tmux,
+    /// else an inset below the graph. The splits are requested off the UI thread.
     fn open_shell(&mut self, path: PathBuf) {
         if let Some(shell) = &self.shell {
             // One inset shell at a time: focus the open one rather than hang it up.
@@ -985,7 +984,7 @@ impl App {
         }
         let (tx, with_herdr) = (self.tx.clone(), self.with_herdr);
         spawn_named("canopy-shell", move || {
-            if (with_herdr && herdr::open_shell_pane(&path).is_ok()) || tmux_popup(&path) {
+            if (with_herdr && herdr::open_shell_pane(&path).is_ok()) || tmux_split(&path) {
                 return;
             }
             let _ = tx.send(UiMsg::ShellInset(path));
@@ -1209,28 +1208,23 @@ enum WtField {
     Path(PathBuf),
 }
 
-/// A shell in `path` as a tmux popup, when canopy runs inside tmux. Blocks until the popup is
-/// closed; `false` if tmux couldn't show one (not in tmux, tmux < 3.2, no client).
-fn tmux_popup(path: &Path) -> bool {
+/// A shell in `path` in a tmux pane split below canopy's, when canopy runs inside tmux. tmux
+/// starts the default shell there and focuses it; `false` if tmux couldn't split.
+fn tmux_split(path: &Path) -> bool {
     if std::env::var_os("TMUX").is_none() {
         return false;
     }
-    let started = Instant::now();
-    let status = std::process::Command::new("tmux")
-        .arg("display-popup")
-        .arg("-E")
-        .arg("-d")
-        .arg(path)
-        .args(["-w", "80%", "-h", "80%"])
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.args(["split-window", "-v", "-c"]).arg(path);
+    // Split canopy's own pane, not whichever pane happens to be active.
+    if let Some(pane) = std::env::var_os("TMUX_PANE") {
+        cmd.arg("-t").arg(pane);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    // A shell's own exit status comes back too; only a quick failure means there was no popup.
-    match status {
-        Ok(s) => s.success() || started.elapsed() > Duration::from_secs(1),
-        Err(_) => false,
-    }
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {

@@ -136,7 +136,7 @@ works:
 
 1. **A herdr pane** split below canopy's, when canopy runs inside herdr. It's an ordinary herdr pane
    (resize, move or zoom it like any other) and closes when you `exit` the shell.
-2. **A tmux popup** (`tmux display-popup`, tmux ≥ 3.2), when canopy runs inside tmux.
+2. **A tmux pane** split below canopy's, when canopy runs inside tmux; likewise closed by `exit`.
 3. **An inset** in the lower half of the graph's space: a real terminal (your `$SHELL` on a pty).
    Keys go to the shell while it has focus; `Ctrl-]` hands them back to canopy, a click or `Tab`
    returns to it, and `exit` closes it. The mouse wheel scrolls its history. One inset shell at a time.

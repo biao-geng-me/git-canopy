@@ -1448,7 +1448,7 @@ const HELP: &[(&str, &str)] = &[
     ("Tab", "switch panel"),
     ("v", "stacked / side-by-side layout"),
     ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
-    ("s  dbl-click path", "shell in the worktree (pane, popup or inset)"),
+    ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("r", "refresh now"),
     ("?", "toggle this help"),

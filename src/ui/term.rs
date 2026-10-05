@@ -1,5 +1,5 @@
 //! A shell in an inset: a pty running `$SHELL` in a worktree, emulated with `vt100` and drawn
-//! into a panel below the graph. The fallback when neither a herdr pane nor a tmux popup is available.
+//! into a panel below the graph. The fallback when neither herdr nor tmux can split a pane for it.
 
 use std::fs::File;
 use std::io::{Read, Write};

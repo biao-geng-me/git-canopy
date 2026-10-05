@@ -200,8 +200,8 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   closes the pane when it exits. Only when canopy runs inside herdr, never with `--no-herdr`.
   A popup came first (herdr 0.9.3 only pops up plugin panes, so it needed a linked plugin manifest),
   but popups can't be resized or moved, so it was dropped for a plain split, which needs no plugin;
-  (2) `tmux display-popup -E -d <path>` inside tmux — it blocks until the popup closes, so it runs on
-  a thread, and only a quick non-zero exit (no client, old tmux) counts as failure; (3) an inset
+  (2) the same inside tmux: `tmux split-window -v -c <path> -t $TMUX_PANE` (a `display-popup` came
+  first and was dropped for the same reason); (3) an inset
   terminal in the lower half of the graph's space (`ui/term.rs`): a pty from `openpty` (libc) with
   `$SHELL` as session leader, emulated by the `vt100` crate (which doesn't answer queries, so cursor
   position / device attribute requests are answered from its callbacks), drawn cell by cell. While
