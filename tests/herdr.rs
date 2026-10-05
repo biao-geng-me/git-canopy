@@ -1,5 +1,5 @@
 //! The herdr client against a fake herdr server on a temporary Unix socket: initial read,
-//! re-read on a pushed event, resubscribe after `events_lost`, focus, the shell popup, and hiding
+//! re-read on a pushed event, resubscribe after `events_lost`, focus, the shell pane, and hiding
 //! when herdr goes away.
 #![cfg(unix)]
 
@@ -73,20 +73,15 @@ fn serve(listener: UnixListener, fake: Arc<Fake>) {
                     let _ = writeln!(conn, r#"{{"id":"{id}","result":{{"type":"subscription_started"}}}}"#);
                     fake.subs.lock().unwrap().push(conn); // keep it open for pushed events
                 }
-                "plugin.list" => {
-                    let _ = writeln!(
-                        conn,
-                        r#"{{"id":"{id}","result":{{"type":"plugin_list","plugins":[{{"plugin_id":"local.canopy","enabled":true,"panes":[{{"id":"shell","title":"shell","command":["sh"]}}]}}]}}}}"#
-                    );
-                }
-                "plugin.pane.open" => {
+                "pane.split" => {
                     let params = req.get("params").unwrap();
                     fake.calls.lock().unwrap().push(format!(
-                        "popup {} {}",
-                        params.get_str("placement").unwrap(),
+                        "split {} {} {}",
+                        params.get_str("target_pane_id").unwrap(),
+                        params.get_str("direction").unwrap(),
                         params.get_str("cwd").unwrap()
                     ));
-                    let _ = writeln!(conn, r#"{{"id":"{id}","result":{{"type":"ok"}}}}"#);
+                    let _ = writeln!(conn, r#"{{"id":"{id}","result":{{"type":"pane_info"}}}}"#);
                 }
                 "agent.focus" => {
                     let target = req.get("params").unwrap().get_str("target").unwrap().to_string();
@@ -189,26 +184,31 @@ fn follows_events_and_recovers_from_events_lost() {
     herdr::focus_at(&sock, "w1:p1").unwrap();
     assert!(fake.calls.lock().unwrap().iter().any(|c| c == "focus w1:p1"));
 
-    // A shell popup goes through the canopy plugin's pane.
-    herdr::open_shell_popup_at(&sock, std::path::Path::new("/w/repo")).unwrap();
-    assert!(fake.calls.lock().unwrap().iter().any(|c| c == "popup popup /w/repo"));
+    // `s` in the UI: a shell in a pane split below canopy's.
+    herdr::open_shell_pane_at(&sock, "w1:p9", std::path::Path::new("/w/repo")).unwrap();
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "split w1:p9 down /w/repo")
+    );
 
     // herdr goes away: the feature hides.
     std::fs::remove_file(&sock).unwrap();
     fake.subs.lock().unwrap().clear();
     wait_view(&rx, |v| v.is_none());
 
-    // Apart from the explicit focus and popup, only read-only methods were called.
+    // Apart from the explicit focus and shell pane, only read-only methods were called.
     let calls = fake.calls.lock().unwrap();
     let allowed = [
         "agent.list",
         "workspace.list",
         "events.subscribe",
-        "plugin.list",
         "agent.focus",
         "focus w1:p1",
-        "plugin.pane.open",
-        "popup popup /w/repo",
+        "pane.split",
+        "split w1:p9 down /w/repo",
     ];
     assert!(calls.iter().all(|c| allowed.contains(&c.as_str())), "{calls:?}");
     let _ = std::fs::remove_dir_all(&dir);

@@ -122,7 +122,7 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   the worktree's `[name]` label in the graph; footer `herdr: 3 agents, 1 blocked`.
 - **The only write-like calls**, both on the user's explicit request: `a` (or a double-click on the
   agent marker) sends `agent.focus` for the worktree's most urgent agent so herdr jumps to that pane;
-  `s` (or a double-click on the path) opens a shell popup via `plugin.pane.open` (see Shells). canopy
+  `s` (or a double-click on the path) opens a shell pane below canopy's via `pane.split` (see Shells). canopy
   never prompts, sends keys to, starts or stops agents.
 - **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
@@ -195,10 +195,11 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   blank (`render::panel`, with `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
   boxes were visual clutter. Only the `?` popup keeps a full frame, since it floats over content.
 - **Shells:** `s` / double-click on a worktree's path opens a shell there, first that works:
-  (1) a herdr popup — herdr 0.9.3 only opens popups for plugin panes (`plugin.pane.open` with
-  `placement: "popup"`), so the repo ships `herdr-plugin/herdr-plugin.toml` (id `local.canopy`, pane
-  `shell` = `$SHELL`, cwd from the request); used only when canopy runs inside herdr
-  (`HERDR_PANE_ID`) and `plugin.list` shows the plugin enabled, and never with `--no-herdr`;
+  (1) a herdr pane split below canopy's own (`pane.split` with `target_pane_id` = `HERDR_PANE_ID`,
+  `direction: "down"`, the worktree as `cwd`, `focus: true`); herdr runs the user's shell there and
+  closes the pane when it exits. Only when canopy runs inside herdr, never with `--no-herdr`.
+  A popup came first (herdr 0.9.3 only pops up plugin panes, so it needed a linked plugin manifest),
+  but popups can't be resized or moved, so it was dropped for a plain split, which needs no plugin;
   (2) `tmux display-popup -E -d <path>` inside tmux — it blocks until the popup closes, so it runs on
   a thread, and only a quick non-zero exit (no client, old tmux) counts as failure; (3) an inset
   terminal in the lower half of the graph's space (`ui/term.rs`): a pty from `openpty` (libc) with
@@ -207,9 +208,9 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   it has focus every key goes to it except `Ctrl-]`; `Tab` cycles worktrees → graph → shell. One inset
   shell at a time (a second request focuses it rather than hanging it up); closing canopy sends the
   shell's session SIGHUP. These two crates are the price of the inset; canopy is Unix-only anyway.
-  Tested live: the inset in a private tmux, the herdr popup in a fully separate herdr instance
-  (relative `HOME` under the scratchpad, plugin linked only there), agent focus and the popup request
-  against a fake socket server.
+  Tested live: the inset in a private tmux, the herdr split in a fully separate herdr instance
+  (relative `HOME` under the scratchpad), agent focus and the split request against a fake socket
+  server.
 - **Worktree row fields are clickable:** render records each row's agent-marker and path column
   ranges (`App::wt_fields`); a double-click on them focuses the agent / opens a shell, anywhere else
   opens the diff as before.

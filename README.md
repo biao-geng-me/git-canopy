@@ -122,7 +122,7 @@ inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns i
   agent, plus `×N` when several agents share a worktree; the graph's `[name]` labels get the same mark.
 - The footer sums it up: `herdr: 3 agents, 1 blocked`.
 - `a` (or a double-click on the marker) asks herdr to focus that worktree's agent pane. That and
-  opening a shell popup (below) are the only things canopy ever asks herdr to do; it never prompts,
+  opening a shell pane (below) are the only things canopy ever asks herdr to do; it never prompts,
   sends keys to, starts or stops agents.
 
 An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
@@ -134,9 +134,8 @@ of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, 
 `s`, or a double-click on a worktree's path, opens a shell in that worktree, in the first of these that
 works:
 
-1. **A herdr popup**, when canopy runs inside herdr and canopy's herdr plugin is linked. herdr only
-   opens popups for plugin panes, so link it once:
-   `herdr plugin link /path/to/canopy/herdr-plugin`.
+1. **A herdr pane** split below canopy's, when canopy runs inside herdr. It's an ordinary herdr pane
+   (resize, move or zoom it like any other) and closes when you `exit` the shell.
 2. **A tmux popup** (`tmux display-popup`, tmux ≥ 3.2), when canopy runs inside tmux.
 3. **An inset** in the lower half of the graph's space: a real terminal (your `$SHELL` on a pty).
    Keys go to the shell while it has focus; `Ctrl-]` hands them back to canopy, a click or `Tab`

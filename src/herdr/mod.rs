@@ -3,7 +3,7 @@
 //! Talks to the herdr server over its Unix socket (newline-delimited JSON). One connection makes
 //! requests (`agent.list`, `workspace.list`); a second one holds an `events.subscribe` stream whose
 //! events are only used as signals to re-read. Everything is read-only except [`focus`] and
-//! [`open_shell_popup`], which the user triggers explicitly. When herdr isn't reachable the feature
+//! [`open_shell_pane`], which the user triggers explicitly. When herdr isn't reachable the feature
 //! stays hidden.
 
 pub mod json;
@@ -243,30 +243,12 @@ pub fn socket_path() -> Option<PathBuf> {
     socket_path_from(|k| std::env::var(k).ok())
 }
 
-/// The herdr plugin that gives canopy a shell popup (`herdr-plugin/` in the repo). herdr only
-/// opens popups for plugin panes, so this is how a worktree shell becomes a herdr popup.
-pub const PLUGIN_ID: &str = "local.canopy";
-/// The plugin's pane entrypoint: `$SHELL` in the directory passed as `cwd`.
-pub const SHELL_PANE: &str = "shell";
-
-/// Whether a `plugin.list` response has the canopy plugin enabled with its shell pane.
-pub fn has_shell_pane(resp: &Json) -> bool {
-    let plugins = resp.get("result").and_then(|r| r.get("plugins")).and_then(Json::arr);
-    plugins.into_iter().flatten().any(|p| {
-        p.get_str("plugin_id") == Some(PLUGIN_ID)
-            && p.get("enabled") == Some(&Json::Bool(true))
-            && p.get("panes")
-                .and_then(Json::arr)
-                .is_some_and(|panes| panes.iter().any(|e| e.get_str("id") == Some(SHELL_PANE)))
-    })
-}
-
-/// `plugin.pane.open` params for a focused shell popup in `cwd`.
-pub fn shell_popup_params(cwd: &Path) -> String {
+/// `pane.split` params for a focused shell in `cwd`, in a new pane below `pane_id` (canopy's own).
+/// herdr starts the user's shell there; the pane closes when the shell exits.
+pub fn shell_split_params(pane_id: &str, cwd: &Path) -> String {
     format!(
-        "{{\"plugin_id\":{},\"entrypoint\":{},\"placement\":\"popup\",\"cwd\":{},\"width\":\"80%\",\"height\":\"80%\",\"focus\":true}}",
-        json::quote(PLUGIN_ID),
-        json::quote(SHELL_PANE),
+        "{{\"target_pane_id\":{},\"direction\":\"down\",\"cwd\":{},\"focus\":true}}",
+        json::quote(pane_id),
         json::quote(&cwd.to_string_lossy())
     )
 }
@@ -274,7 +256,7 @@ pub fn shell_popup_params(cwd: &Path) -> String {
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
-pub use client::{focus, focus_at, open_shell_popup, open_shell_popup_at, spawn, spawn_with};
+pub use client::{focus, focus_at, open_shell_pane, open_shell_pane_at, spawn, spawn_with};
 
 /// Without Unix sockets the feature is unavailable.
 #[cfg(not(unix))]
@@ -445,25 +427,11 @@ mod tests {
         assert_eq!(socket_path_from(env(&[])), None);
     }
 
-    // `plugin.list` from herdr 0.9.3 with the canopy plugin linked, trimmed.
-    const PLUGIN_LIST: &str = r#"{"id":"c","result":{"type":"plugin_list","plugins":[{"plugin_id":"local.canopy","name":"canopy","enabled":true,"version":"0.1.0","manifest_path":"/x/herdr-plugin.toml","plugin_root":"/x","actions":[],"startup":[],"panes":[{"id":"shell","title":"shell","command":["sh","-c","exec \"${SHELL:-/bin/sh}\""],"placement":"popup","width":"80%","height":"80%"}]}]}}"#;
-
     #[test]
-    fn finds_the_shell_pane_of_the_canopy_plugin() {
-        assert!(has_shell_pane(&Json::parse(PLUGIN_LIST).unwrap()));
-        let disabled = PLUGIN_LIST.replace("\"enabled\":true", "\"enabled\":false");
-        assert!(!has_shell_pane(&Json::parse(&disabled).unwrap()));
-        let other = PLUGIN_LIST.replace("local.canopy", "local.other");
-        assert!(!has_shell_pane(&Json::parse(&other).unwrap()));
-        let empty = r#"{"id":"c","result":{"type":"plugin_list","plugins":[]}}"#;
-        assert!(!has_shell_pane(&Json::parse(empty).unwrap()));
-    }
-
-    #[test]
-    fn shell_popup_params_are_json() {
-        let p = Json::parse(&shell_popup_params(Path::new("/w/a \"b\""))).unwrap();
-        assert_eq!(p.get_str("placement"), Some("popup"));
-        assert_eq!(p.get_str("entrypoint"), Some("shell"));
+    fn shell_split_params_are_json() {
+        let p = Json::parse(&shell_split_params("w1:p2", Path::new("/w/a \"b\""))).unwrap();
+        assert_eq!(p.get_str("target_pane_id"), Some("w1:p2"));
+        assert_eq!(p.get_str("direction"), Some("down"));
         assert_eq!(p.get_str("cwd"), Some("/w/a \"b\""));
         assert_eq!(p.get("focus"), Some(&Json::Bool(true)));
     }

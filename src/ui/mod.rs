@@ -53,7 +53,7 @@ pub enum UiMsg {
     TermOutput,
     /// The inset shell with this id exited.
     TermExited(u64),
-    /// Neither a herdr nor a tmux popup could show a shell in this worktree: use the inset.
+    /// Neither a herdr pane nor a tmux popup could show a shell in this worktree: use the inset.
     ShellInset(PathBuf),
 }
 
@@ -208,7 +208,7 @@ pub struct App {
     pub shell_focus: bool,
     /// A one-off message for the footer, cleared by the next key or click.
     pub notice: Option<String>,
-    /// herdr integration enabled (`--no-herdr` turns it off, the shell popup included).
+    /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
     next_id: u64,
     tx: Sender<UiMsg>,
@@ -968,9 +968,9 @@ impl App {
         None
     }
 
-    /// A shell in worktree `path`: a herdr popup if canopy runs in herdr and the canopy plugin is
-    /// installed, else a tmux popup inside tmux, else an inset below the graph. The popups are
-    /// tried off the UI thread (`display-popup` blocks until the popup closes).
+    /// A shell in worktree `path`: a herdr pane split below canopy's if canopy runs in herdr, else
+    /// a tmux popup inside tmux, else an inset below the graph. Tried off the UI thread
+    /// (`display-popup` blocks until the popup closes).
     fn open_shell(&mut self, path: PathBuf) {
         if let Some(shell) = &self.shell {
             // One inset shell at a time: focus the open one rather than hang it up.
@@ -985,7 +985,7 @@ impl App {
         }
         let (tx, with_herdr) = (self.tx.clone(), self.with_herdr);
         spawn_named("canopy-shell", move || {
-            if (with_herdr && herdr::open_shell_popup(&path).is_ok()) || tmux_popup(&path) {
+            if (with_herdr && herdr::open_shell_pane(&path).is_ok()) || tmux_popup(&path) {
                 return;
             }
             let _ = tx.send(UiMsg::ShellInset(path));
