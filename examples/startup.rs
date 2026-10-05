@@ -19,16 +19,21 @@ fn main() {
     });
     while let Ok(s) = rx.recv_timeout(Duration::from_secs(60)) {
         let dirty = s.worktrees.iter().filter(|w| w.is_dirty()).count();
+        let changes = s.worktrees.iter().filter(|w| w.changes.is_some()).count();
+        let overlaps: usize = s.worktrees.iter().map(|w| w.overlaps.len()).sum();
         println!(
-            "{:>7.1} ms  worktrees={} dirty={} statuses_loaded={} commits={} rows={}",
+            "{:>7.1} ms  worktrees={} dirty={} statuses_loaded={} commits={} rows={} changes={} overlaps={}",
             t0.elapsed().as_secs_f64() * 1000.0,
             s.worktrees.len(),
             dirty,
             s.statuses_loaded,
             s.graph.commits.len(),
-            s.graph.rows.len()
+            s.graph.rows.len(),
+            changes,
+            overlaps / 2
         );
-        if !s.graph.rows.is_empty() {
+        // The last startup snapshot: change sizes and overlaps.
+        if changes > 0 {
             break;
         }
     }

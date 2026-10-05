@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use super::{lossy, non_null_oid, split_nul};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Status {
     /// HEAD commit, `None` on an unborn branch.
     pub oid: Option<String>,

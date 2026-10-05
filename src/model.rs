@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::git::changes::FileChange;
 use crate::git::refs::{RefEntry, RefKind};
 use crate::git::status::Status;
 use crate::git::worktree::WorktreeEntry;
@@ -40,6 +41,10 @@ pub struct WorktreeView {
     pub changed_at: Option<i64>,
     /// Its directories are watched for edits (otherwise only polled).
     pub watched: bool,
+    /// What it changed since it forked from the base branch (`None` without a base branch).
+    pub changes: Option<Arc<Changes>>,
+    /// Other worktrees (or the base branch) that changed some of the same files.
+    pub overlaps: Vec<Overlap>,
 }
 
 impl WorktreeView {
@@ -71,6 +76,78 @@ impl WorktreeView {
     pub fn has_worktree(&self) -> bool {
         !self.bare && self.prunable.is_none()
     }
+}
+
+/// What a worktree changed since its merge base with the base branch: committed and
+/// uncommitted changes to tracked files (untracked files aren't counted).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    pub merge_base: String,
+    /// Sorted by path.
+    pub files: Vec<FileChange>,
+    pub adds: u64,
+    pub dels: u64,
+}
+
+impl Changes {
+    /// Combine the committed changes (merge base → HEAD) with `dirty`, the merge base → working
+    /// tree counts of the paths `git status` reports (`dirty_paths`), which replace the committed
+    /// counts of those paths. `dirty_paths: None` means `dirty` covers every path.
+    pub fn merge(
+        merge_base: String,
+        committed: &[FileChange],
+        dirty: &[FileChange],
+        dirty_paths: Option<&[String]>,
+    ) -> Changes {
+        let mut files: std::collections::BTreeMap<&str, &FileChange> = match dirty_paths {
+            None => Default::default(),
+            Some(paths) => {
+                let replaced: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+                committed
+                    .iter()
+                    .filter(|f| !replaced.contains(f.path.as_str()))
+                    .map(|f| (f.path.as_str(), f))
+                    .collect()
+            }
+        };
+        for f in dirty {
+            files.insert(&f.path, f);
+        }
+        let files: Vec<FileChange> = files.into_values().cloned().collect();
+        Changes {
+            merge_base,
+            adds: files.iter().map(|f| f.adds as u64).sum(),
+            dels: files.iter().map(|f| f.dels as u64).sum(),
+            files,
+        }
+    }
+}
+
+/// Files a worktree and another worktree (or the base branch) both changed since their
+/// histories split: likely merge conflicts, or two agents doing the same work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    /// The other worktree's name, or the base branch.
+    pub with: String,
+    /// The other worktree; `None` for the base branch when no worktree has it checked out.
+    pub path: Option<PathBuf>,
+    pub files: Vec<String>,
+}
+
+/// Paths in both `a` and `b`. An entry ending in `/` (an untracked directory, as `git status`
+/// reports it) stands for everything under it.
+pub fn shared_files(a: &[String], b: &[String]) -> Vec<String> {
+    let in_b: std::collections::HashSet<&str> = b.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = a.iter().filter(|p| in_b.contains(p.as_str())).cloned().collect();
+    // Directories are few (untracked ones only), so scanning the other side for each is cheap.
+    for (dirs, other) in [(a, b), (b, a)] {
+        for d in dirs.iter().filter(|d| d.ends_with('/')) {
+            out.extend(other.iter().filter(|p| p.starts_with(d.as_str()) && *p != d).cloned());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Branch name if on a branch, else the worktree directory name.
@@ -145,6 +222,46 @@ mod tests {
     fn names() {
         assert_eq!(display_name(&wt("/a/feat", Some("feature/x"))), "feature/x");
         assert_eq!(display_name(&wt("/a/detached-1", None)), "detached-1");
+    }
+
+    #[test]
+    fn shared() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(shared_files(&v(&["a", "b", "c"]), &v(&["c", "a", "z"])), v(&["a", "c"]));
+        // An untracked directory stands for the files under it, on either side.
+        assert_eq!(
+            shared_files(&v(&["new/", "x"]), &v(&["new/f.rs", "y"])),
+            v(&["new/f.rs"])
+        );
+        assert_eq!(shared_files(&v(&["new/f.rs"]), &v(&["new/"])), v(&["new/f.rs"]));
+        assert_eq!(shared_files(&v(&["new/"]), &v(&["new/"])), v(&["new/"]));
+        assert!(shared_files(&v(&["newer"]), &v(&["new/"])).is_empty());
+    }
+
+    fn fc(path: &str, adds: u32, dels: u32) -> FileChange {
+        FileChange {
+            path: path.into(),
+            adds,
+            dels,
+            binary: false,
+        }
+    }
+
+    #[test]
+    fn merged_changes() {
+        let committed = [fc("a", 10, 2), fc("b", 5, 0)];
+        // b was edited further, c is new and staged, d is untracked (no counts).
+        let dirty = [fc("b", 7, 1), fc("c", 3, 0)];
+        let paths = ["b".to_string(), "c".to_string(), "d".to_string()];
+        let ch = Changes::merge("mb".into(), &committed, &dirty, Some(&paths));
+        assert_eq!(ch.files, [fc("a", 10, 2), fc("b", 7, 1), fc("c", 3, 0)]);
+        assert_eq!((ch.adds, ch.dels), (20, 3));
+        // b was reverted to the merge base: gone.
+        let ch = Changes::merge("mb".into(), &committed, &[], Some(&["b".to_string()]));
+        assert_eq!(ch.files, [fc("a", 10, 2)]);
+        // A full working-tree diff replaces everything.
+        let ch = Changes::merge("mb".into(), &committed, &[fc("z", 1, 1)], None);
+        assert_eq!(ch.files, [fc("z", 1, 1)]);
     }
 
     #[test]

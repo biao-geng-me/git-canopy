@@ -47,10 +47,12 @@ pub struct Term {
 }
 
 impl Term {
-    /// Start `$SHELL` in `path` on a new pty of `rows` × `cols`. `on_output` is called (on the
-    /// reader thread) after each chunk of output, `on_exit` once the shell is gone.
+    /// Start `$SHELL` in `path` on a new pty of `rows` × `cols`, running `command` (with
+    /// `$SHELL -c`) instead of an interactive shell if given. `on_output` is called (on the reader
+    /// thread) after each chunk of output, `on_exit` once the shell is gone.
     pub fn spawn(
         path: &Path,
+        command: Option<&str>,
         rows: u16,
         cols: u16,
         on_output: impl Fn() + Send + 'static,
@@ -60,6 +62,9 @@ impl Term {
         let (master, slave) = openpty(rows, cols)?;
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = Command::new(&shell);
+        if let Some(c) = command {
+            cmd.arg("-c").arg(format!("exec {c}"));
+        }
         cmd.current_dir(path)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone()?))
@@ -296,6 +301,7 @@ mod tests {
         let tx2 = tx.clone();
         let mut t = Term::spawn(
             &dir,
+            None,
             10,
             60,
             move || {
@@ -314,6 +320,33 @@ mod tests {
         let text = t.screen().screen().contents();
         let canon = std::fs::canonicalize(&dir).unwrap();
         assert!(text.contains(canon.to_str().unwrap()), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runs_a_command_instead_of_a_shell() {
+        let dir = std::env::temp_dir().join(format!("canopy-term-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx2 = tx.clone();
+        let t = Term::spawn(
+            &dir,
+            Some("printf 'ran in %s' \"$PWD\""),
+            10,
+            60,
+            move || {
+                let _ = tx.send(false);
+            },
+            move || {
+                let _ = tx2.send(true);
+            },
+        )
+        .unwrap();
+        // It exits by itself once the command is done.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !rx.recv_timeout(deadline - std::time::Instant::now()).unwrap() {}
+        let text = t.screen().screen().contents();
+        assert!(text.contains("ran in "), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

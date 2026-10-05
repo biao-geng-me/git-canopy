@@ -122,8 +122,11 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   the worktree's `[name]` label in the graph; footer `herdr: 3 agents, 1 blocked`.
 - **The only write-like calls**, both on the user's explicit request: `a` (or a double-click on the
   agent marker) sends `agent.focus` for the worktree's most urgent agent so herdr jumps to that pane;
-  `s` (or a double-click on the path) opens a shell pane below canopy's via `pane.split` (see Shells). canopy
-  never prompts, sends keys to, starts or stops agents.
+  `s` (or a double-click on the path) opens a shell pane below canopy's via `pane.split` (see Shells);
+  `t` does the same and then types ` exec <git tui>` into that new pane (`pane.send_input` with
+  `keys: ["Enter"]`, the exact request `herdr pane run` sends, captured with a logging fake socket),
+  since `pane.split` takes no command. canopy never prompts, sends keys to, starts or stops agents;
+  the only input it sends goes to a pane it just created.
 - **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
   every request opens a fresh connection; only the subscription connection stays open. Tests run the
@@ -143,6 +146,44 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 6. Polish: mouse, resize, help popup (`?`), `canopy [path]` arg, `--interval`, graceful non-repo error.
 7. (Later, not now) herdr plugin: `herdr-plugin.toml` with a popup pane running canopy and a startup
    poller that sets a per-workspace `$wt_dirty` sidebar token via `herdr workspace report-metadata`.
+
+## Roadmap after 0.2
+
+Still read-only. No git operations in canopy (staging, committing, rebasing in an agent's worktree
+races the agent and breaks the "never interfere" guarantee); a key hands off to a real git TUI instead.
+
+- **0.3, reviewing agent work (built):** `t` opens a git TUI (lazygit, …) in the worktree, the same way `s`
+  opens a shell; a change-size column (`+412 −38` vs the base branch, uncommitted included); `b` diffs
+  a worktree against its merge base with the base branch (everything the agent did); overlap warnings
+  between worktrees that touch the same files.
+- **Later:** graph search and a per-worktree filter; cleanup hints (merged into base, prunable, idle for
+  days; shown, not acted on); `e` opens `$EDITOR` at the file/line under the cursor.
+- Not planned: notifications (herdr already notifies on blocked agents).
+
+### Multi-repo (planned for 0.4, not built)
+
+Agents often work in several projects at once; one canopy should be able to watch all of them.
+
+- **Boundary:** everything per repository stays per repository. One `watch::Worker` (and one
+  `Snapshot`) per common dir, unchanged; `App` holds a list of repos instead of one `snap` + `worker`.
+  **Rule until then:** new features compute their data in the worker into `Snapshot`/`WorktreeView`
+  and never assume the UI has only one repo (key things by worktree path, which is unique across repos,
+  or by common dir, never by index into one global list).
+- **Layout:** the worktree panel lists all repos, grouped under a header row per repo (repo name, base
+  branch, worktree/dirty counts); the graph shows the repo of the selected worktree (or header). Moving
+  the selection into another repo swaps the graph; per-repo graph cursor/expansion state is kept. Tabs
+  and stacked graphs were considered: tabs are no better than two canopies in herdr panes, and several
+  graphs on one screen get unreadable.
+- **Which repos:** every `PATH` argument (`canopy ~/a ~/b`); with `--herdr-repos`, also every repo that
+  a herdr agent's cwd or a workspace's `checkout_path` is in (discovered with `git rev-parse
+  --git-common-dir`, deduplicated by common dir, added/removed as agents come and go). A single
+  repo behaves exactly as today (no header row).
+- **Shared resources:** one herdr connection for all repos (agents are matched against every repo's
+  worktree paths; today agents outside the repo are dropped); a global cap on concurrent git processes
+  across workers (today `PARALLELISM` is per worker); one inotify watcher shared by all workers so the
+  `MAX_WATCH_DIRS`/inotify budget is global; `--base` applies to every repo, else per-repo detection.
+- **Footer/details:** herdr summary across all repos; the details line names the repo when there are
+  several.
 
 ## Conventions
 
@@ -230,6 +271,30 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/
   develop, else the main worktree's branch), computed with `rev-list --left-right --count` and cached
   per (base sha, head sha). `⇡a ⇣b` vs upstream from status. The base worktree shows upstream only.
+- **Change size** (`+412 -38`, wide rows): per worktree, merge base with the base branch → working tree,
+  tracked files only. Computed in the worker, not with one `diff-index <merge base>` (that stats every
+  file, as costly as a status) but as `diff-tree --numstat` merge base → HEAD (cached forever by the
+  pair) plus `diff-index --numstat <merge base> -- <paths status reported>` (stats only those; all
+  paths when status listed `MAX_PATHS`), merged per path (`Changes::merge`). `--no-renames`
+  everywhere so every entry has one path (a rename counts as delete + add). `diff-index` doesn't
+  refresh the index, so stat-dirty-but-unchanged files come back 0/0 and are dropped.
+- **Overlaps:** for every pair of sides (worktrees with a status, plus the base branch itself when no
+  worktree has it checked out), the files both changed in *their own work*, committed or not. A side's
+  own work starts at the later of the pair's merge base and its fork from base (`merge-base` of the
+  two decides which is later): without that, every branch that merely contains base's newer commits
+  "overlapped" (caught by the fixture test), and a branch built on another overlapped all of its
+  files. The base side's work starts at the pair's merge base (what base changed since the other
+  forked = rebase/merge conflict risk). Uncommitted files are status's paths (untracked dirs as
+  `dir/`, matching everything under them, `model::shared_files`). Merge bases and commit diffs are
+  cached; O(n²) merge-base calls at startup (190 for 20 worktrees, parallel, after the graph is up),
+  then only for moved HEADs. Shown on the row (`⚠ name +n`), in the details footer (files), and in
+  the diff file list (`⚠ also in name`).
+- **Diff vs base (`b`):** `diff::Target::Branch { path, base }` resolves `merge-base <base> HEAD` at
+  load time (so it never goes stale) and shows `diff-index -p <merge base>` + untracked, like the
+  worktree diff. Copy (`yd`) gives the same as a patch.
+- **Git TUI (`t`):** `--git-tui` / `CANOPY_GIT_TUI`, else the first of lazygit, gitui, tig on PATH,
+  opened exactly like a shell (herdr split, tmux split with the command, or the inset running
+  `$SHELL -c 'exec <cmd>'`), so its pane closes when the TUI exits. `t`, not `g` (taken by top/bottom).
 - **Refresh:** every poll tick re-runs `worktree list` + `for-each-ref` (cheap) and all statuses; the
   refs fingerprint gates the log/graph reload, so polling alone covers repos where fs events don't fire.
   fs events only reduce latency. Startup publishes three snapshots: worktree list, + statuses, + graph.
@@ -274,7 +339,8 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 - **Static binary:** the default glibc build links libc dynamically; `--target x86_64-unknown-linux-musl`
   gives a fully static ~1.2 MB binary (no C deps, works out of the box with rustup's musl target).
 - **Perf baseline** (`scripts/mkbigrepo.sh`, 20k commits, 16 worktrees, no commit-graph, WSL2): worktree
-  list ~25 ms, all statuses ~35 ms, graph ~100 ms after start (`cargo run --release --example startup`).
+  list ~25 ms, all statuses ~35 ms, graph ~100 ms after start, change sizes + overlaps (136 pairs)
+  ~350 ms after the graph (`cargo run --release --example startup`).
 - **Testing:** integration tests build a fresh fixture under `std::env::temp_dir()` per test
   (`tests/common`), never inside the repo. The TUI was exercised by driving it in a private tmux server
   (`tmux -L <name>`), including injected SGR mouse sequences.

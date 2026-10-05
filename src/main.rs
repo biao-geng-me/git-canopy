@@ -23,11 +23,13 @@ OPTIONS:
         --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only
         --no-herdr          don't show herdr agent activity
+        --git-tui <CMD>     git TUI that t opens in a worktree (default: $CANOPY_GIT_TUI, else
+                            the first of lazygit, gitui, tig on PATH)
     -h, --help              print help
     -V, --version           print version
 
 KEYS:
-    ↑↓/jk move · Space expand · Enter full diff · Tab switch panel · v layout · y copy · ? help · q quit
+    ↑↓/jk move · Space expand · Enter full diff · b diff vs base · t git TUI · s shell · y copy · ? help
 ";
 
 struct Args {
@@ -35,6 +37,7 @@ struct Args {
     cfg: Config,
     layout: LayoutMode,
     herdr: bool,
+    git_tui: Option<String>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -42,6 +45,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut cfg = Config::default();
     let mut layout = LayoutMode::default();
     let mut herdr = true;
+    let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         let s = arg.to_string_lossy().into_owned();
@@ -76,6 +80,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-watch" => cfg.watch = false,
             "--no-poll" => cfg.poll = false,
             "--no-herdr" => herdr = false,
+            "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
                     "stacked" => LayoutMode::Stacked,
@@ -98,6 +103,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         cfg,
         layout,
         herdr,
+        git_tui,
     }))
 }
 
@@ -121,7 +127,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match canopy::ui::run(paths, args.cfg, args.layout, args.herdr) {
+    match canopy::ui::run(paths, args.cfg, args.layout, args.herdr, args.git_tui) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");

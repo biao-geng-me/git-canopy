@@ -54,8 +54,9 @@ pub enum UiMsg {
     TermOutput,
     /// The inset shell with this id exited.
     TermExited(u64),
-    /// Neither herdr nor tmux could split a pane for a shell in this worktree: use the inset.
-    ShellInset(PathBuf),
+    /// Neither herdr nor tmux could split a pane for a shell (or this command) in this worktree:
+    /// use the inset.
+    ShellInset(PathBuf, Option<String>),
     /// A copy finished: the footer notice, and the OSC 52 sequence to write when no clipboard
     /// program or tmux took the text.
     Copied {
@@ -96,9 +97,11 @@ pub struct WtFields {
     pub path: Option<Range<u16>>,
 }
 
-/// A shell in an inset below the graph.
+/// A shell (or a git TUI) in an inset below the graph.
 pub struct Shell {
     id: u64,
+    /// What runs there: `shell`, or the command's program name.
+    pub label: String,
     pub term: term::Term,
 }
 
@@ -220,6 +223,8 @@ pub struct App {
     clipboard: Vec<crate::clipboard::Method>,
     /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
+    /// Git TUI for `t` (`--git-tui` / `CANOPY_GIT_TUI`); found on PATH when `None`.
+    git_tui: Option<String>,
     next_id: u64,
     tx: Sender<UiMsg>,
     last_click: Option<Click>,
@@ -253,6 +258,7 @@ impl App {
             copy_pending: false,
             clipboard: crate::clipboard::methods(),
             with_herdr: true,
+            git_tui: None,
             next_id: 0,
             tx,
             last_click: None,
@@ -585,7 +591,7 @@ impl App {
                     self.shell_focus = false;
                 }
             }
-            UiMsg::ShellInset(path) => self.open_shell_inset(&path),
+            UiMsg::ShellInset(path, command) => self.open_shell_inset(&path, command),
             UiMsg::Copied { notice, osc52 } => {
                 if let Some(seq) = osc52 {
                     // Between frames, so it can't land inside ratatui's output.
@@ -660,12 +666,12 @@ impl App {
 
         // Keep an open worktree diff in sync when that worktree changes.
         let stale = match &self.diff {
-            Some(d @ DiffView { doc: Some(_), .. }) => match &d.target {
-                diff::Target::Worktree { path, .. } => {
-                    let now = self.worktree_stamp(&Key::Worktree(path.clone()));
+            Some(d @ DiffView { doc: Some(_), .. }) => match d.target.worktree() {
+                Some(path) => {
+                    let now = self.worktree_stamp(&Key::Worktree(path.to_path_buf()));
                     now.is_some_and(|now| now.0.is_some() && Some(now) != d.stamp)
                 }
-                _ => false,
+                None => false,
             },
             _ => false,
         };
@@ -700,13 +706,23 @@ impl App {
             .count()
     }
 
+    /// The worktree the cursor is on: the selected one in the worktree list; in the graph, the
+    /// one the row belongs to.
+    fn focused_wi(&self) -> Option<usize> {
+        match self.focus {
+            Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
+            Focus::Graph => self.graph_row_worktree(),
+        }
+    }
+
+    fn focused_worktree(&self) -> Option<&crate::model::WorktreeView> {
+        self.snap.worktrees.get(self.focused_wi()?).filter(|w| w.has_worktree())
+    }
+
     /// `a`: ask herdr to focus the pane of the selected worktree's most urgent agent.
     fn focus_agent(&mut self) {
         let Some(view) = &self.herdr else { return };
-        let wi = match self.focus {
-            Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
-            Focus::Graph => self.graph_row_worktree(),
-        };
+        let wi = self.focused_wi();
         let agent = wi
             .and_then(|wi| self.agents.get(wi))
             .and_then(|ids| ids.iter().map(|&i| &view.agents[i]).max_by_key(|a| a.state));
@@ -768,14 +784,12 @@ impl App {
             KeyCode::Char('r') => self.worker.request(Request::Refresh),
             KeyCode::Char('a') => self.focus_agent(),
             KeyCode::Char('s') => {
-                let wi = match self.focus {
-                    Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
-                    Focus::Graph => self.graph_row_worktree(),
-                };
-                if let Some(w) = wi.and_then(|wi| self.snap.worktrees.get(wi)) {
-                    self.open_shell(w.path.clone());
+                if let Some(w) = self.focused_worktree() {
+                    self.open_shell(w.path.clone(), None);
                 }
             }
+            KeyCode::Char('t') => self.open_git_tui(),
+            KeyCode::Char('b') => self.open_branch_diff(),
             KeyCode::Char('v') => {
                 self.layout = match self.layout {
                     LayoutMode::Stacked => LayoutMode::Side,
@@ -997,15 +1011,17 @@ impl App {
         None
     }
 
-    /// A shell in worktree `path`: a pane split below canopy's if canopy runs in herdr or tmux,
-    /// else an inset below the graph. The splits are requested off the UI thread.
-    fn open_shell(&mut self, path: PathBuf) {
+    /// A shell in worktree `path` (running `command` if given): a pane split below canopy's if
+    /// canopy runs in herdr or tmux, else an inset below the graph. The splits are requested off
+    /// the UI thread.
+    fn open_shell(&mut self, path: PathBuf, command: Option<String>) {
         if let Some(shell) = &self.shell {
-            // One inset shell at a time: focus the open one rather than hang it up.
+            // One inset at a time: focus the open one rather than hang it up.
             self.shell_focus = true;
-            if shell.term.path != path {
+            if shell.term.path != path || command.is_some() {
                 self.notice = Some(format!(
-                    "a shell is open in {}; exit it first",
+                    "{} is open in {}; exit it first",
+                    shell.label,
                     render::tilde(&shell.term.path)
                 ));
             }
@@ -1013,14 +1029,49 @@ impl App {
         }
         let (tx, with_herdr) = (self.tx.clone(), self.with_herdr);
         spawn_named("canopy-shell", move || {
-            if (with_herdr && herdr::open_shell_pane(&path).is_ok()) || tmux_split(&path) {
+            let cmd = command.as_deref();
+            if (with_herdr && herdr::open_shell_pane(&path, cmd).is_ok()) || tmux_split(&path, cmd) {
                 return;
             }
-            let _ = tx.send(UiMsg::ShellInset(path));
+            let _ = tx.send(UiMsg::ShellInset(path, command));
         });
     }
 
-    fn open_shell_inset(&mut self, path: &Path) {
+    /// `t`: a git TUI (lazygit, gitui, tig, or `--git-tui`) in the focused worktree, opened like
+    /// a shell. canopy itself stays read-only; changes are made there.
+    fn open_git_tui(&mut self) {
+        let Some(path) = self.focused_worktree().map(|w| w.path.clone()) else {
+            return;
+        };
+        match self.git_tui.clone().or_else(find_git_tui) {
+            Some(cmd) => self.open_shell(path, Some(cmd)),
+            None => {
+                self.notice =
+                    Some("no git TUI found (lazygit, gitui, tig); set one with --git-tui or CANOPY_GIT_TUI".into())
+            }
+        }
+    }
+
+    /// `b`: everything the focused worktree changed since it forked from the base branch.
+    fn open_branch_diff(&mut self) {
+        let Some(w) = self.focused_worktree() else { return };
+        let Some(base) = self.snap.base.clone() else {
+            self.notice = Some("no base branch to compare with (set one with --base)".into());
+            return;
+        };
+        let (path, name) = (w.path.clone(), w.name.clone());
+        let title = format!("[{name}] since branching from {base}");
+        let target = diff::Target::Branch {
+            path: path.clone(),
+            base,
+        };
+        self.next_id += 1;
+        let view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&Key::Worktree(path)));
+        self.diff = Some(view);
+        self.spawn_diff_load();
+    }
+
+    fn open_shell_inset(&mut self, path: &Path, command: Option<String>) {
         if self.shell.is_some() {
             return;
         }
@@ -1030,6 +1081,7 @@ impl App {
         // Sized properly on the next render.
         let started = term::Term::spawn(
             path,
+            command.as_deref(),
             12,
             80,
             move || {
@@ -1041,7 +1093,11 @@ impl App {
         );
         match started {
             Ok(term) => {
-                self.shell = Some(Shell { id, term });
+                let label = match &command {
+                    Some(c) => program_name(c),
+                    None => "shell".into(),
+                };
+                self.shell = Some(Shell { id, label, term });
                 self.shell_focus = true;
             }
             Err(e) => self.notice = Some(format!("can't start a shell: {e}")),
@@ -1102,7 +1158,7 @@ impl App {
                     self.last_click = None;
                     match self.wt_field_at(f, idx, m.column - inner.x) {
                         Some(WtField::Agent) => self.focus_agent(),
-                        Some(WtField::Path(path)) => self.open_shell(path),
+                        Some(WtField::Path(path)) => self.open_shell(path, None),
                         None => self.open_full(f, idx),
                     }
                 } else {
@@ -1196,10 +1252,10 @@ impl App {
 
     fn reload_diff(&mut self) {
         let stamp = match &self.diff {
-            Some(d) => match &d.target {
-                diff::Target::Worktree { path, .. } => self.worktree_stamp(&Key::Worktree(path.clone())),
-                diff::Target::Commit { .. } => None,
-            },
+            Some(d) => d
+                .target
+                .worktree()
+                .and_then(|p| self.worktree_stamp(&Key::Worktree(p.to_path_buf()))),
             None => return,
         };
         self.next_id += 1;
@@ -1238,8 +1294,9 @@ enum WtField {
 }
 
 /// A shell in `path` in a tmux pane split below canopy's, when canopy runs inside tmux. tmux
-/// starts the default shell there and focuses it; `false` if tmux couldn't split.
-fn tmux_split(path: &Path) -> bool {
+/// starts the default shell there (or `command`, closing the pane when it exits) and focuses it;
+/// `false` if tmux couldn't split.
+fn tmux_split(path: &Path, command: Option<&str>) -> bool {
     if std::env::var_os("TMUX").is_none() {
         return false;
     }
@@ -1249,6 +1306,9 @@ fn tmux_split(path: &Path) -> bool {
     if let Some(pane) = std::env::var_os("TMUX_PANE") {
         cmd.arg("-t").arg(pane);
     }
+    if let Some(c) = command {
+        cmd.arg(c);
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1256,12 +1316,37 @@ fn tmux_split(path: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Git TUIs `t` looks for on PATH, in order.
+const GIT_TUIS: [&str; 3] = ["lazygit", "gitui", "tig"];
+
+/// The first of [`GIT_TUIS`] on PATH.
+fn find_git_tui() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    GIT_TUIS
+        .into_iter()
+        .find(|name| {
+            std::env::split_paths(&path).any(|dir| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+        })
+        .map(str::to_string)
+}
+
+/// `lazygit` for `/usr/bin/lazygit -p x`: what the inset's title calls it.
+fn program_name(command: &str) -> String {
+    let first = command.split_whitespace().next().unwrap_or(command);
+    Path::new(first)
+        .file_name()
+        .map_or_else(|| first.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new().name(name.into()).spawn(f).expect("spawn thread");
 }
 
 /// Run the TUI until the user quits.
-pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool) -> Result<()> {
+pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, git_tui: Option<String>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
     if with_herdr {
@@ -1286,6 +1371,7 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool) 
 
     let mut app = App::new(worker, tx, &cfg, layout);
     app.with_herdr = with_herdr;
+    app.git_tui = git_tui;
     let res = event_loop(&mut terminal, &mut app, &rx);
 
     let _ = execute!(stdout(), DisableMouseCapture);

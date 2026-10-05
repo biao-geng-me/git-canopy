@@ -132,3 +132,49 @@ fn copied_patches_are_real_patches() {
     let one = diff::patch(&target, Some("src/db.rs")).unwrap();
     assert!(one.starts_with("diff --git a/src/db.rs b/src/db.rs"), "{one}");
 }
+
+#[test]
+fn branch_diff_covers_commits_and_uncommitted_changes() {
+    let fx = common::Fixture::new();
+    let branch = |name: &str| Target::Branch {
+        path: fx.wt(name),
+        base: "main".into(),
+    };
+    let doc = diff::load(&branch("feat-auth")).unwrap();
+    assert!(doc.overview[0].starts_with("Everything changed since branching from main at "));
+    let files: Vec<_> = doc.files.iter().map(|f| (f.path.as_str(), f.status, f.adds)).collect();
+    assert_eq!(
+        files,
+        [
+            // Two commits plus an unstaged line.
+            ("src/auth.rs", 'A', 3),
+            ("src/lib.rs", 'M', 1),
+            ("src/main.rs", 'M', 1),
+            ("src/session.rs", 'A', 1),
+            ("src/token.rs", 'A', 1),
+            ("notes.md", '?', 1),
+        ]
+    );
+
+    // Clean and at main: nothing since the fork.
+    let doc = diff::load(&branch("untracked-only")).unwrap();
+    assert!(doc.files.iter().all(|f| f.status == '?'));
+    let doc = diff::load(&Target::Branch {
+        path: fx.repo(),
+        base: "main".into(),
+    })
+    .unwrap();
+    assert!(doc.files.is_empty());
+    assert!(
+        doc.overview
+            .iter()
+            .any(|l| l == "No changes since branching from main.")
+    );
+
+    // The copyable patch for the same target applies the same files.
+    let patch = diff::patch(&branch("fix-parser"), None).unwrap();
+    assert!(
+        patch.contains("+fn parse() {}") && patch.contains("+// fixme"),
+        "{patch}"
+    );
+}

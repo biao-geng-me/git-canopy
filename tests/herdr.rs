@@ -81,7 +81,28 @@ fn serve(listener: UnixListener, fake: Arc<Fake>) {
                         params.get_str("direction").unwrap(),
                         params.get_str("cwd").unwrap()
                     ));
-                    let _ = writeln!(conn, r#"{{"id":"{id}","result":{{"type":"pane_info"}}}}"#);
+                    let _ = writeln!(
+                        conn,
+                        r#"{{"id":"{id}","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p10","focused":true}}}}}}"#
+                    );
+                }
+                "pane.send_input" => {
+                    let params = req.get("params").unwrap();
+                    let keys: Vec<&str> = params
+                        .get("keys")
+                        .unwrap()
+                        .arr()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Json::str)
+                        .collect();
+                    fake.calls.lock().unwrap().push(format!(
+                        "input {} {:?} {}",
+                        params.get_str("pane_id").unwrap(),
+                        params.get_str("text").unwrap(),
+                        keys.join(",")
+                    ));
+                    let _ = writeln!(conn, r#"{{"id":"{id}","result":{{"type":"ok"}}}}"#);
                 }
                 "agent.focus" => {
                     let target = req.get("params").unwrap().get_str("target").unwrap().to_string();
@@ -185,13 +206,24 @@ fn follows_events_and_recovers_from_events_lost() {
     assert!(fake.calls.lock().unwrap().iter().any(|c| c == "focus w1:p1"));
 
     // `s` in the UI: a shell in a pane split below canopy's.
-    herdr::open_shell_pane_at(&sock, "w1:p9", std::path::Path::new("/w/repo")).unwrap();
+    herdr::open_shell_pane_at(&sock, "w1:p9", std::path::Path::new("/w/repo"), None).unwrap();
     assert!(
         fake.calls
             .lock()
             .unwrap()
             .iter()
             .any(|c| c == "split w1:p9 down /w/repo")
+    );
+    assert!(!fake.calls.lock().unwrap().iter().any(|c| c == "pane.send_input"));
+
+    // `t` in the UI: the same pane, with the git TUI typed into the new pane's shell.
+    herdr::open_shell_pane_at(&sock, "w1:p9", std::path::Path::new("/w/repo"), Some("lazygit")).unwrap();
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == r#"input w1:p10 " exec lazygit" Enter"#)
     );
 
     // herdr goes away: the feature hides.
@@ -209,6 +241,8 @@ fn follows_events_and_recovers_from_events_lost() {
         "focus w1:p1",
         "pane.split",
         "split w1:p9 down /w/repo",
+        "pane.send_input",
+        r#"input w1:p10 " exec lazygit" Enter"#,
     ];
     assert!(calls.iter().all(|c| allowed.contains(&c.as_str())), "{calls:?}");
     let _ = std::fs::remove_dir_all(&dir);

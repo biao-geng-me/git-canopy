@@ -1,6 +1,7 @@
-//! Loading diffs for the diff view: a commit (`git show`) or a worktree's uncommitted changes
-//! (`git diff-index HEAD` plus untracked files), split into an overview and one section per file.
-//! Runs off the UI thread.
+//! Loading diffs for the diff view: a commit (`git show`), a worktree's uncommitted changes
+//! (`git diff-index HEAD` plus untracked files), or everything a worktree changed since it forked
+//! from the base branch (`git diff-index <merge base>` plus untracked files), split into an
+//! overview and one section per file. Runs off the UI thread.
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -16,6 +17,19 @@ pub enum Target {
     Commit { dir: PathBuf, id: String },
     /// Uncommitted changes of the worktree at `path`.
     Worktree { path: PathBuf, has_head: bool },
+    /// Everything the worktree at `path` changed since its merge base with branch `base`:
+    /// commits and uncommitted changes together.
+    Branch { path: PathBuf, base: String },
+}
+
+impl Target {
+    /// The worktree whose working tree this diff reads (`None` for a commit).
+    pub fn worktree(&self) -> Option<&Path> {
+        match self {
+            Target::Worktree { path, .. } | Target::Branch { path, .. } => Some(path),
+            Target::Commit { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,22 +71,58 @@ pub fn load(target: &Target) -> Result<DiffDoc> {
             ];
             Ok(parse(&String::from_utf8_lossy(&git::run(dir, &args)?)))
         }
-        Target::Worktree { path, has_head } => worktree_diff(path, *has_head),
+        Target::Worktree { .. } | Target::Branch { .. } => {
+            let (wt, from) = worktree_base(target)?;
+            let mut doc = worktree_diff(&wt, &from)?;
+            if let Target::Branch { base, .. } = target {
+                let short = &from[..from.len().min(10)];
+                let mut intro = vec![
+                    format!("Everything changed since branching from {base} at {short}: commits and uncommitted"),
+                    "changes together, compared with the working tree.".into(),
+                ];
+                if doc.files.is_empty() {
+                    doc.overview.clear();
+                    intro.push(String::new());
+                    intro.push(format!("No changes since branching from {base}."));
+                } else if !doc.overview.is_empty() {
+                    intro.push(String::new());
+                }
+                doc.overview.splice(0..0, intro);
+            } else if doc.overview.is_empty() && doc.files.is_empty() {
+                doc.overview.push("No uncommitted changes.".into());
+            }
+            Ok(doc)
+        }
     }
 }
 
-fn worktree_diff(wt: &Path, has_head: bool) -> Result<DiffDoc> {
+/// The worktree and the commit a worktree target is compared against: HEAD (the empty tree on
+/// an unborn branch), or the merge base with the base branch.
+fn worktree_base(target: &Target) -> Result<(PathBuf, String)> {
+    match target {
+        Target::Worktree { path, has_head: true } => Ok((path.clone(), "HEAD".into())),
+        Target::Worktree { path, has_head: false } => Ok((path.clone(), empty_tree(path)?)),
+        Target::Branch { path, base } => {
+            let mb = git::changes::merge_base(path, base, "HEAD")?
+                .ok_or_else(|| anyhow::anyhow!("no history in common with {base}"))?;
+            Ok((path.clone(), mb))
+        }
+        Target::Commit { .. } => anyhow::bail!("not a worktree"),
+    }
+}
+
+/// The empty tree's id (computed, not written).
+fn empty_tree(dir: &Path) -> Result<String> {
+    let out = git::run(dir, &["hash-object", "-t", "tree", "--stdin"])?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Changes in the worktree `wt` relative to commit `from`, plus untracked files.
+fn worktree_diff(wt: &Path, from: &str) -> Result<DiffDoc> {
     // Plumbing on purpose: porcelain `git diff` refreshes and rewrites the index (taking
     // index.lock) when it finds stat-dirty files, even with --no-optional-locks. `diff-index`
     // never writes, and skips files whose content is unchanged.
-    let base = if has_head {
-        "HEAD".to_string()
-    } else {
-        // Unborn branch: compare against the empty tree (computed, not written).
-        let out = git::run(wt, &["hash-object", "-t", "tree", "--stdin"])?;
-        String::from_utf8_lossy(&out).trim().to_string()
-    };
-    let raw = git::run(wt, &["diff-index", "-p", "--stat", "-M", &base, "--"])?;
+    let raw = git::run(wt, &["diff-index", "-p", "--stat", "-M", from, "--"])?;
     let mut doc = parse(&String::from_utf8_lossy(&raw));
     while doc.overview.last().is_some_and(|l| l.is_empty()) {
         doc.overview.pop();
@@ -101,9 +151,6 @@ fn worktree_diff(wt: &Path, has_head: bool) -> Result<DiffDoc> {
                 }
             });
         }
-    }
-    if doc.overview.is_empty() && doc.files.is_empty() {
-        doc.overview.push("No uncommitted changes.".into());
     }
     Ok(doc)
 }
@@ -134,14 +181,10 @@ pub fn patch(target: &Target, file: Option<&str>) -> Result<String> {
             args.extend(spec);
             Ok(String::from_utf8_lossy(&git::run(dir, &args)?).into_owned())
         }
-        Target::Worktree { path, has_head } => {
-            let base = if *has_head {
-                "HEAD".to_string()
-            } else {
-                let out = git::run(path, &["hash-object", "-t", "tree", "--stdin"])?;
-                String::from_utf8_lossy(&out).trim().to_string()
-            };
-            let mut args = vec!["diff-index", "-p", "-M", "--no-color", "--no-ext-diff", &base, "--"];
+        Target::Worktree { .. } | Target::Branch { .. } => {
+            let (path, from) = worktree_base(target)?;
+            let path = &path;
+            let mut args = vec!["diff-index", "-p", "-M", "--no-color", "--no-ext-diff", &from, "--"];
             args.extend(spec);
             let mut out = String::from_utf8_lossy(&git::run(path, &args)?).into_owned();
             let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];

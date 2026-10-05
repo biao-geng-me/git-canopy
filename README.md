@@ -17,8 +17,10 @@ tree doing, and which ones are dirty?" on one screen:
 
 - **Worktrees** (bottom): one row per worktree: state marker, branch (or directory name when detached),
   staged `+`, modified `~`, untracked `?` and conflicted `!` counts, ahead/behind the base branch `↑↓`
-  and the upstream `⇡⇣`, in-progress operations (`MERGING`, `REBASING`, …), when its changed files
-  were last edited, its HEAD commit (sha, age) and its path.
+  and the upstream `⇡⇣`, in-progress operations (`MERGING`, `REBASING`, …), how much it changed since
+  it forked from the base branch (`+412 -38`, commits and uncommitted changes together), overlap
+  warnings (`⚠ feat-x`, see below), when its changed files were last edited, its HEAD commit (sha, age)
+  and its path.
 - **Graph** (top): the commit graph of all branches, remotes and tags, with authors. Each worktree's
   HEAD is labelled `[name]`, and a dirty worktree gets a `◌` "uncommitted" row right above its HEAD.
 - **Expand in place** (graph): `Space` (or a click) on a commit or a `◌` row unfolds its full
@@ -32,10 +34,18 @@ tree doing, and which ones are dirty?" on one screen:
   10 minutes, spread out one worktree at a time. `--no-poll` turns it off; `r` refreshes now.
   The footer shows e.g. `watching 8/9 · poll 60s`. Refreshing never blocks the UI.
 - **Details on demand:** `Enter` shows `git show` for a commit, or the uncommitted diff (including
-  untracked files) for a worktree.
+  untracked files) for a worktree. `b` shows everything a worktree changed since it forked from the
+  base branch, committed or not: what you'd review before merging an agent's work.
+- **Overlaps:** `⚠ feat-x` on a worktree row means another worktree (or the base branch, since this one
+  forked) changed some of the same files: a likely merge conflict, or two agents doing the same work.
+  The footer lists the files; in the diff view they are marked `⚠ also in feat-x`. Only each branch's
+  own work counts: what it got from the base branch, or from a branch it was built on, doesn't.
+- **Git TUI on demand:** `t` opens lazygit (or gitui, tig, `--git-tui`) in the selected worktree, the
+  same way `s` opens a shell, for when you do want to stage, commit or rebase.
 
 canopy is read-only. It never stages, commits or writes to the repository, and every git call runs with
-optional locks disabled, so it never contends with an agent for `index.lock`.
+optional locks disabled, so it never contends with an agent for `index.lock`. For changes, `t` hands
+you over to a git TUI.
 
 ## Install
 
@@ -63,6 +73,8 @@ git canopy [OPTIONS] [PATH]
       --no-poll           never poll; update on file system events and `r` only
       --no-watch          disable file system notifications, poll only
       --no-herdr          don't show herdr agent activity
+      --git-tui <CMD>     git TUI that `t` opens (default: $CANOPY_GIT_TUI, else the first of
+                          lazygit, gitui, tig on PATH)
 ```
 
 ### Keys
@@ -75,10 +87,12 @@ git canopy [OPTIONS] [PATH]
 | `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
 | `Esc` | fold the expansion under the cursor back to its row (on a folded row: fold everything) |
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
+| `b` | diff vs base: everything the worktree changed since it forked from the base branch |
 | `Tab` | switch between the graph, the worktree list and the shell (when one is open) |
 | `v` | stacked / side-by-side layout |
 | `a`, double-click an agent marker | herdr: jump to the worktree's agent pane |
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
+| `t` | open a git TUI (lazygit, gitui, tig) in that worktree, like a shell |
 | `y` + key | copy to the clipboard (see [Copying](#copying)) |
 | `r` | refresh now |
 | `?` | help |
@@ -107,6 +121,7 @@ The mouse works too: click to select, wheel to scroll.
 | `●` | clean |
 | `✎` | uncommitted changes |
 | `⚠` | conflicts or an operation in progress (merge, rebase, cherry-pick, …) |
+| `⚠ name` (light red, after the counts) | overlaps: `name` changed some of the same files |
 | `✗` | prunable: the worktree directory is gone |
 | `…` | status still loading |
 
@@ -123,8 +138,8 @@ inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns i
   agent, plus `×N` when several agents share a worktree; the graph's `[name]` labels get the same mark.
 - The footer sums it up: `herdr: 3 agents, 1 blocked`.
 - `a` (or a double-click on the marker) asks herdr to focus that worktree's agent pane. That and
-  opening a shell pane (below) are the only things canopy ever asks herdr to do; it never prompts,
-  sends keys to, starts or stops agents.
+  opening a shell or git TUI pane (below) are the only things canopy ever asks herdr to do; it never
+  prompts, sends keys to, starts or stops agents.
 
 An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
 of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, `HERDR_SESSION`, or
@@ -141,6 +156,9 @@ works:
 3. **An inset** in the lower half of the graph's space: a real terminal (your `$SHELL` on a pty).
    Keys go to the shell while it has focus; `Ctrl-]` hands them back to canopy, a click or `Tab`
    returns to it, and `exit` closes it. The mouse wheel scrolls its history. One inset shell at a time.
+
+`t` opens a git TUI the same way: the first of lazygit, gitui and tig found on PATH, or the command
+given with `--git-tui` / `CANOPY_GIT_TUI` (e.g. `"tig --all"`). Its pane closes when you quit it.
 
 ## Copying
 

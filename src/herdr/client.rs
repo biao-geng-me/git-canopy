@@ -55,19 +55,30 @@ pub fn focus_at(path: &Path, pane_id: &str) -> std::io::Result<()> {
     Rpc::connect(path)?.call("agent.focus", &params).map(|_| ())
 }
 
-/// Open a shell in `cwd` in a new herdr pane split below canopy's own pane. Only when canopy itself
-/// runs inside herdr (`HERDR_PANE_ID`), so the shell shows up right where the user is looking.
-pub fn open_shell_pane(cwd: &Path) -> std::io::Result<()> {
+/// Open a shell in `cwd` in a new herdr pane split below canopy's own pane, running `command` in
+/// it if given. Only when canopy itself runs inside herdr (`HERDR_PANE_ID`), so the pane shows up
+/// right where the user is looking.
+pub fn open_shell_pane(cwd: &Path, command: Option<&str>) -> std::io::Result<()> {
     let pane_id = std::env::var("HERDR_PANE_ID").map_err(|_| ErrorKind::NotFound)?;
     let path = socket_path().ok_or(ErrorKind::NotFound)?;
-    open_shell_pane_at(&path, &pane_id, cwd)
+    open_shell_pane_at(&path, &pane_id, cwd, command)
 }
 
-/// [`open_shell_pane`] below `pane_id` on the server at `path`.
-pub fn open_shell_pane_at(path: &Path, pane_id: &str, cwd: &Path) -> std::io::Result<()> {
-    Rpc::connect(path)?
-        .call("pane.split", &super::shell_split_params(pane_id, cwd))
-        .map(|_| ())
+/// [`open_shell_pane`] below `pane_id` on the server at `path`. `pane.split` has no command
+/// parameter, so a command is typed into the new pane's shell (as `exec`, so the pane closes when
+/// it exits): the only input canopy ever sends, and only to a pane it just created.
+pub fn open_shell_pane_at(path: &Path, pane_id: &str, cwd: &Path, command: Option<&str>) -> std::io::Result<()> {
+    let mut rpc = Rpc::connect(path)?;
+    let res = rpc.call("pane.split", &super::shell_split_params(pane_id, cwd))?;
+    if let Some(command) = command {
+        let new = res
+            .get("result")
+            .and_then(|r| r.get("pane"))
+            .and_then(|p| p.get_str("pane_id"))
+            .ok_or(ErrorKind::InvalidData)?;
+        rpc.call("pane.send_input", &super::run_params(new, command))?;
+    }
+    Ok(())
 }
 
 fn run(resolve: &dyn Fn() -> Option<PathBuf>, emit: &Emit) {

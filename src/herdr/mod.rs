@@ -253,6 +253,16 @@ pub fn shell_split_params(pane_id: &str, cwd: &Path) -> String {
     )
 }
 
+/// `pane.send_input` params that run `command` in a fresh shell pane: typed after a space (kept
+/// out of shell history) as `exec`, so the pane closes when the command exits.
+pub fn run_params(pane_id: &str, command: &str) -> String {
+    format!(
+        "{{\"pane_id\":{},\"text\":{},\"keys\":[\"Enter\"]}}",
+        json::quote(pane_id),
+        json::quote(&format!(" exec {command}"))
+    )
+}
+
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
@@ -425,6 +435,14 @@ mod tests {
             Some(PathBuf::from("/h/.config/herdr/herdr.sock"))
         );
         assert_eq!(socket_path_from(env(&[])), None);
+    }
+
+    #[test]
+    fn run_params_are_json() {
+        let p = Json::parse(&run_params("w1:p3", "lazygit -p \"x\"")).unwrap();
+        assert_eq!(p.get_str("pane_id"), Some("w1:p3"));
+        assert_eq!(p.get_str("text"), Some(" exec lazygit -p \"x\""));
+        assert_eq!(p.get("keys").and_then(Json::arr).map(<[Json]>::len), Some(1));
     }
 
     #[test]

@@ -29,9 +29,9 @@ use std::time::{Duration, Instant};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::fsinfo::{self, Events};
-use crate::git::{self, RepoPaths, log::Commit, refs::RefEntry};
+use crate::git::{self, RepoPaths, changes::FileChange, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
-use crate::model::{self, Snapshot, WorktreeView};
+use crate::model::{self, Changes, Overlap, Snapshot, WorktreeView};
 use trees::TreeWatch;
 
 /// Coalesce bursts of fs events (git writes several files per operation).
@@ -142,7 +142,15 @@ struct Worker {
     /// Hash of raw `worktree list` + `for-each-ref` output.
     fingerprint: u64,
     base: Option<String>,
+    base_sha: Option<String>,
     ab_cache: HashMap<(String, String), (u32, u32)>,
+    /// Merge base per (sorted) pair of commits; `None` for unrelated histories.
+    mb_cache: HashMap<(String, String), Option<String>>,
+    /// Files changed between two commits.
+    between_cache: HashMap<(String, String), Arc<Vec<FileChange>>>,
+    /// Merge base → working tree counts of each dirty worktree's changed paths, with the key
+    /// they were computed for (merge base, status, last edit).
+    dirty_cache: HashMap<PathBuf, (u64, Arc<Vec<FileChange>>)>,
     /// Commit time per HEAD sha.
     head_cache: HashMap<String, i64>,
 
@@ -176,7 +184,11 @@ impl Worker {
             refs: Vec::new(),
             fingerprint: 0,
             base: None,
+            base_sha: None,
             ab_cache: HashMap::new(),
+            mb_cache: HashMap::new(),
+            between_cache: HashMap::new(),
+            dirty_cache: HashMap::new(),
             head_cache: HashMap::new(),
             limit,
             commits: Arc::default(),
@@ -327,6 +339,10 @@ impl Worker {
         self.publish();
         self.refresh_graph();
         self.publish();
+        // What each branch changed and where they overlap: needs more git work, so last.
+        if self.refresh_changes() {
+            self.publish();
+        }
     }
 
     fn run(&mut self, rx: mpsc::Receiver<Msg>) {
@@ -395,6 +411,7 @@ impl Worker {
         }
         if changed {
             self.refresh_graph();
+            self.refresh_changes();
             self.publish();
         }
     }
@@ -421,6 +438,7 @@ impl Worker {
         self.schedule();
         self.refresh_status(None);
         self.refresh_graph();
+        self.refresh_changes();
         self.publish();
     }
 
@@ -503,6 +521,7 @@ impl Worker {
         }
         if changed {
             self.refresh_graph();
+            self.refresh_changes();
             self.publish();
         }
     }
@@ -542,6 +561,8 @@ impl Worker {
                     v.op = prev.op;
                     v.changed_at = prev.changed_at;
                     v.admin_dir = prev.admin_dir;
+                    v.changes = prev.changes;
+                    v.overlaps = prev.overlaps;
                 }
                 if v.admin_dir.is_none() && v.has_worktree() {
                     v.admin_dir = git::worktree::admin_dir(&v.path);
@@ -557,6 +578,7 @@ impl Worker {
                 .or_else(|| refs.iter().find(|r| &r.name == b))
                 .map(|r| r.target.clone())
         });
+        self.base_sha = base_sha.clone();
         if let Some(base_sha) = base_sha {
             let missing: Vec<String> = views
                 .iter()
@@ -695,6 +717,240 @@ impl Worker {
         }
     }
 
+    /// Recompute what each worktree changed since it forked from the base branch, and which
+    /// worktrees changed the same files. Git work is cached (merge bases and commit-to-commit
+    /// diffs never change; working-tree counts are keyed by status). Returns whether anything
+    /// visible changed.
+    fn refresh_changes(&mut self) -> bool {
+        let dir = self.repo_dir().to_path_buf();
+        for cache_len in [self.mb_cache.len(), self.between_cache.len(), self.dirty_cache.len()] {
+            if cache_len > 4096 {
+                self.mb_cache.clear();
+                self.between_cache.clear();
+                self.dirty_cache.clear();
+            }
+        }
+        let Some(base_sha) = self.base_sha.clone() else {
+            let mut changed = false;
+            for w in &mut self.worktrees {
+                changed |= w.changes.take().is_some() || !std::mem::take(&mut w.overlaps).is_empty();
+            }
+            return changed;
+        };
+
+        // Everything that takes part: worktrees with a HEAD and a status, plus the base branch
+        // itself when no worktree has it checked out.
+        struct Side {
+            wi: Option<usize>,
+            name: String,
+            path: Option<PathBuf>,
+            head: String,
+            /// Paths `git status` reports, untracked included.
+            dirty: Vec<String>,
+            is_base: bool,
+        }
+        let base_name = self.base.clone().unwrap_or_default();
+        let mut sides: Vec<Side> = self
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.has_worktree())
+            .filter_map(|(wi, w)| {
+                Some(Side {
+                    wi: Some(wi),
+                    name: w.name.clone(),
+                    path: Some(w.path.clone()),
+                    head: w.head.clone()?,
+                    dirty: w.status.as_ref()?.paths.clone(),
+                    is_base: w.branch.as_deref() == Some(&base_name),
+                })
+            })
+            .collect();
+        if !sides.iter().any(|s| s.is_base) {
+            sides.push(Side {
+                wi: None,
+                name: base_name,
+                path: None,
+                head: base_sha.clone(),
+                dirty: Vec::new(),
+                is_base: true,
+            });
+        }
+
+        // Where each side forked from the base branch, and where each pair's histories split.
+        let mut wanted: Vec<(String, String)> = sides.iter().map(|s| (base_sha.clone(), s.head.clone())).collect();
+        for (i, a) in sides.iter().enumerate() {
+            for b in &sides[i + 1..] {
+                wanted.push((a.head.clone(), b.head.clone()));
+            }
+        }
+        self.fill_merge_bases(&dir, wanted);
+        let fork: Vec<Option<String>> = sides.iter().map(|s| self.merge_base(&base_sha, &s.head)).collect();
+        let mut pairs: Vec<(usize, usize, String)> = Vec::new();
+        for i in 0..sides.len() {
+            for j in i + 1..sides.len() {
+                if let Some(x) = self.merge_base(&sides[i].head, &sides[j].head) {
+                    pairs.push((i, j, x));
+                }
+            }
+        }
+        // In a pair, a side's own work starts at the later of the split point and its fork from
+        // base: what it got from base isn't its work (unless it's the base branch itself), and
+        // what it shares with the other side (one built on the other) isn't either.
+        let wanted: Vec<(String, String)> = pairs
+            .iter()
+            .flat_map(|(i, j, x)| [(*i, x), (*j, x)])
+            .filter_map(|(k, x)| Some((x.clone(), fork[k].clone()?)))
+            .filter(|(x, f)| x != f)
+            .collect();
+        self.fill_merge_bases(&dir, wanted);
+        let start = |k: usize, x: &String| -> String {
+            match &fork[k] {
+                Some(f) if !sides[k].is_base && f != x && self.merge_base(x, f).as_ref() == Some(x) => f.clone(),
+                _ => x.clone(),
+            }
+        };
+        let pairs: Vec<(usize, usize, String, String)> = pairs
+            .iter()
+            .map(|(i, j, x)| (*i, *j, start(*i, x), start(*j, x)))
+            .collect();
+
+        // Commit-to-commit diffs: fork → HEAD for the sizes, own-work start → HEAD for overlaps.
+        let mut wanted: HashSet<(String, String)> = HashSet::new();
+        for (s, f) in sides.iter().zip(&fork) {
+            if let Some(f) = f {
+                wanted.insert((f.clone(), s.head.clone()));
+            }
+        }
+        for (i, j, from_i, from_j) in &pairs {
+            wanted.insert((from_i.clone(), sides[*i].head.clone()));
+            wanted.insert((from_j.clone(), sides[*j].head.clone()));
+        }
+        let missing: Vec<(String, String)> = wanted
+            .into_iter()
+            .filter(|k| !self.between_cache.contains_key(k))
+            .collect();
+        let found = par_map(&missing, PARALLELISM, |(from, to)| {
+            git::changes::between(&dir, from, to).ok()
+        });
+        for (k, v) in missing.into_iter().zip(found) {
+            if let Some(v) = v {
+                self.between_cache.insert(k, Arc::new(v));
+            }
+        }
+
+        // Uncommitted part: merge base → working tree, for the paths status reports (all paths
+        // when status had more than it lists).
+        let mut jobs: Vec<(PathBuf, String, Option<Vec<String>>, u64)> = Vec::new();
+        for (s, f) in sides.iter().zip(&fork) {
+            let (Some(wi), Some(f)) = (s.wi, f) else { continue };
+            let w = &self.worktrees[wi];
+            if !w.is_dirty() {
+                self.dirty_cache.remove(&w.path);
+                continue;
+            }
+            let mut h = DefaultHasher::new();
+            (f, &w.status, w.changed_at).hash(&mut h);
+            let key = h.finish();
+            if self.dirty_cache.get(&w.path).is_some_and(|(k, _)| *k == key) {
+                continue;
+            }
+            let truncated = s.dirty.len() >= git::status::MAX_PATHS;
+            jobs.push((w.path.clone(), f.clone(), (!truncated).then(|| s.dirty.clone()), key));
+        }
+        let found = par_map(&jobs, PARALLELISM, |(path, from, paths, _)| {
+            git::changes::worktree(path, from, paths.as_deref()).ok()
+        });
+        for ((path, _, _, key), v) in jobs.into_iter().zip(found) {
+            if let Some(v) = v {
+                self.dirty_cache.insert(path, (key, Arc::new(v)));
+            }
+        }
+
+        // Per worktree: committed + uncommitted counts.
+        let mut changes: Vec<Option<Arc<Changes>>> = vec![None; self.worktrees.len()];
+        for (s, f) in sides.iter().zip(&fork) {
+            let (Some(wi), Some(f)) = (s.wi, f) else { continue };
+            let Some(committed) = self.between_cache.get(&(f.clone(), s.head.clone())) else {
+                continue;
+            };
+            let w = &self.worktrees[wi];
+            let ch = match self.dirty_cache.get(&w.path).filter(|_| w.is_dirty()) {
+                Some((_, dirty)) => {
+                    let all = s.dirty.len() >= git::status::MAX_PATHS;
+                    Changes::merge(f.clone(), committed, dirty, (!all).then_some(&s.dirty[..]))
+                }
+                None => Changes::merge(f.clone(), committed, &[], Some(&[])),
+            };
+            changes[wi] = Some(match &w.changes {
+                Some(old) if **old == ch => old.clone(),
+                _ => Arc::new(ch),
+            });
+        }
+
+        // Overlaps: per pair, the files both sides changed in their own work (committed or not).
+        let touched = |s: &Side, from: &str| -> Option<Vec<String>> {
+            let committed = self.between_cache.get(&(from.to_string(), s.head.clone()))?;
+            let mut v: Vec<String> = committed.iter().map(|f| f.path.clone()).collect();
+            v.extend(s.dirty.iter().cloned());
+            Some(v)
+        };
+        let mut overlaps: Vec<Vec<Overlap>> = vec![Vec::new(); self.worktrees.len()];
+        for (i, j, from_i, from_j) in &pairs {
+            let (a, b) = (&sides[*i], &sides[*j]);
+            let (Some(ta), Some(tb)) = (touched(a, from_i), touched(b, from_j)) else {
+                continue;
+            };
+            let files = model::shared_files(&ta, &tb);
+            if files.is_empty() {
+                continue;
+            }
+            for (me, other) in [(a, b), (b, a)] {
+                if let Some(wi) = me.wi {
+                    overlaps[wi].push(Overlap {
+                        with: other.name.clone(),
+                        path: other.path.clone(),
+                        files: files.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut changed = false;
+        for ((w, ch), mut ov) in self.worktrees.iter_mut().zip(changes).zip(overlaps) {
+            ov.sort_by(|a, b| b.files.len().cmp(&a.files.len()).then_with(|| a.with.cmp(&b.with)));
+            changed |= w.changes != ch || w.overlaps != ov;
+            w.changes = ch;
+            w.overlaps = ov;
+        }
+        changed
+    }
+
+    /// Compute the merge bases of `pairs` that aren't cached yet (in parallel).
+    fn fill_merge_bases(&mut self, dir: &Path, pairs: Vec<(String, String)>) {
+        let missing: Vec<(String, String)> = pairs
+            .into_iter()
+            .map(|(a, b)| sorted_pair(a, b))
+            .filter(|k| k.0 != k.1 && !self.mb_cache.contains_key(k))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let found = par_map(&missing, PARALLELISM, |(a, b)| {
+            git::changes::merge_base(dir, a, b).unwrap_or(None)
+        });
+        self.mb_cache.extend(missing.into_iter().zip(found));
+    }
+
+    fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        if a == b {
+            return Some(a.to_string());
+        }
+        self.mb_cache
+            .get(&sorted_pair(a.to_string(), b.to_string()))
+            .cloned()
+            .flatten()
+    }
+
     fn publish(&self) {
         let repo_name = self
             .worktrees
@@ -750,6 +1006,10 @@ fn watch_dirs(watcher: &mut RecommendedWatcher, ignored: Vec<PathBuf>, dirs: Vec
         tw.dirs.insert(d);
     }
     Some(tw)
+}
+
+fn sorted_pair(a: String, b: String) -> (String, String) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// Newest mtime among the changed paths (deleted files are skipped), as unix seconds.

@@ -25,6 +25,8 @@ pub const C_DIM: Color = Color::DarkGray;
 const C_REMOTE: Color = Color::Red;
 /// Commit hashes: a muted yellow (dark goldenrod), present but quieter than the subject.
 const C_HASH: Color = Color::Indexed(136);
+/// Overlapping changes between worktrees: a likely conflict, softer than the red of real ones.
+pub const C_OVERLAP: Color = Color::LightRed;
 const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
 
@@ -135,6 +137,10 @@ struct WtRow {
     agent: Vec<Span<'static>>,
     counts: Vec<Span<'static>>,
     ab: Vec<Span<'static>>,
+    /// `+412 -38` since forking from the base branch (wide rows only).
+    size: Vec<Span<'static>>,
+    /// `⚠ feat-x +1` (wide) or `⚠2`: worktrees that changed the same files.
+    overlap: Vec<Span<'static>>,
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -235,6 +241,46 @@ fn ab_spans(w: &WorktreeView, base: Option<&str>) -> Vec<Span<'static>> {
     spaced
 }
 
+/// What a worktree changed since forking from the base branch: `+412 -38` (empty when nothing).
+fn size_spans(w: &WorktreeView) -> Vec<Span<'static>> {
+    let Some(ch) = &w.changes else { return Vec::new() };
+    let k = |n: u64| {
+        if n >= 10_000 {
+            format!("{}k", n / 1000)
+        } else {
+            n.to_string()
+        }
+    };
+    let mut out = Vec::new();
+    if ch.adds > 0 {
+        out.push(Span::styled(format!("+{}", k(ch.adds)), Style::new().fg(Color::Green)));
+    }
+    if ch.dels > 0 {
+        if !out.is_empty() {
+            out.push(Span::raw(" "));
+        }
+        out.push(Span::styled(format!("-{}", k(ch.dels)), Style::new().fg(Color::Red)));
+    }
+    out
+}
+
+/// Other worktrees that changed the same files: `⚠ feat-x +1` when `wide`, else `⚠2`.
+fn overlap_spans(w: &WorktreeView, wide: bool) -> Vec<Span<'static>> {
+    let Some(first) = w.overlaps.first() else {
+        return Vec::new();
+    };
+    let style = Style::new().fg(C_OVERLAP);
+    let n = w.overlaps.len();
+    if !wide {
+        return vec![Span::styled(format!("⚠{n}"), style)];
+    }
+    let mut out = vec![Span::styled(format!("⚠ {}", truncate(&first.with, 20)), style)];
+    if n > 1 {
+        out.push(Span::styled(format!(" +{}", n - 1), Style::new().fg(C_DIM)));
+    }
+    out
+}
+
 /// Marker for the agents in a worktree: `◆ blocked`, `▶ working ×2`, … (glyph only when not
 /// `wide`). Blocked is bold red: the agent needs the user.
 pub fn agent_spans(act: herdr::Activity, wide: bool) -> Vec<Span<'static>> {
@@ -278,6 +324,8 @@ fn wt_rows(app: &App, wide: bool) -> Vec<WtRow> {
                 agent: app.agent_activity(wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
                 counts: count_spans(w),
                 ab: ab_spans(w, base),
+                size: if wide { size_spans(w) } else { Vec::new() },
+                overlap: overlap_spans(w, wide),
             }
         })
         .collect()
@@ -298,9 +346,17 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
     let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
+    let overlap = rows.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
     // side margins + marker + gaps
-    let natural =
-        2 + 2 + name + 1 + if agent > 0 { agent + 1 } else { 0 } + counts + if ab > 0 { 1 + ab } else { 0 } + 1;
+    let natural = 2
+        + 2
+        + name
+        + 1
+        + if agent > 0 { agent + 1 } else { 0 }
+        + counts
+        + if ab > 0 { 1 + ab } else { 0 }
+        + if overlap > 0 { 1 + overlap } else { 0 }
+        + 1;
     let max = total as usize * 45 / 100;
     natural.max(24).min(max) as u16
 }
@@ -335,6 +391,10 @@ struct WtCols {
     agent: usize,
     counts: usize,
     ab: usize,
+    /// Change size column (wide rows only).
+    size: usize,
+    /// Overlap marker column (0 when no worktree overlaps another).
+    overlap: usize,
     /// "edited 3m" column (wide rows only).
     activity: usize,
     /// Path column (wide rows only).
@@ -408,16 +468,29 @@ fn wt_line(
     }
     let cw = spans_width(&row.counts);
     spans.extend(row.counts);
-    if cols.ab > 0 || wide {
+    if cols.ab > 0 || cols.overlap > 0 || wide {
         spans.push(Span::raw(" ".repeat(cols.counts - cw + 1)));
         let aw = spans_width(&row.ab);
         spans.extend(row.ab);
         if wide {
             spans.push(Span::raw(" ".repeat(cols.ab - aw + 2)));
+        } else if cols.overlap > 0 {
+            spans.push(Span::raw(" ".repeat(cols.ab - aw + usize::from(cols.ab > 0))));
         }
     }
     if !wide {
+        spans.extend(row.overlap);
         return (Line::from(spans), fields);
+    }
+    if cols.size > 0 {
+        let sw = spans_width(&row.size);
+        spans.extend(row.size);
+        spans.push(Span::raw(" ".repeat(cols.size - sw + 2)));
+    }
+    if cols.overlap > 0 {
+        let ow = spans_width(&row.overlap);
+        spans.extend(row.overlap);
+        spans.push(Span::raw(" ".repeat(cols.overlap - ow + 2)));
     }
 
     // Wide rows: last edit, HEAD commit (sha, age), path on the right.
@@ -518,7 +591,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
     let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
     let name_natural = rows.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
-    let fixed = 2 + 1 + counts + if ab > 0 { 1 + ab } else { 0 };
+    let size = rows.iter().map(|r| spans_width(&r.size)).max().unwrap_or(0);
+    let overlap = rows.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
+    let fixed = 2
+        + 1
+        + counts
+        + if ab > 0 { 1 + ab } else { 0 }
+        + if size > 0 { 2 + size } else { 0 }
+        + if overlap > 0 { 2 + overlap } else { 0 };
     let activity = if wide {
         app.snap
             .worktrees
@@ -559,6 +639,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
         agent,
         counts,
         ab,
+        size,
+        overlap,
         activity,
         path,
     };
@@ -917,6 +999,32 @@ fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
         }
         _ => {}
     }
+    if let Some(ch) = &w.changes
+        && !ch.files.is_empty()
+    {
+        spans.push(sep());
+        let n = ch.files.len();
+        spans.push(Span::raw(format!("{n} file{} ", if n == 1 { "" } else { "s" })));
+        spans.extend(add_del_spans(ch.adds as usize, ch.dels as usize));
+        spans.push(Span::styled(" since fork", dim));
+    }
+    if !w.overlaps.is_empty() {
+        // `⚠ feat-x: src/a.rs, src/b.rs +2 · main: README.md`
+        spans.push(sep());
+        let style = Style::new().fg(C_OVERLAP);
+        spans.push(Span::styled("⚠ ", style));
+        for (i, o) in w.overlaps.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", dim));
+            }
+            spans.push(Span::styled(format!("{}: ", o.with), style));
+            let shown: Vec<&str> = o.files.iter().take(3).map(String::as_str).collect();
+            spans.push(Span::raw(shown.join(", ")));
+            if o.files.len() > 3 {
+                spans.push(Span::styled(format!(" +{}", o.files.len() - 3), dim));
+            }
+        }
+    }
     if watching && !w.watched && w.has_worktree() {
         spans.push(sep());
         spans.push(Span::styled("not watched: polled", dim));
@@ -1137,6 +1245,22 @@ fn add_del_spans(adds: usize, dels: usize) -> Vec<Span<'static>> {
 }
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
+    // Files that other worktrees changed too (for a worktree's diff): file → their names.
+    let overlapping: std::collections::HashMap<String, Vec<String>> = app
+        .diff
+        .as_ref()
+        .and_then(|d| d.target.worktree())
+        .and_then(|p| app.snap.worktrees.iter().find(|w| w.path == p))
+        .map(|w| {
+            let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
+            for o in &w.overlaps {
+                for file in &o.files {
+                    m.entry(file.clone()).or_default().push(o.with.clone());
+                }
+            }
+            m
+        })
+        .unwrap_or_default();
     let Some(d) = app.diff.as_mut() else { return };
     let dim = Style::new().fg(C_DIM);
     let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -1201,7 +1325,22 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                         Span::raw(path),
                         Span::raw("  "),
                     ];
+                    let cw = spans_width(&counts);
                     spans.extend(counts);
+                    let also = overlapping.get(&file.path).or_else(|| {
+                        // An untracked directory in the overlap stands for the files under it.
+                        overlapping
+                            .iter()
+                            .find(|(k, _)| k.ends_with('/') && file.path.starts_with(k.as_str()))
+                            .map(|(_, v)| v)
+                    });
+                    if let Some(names) = also {
+                        spans.push(Span::raw(" ".repeat(counts_w - cw + 2)));
+                        spans.push(Span::styled(
+                            format!("⚠ also in {}", names.join(", ")),
+                            Style::new().fg(C_OVERLAP),
+                        ));
+                    }
                     Line::from(spans)
                 }
             })
@@ -1264,8 +1403,8 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
     let [details, hints] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let Some(d) = &app.diff else { return };
     let mut msg = match &d.target {
-        crate::diff::Target::Worktree { path, .. } => tilde(path),
         crate::diff::Target::Commit { id, .. } => id.clone(),
+        t => t.worktree().map(tilde).unwrap_or_default(),
     };
     if d.hscroll > 0 {
         msg.push_str(&format!("  ·  scrolled right {} columns", d.hscroll));
@@ -1311,10 +1450,10 @@ fn draw_shell(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(shell) = app.shell.as_mut() else { return };
     let focused = app.shell_focus;
     let dim = Style::new().fg(C_DIM);
-    let hint = if focused {
-        " Ctrl-] back to canopy · exit to close "
-    } else {
-        " click or Tab to type "
+    let hint = match (focused, shell.label.as_str()) {
+        (true, "shell") => " Ctrl-] back to canopy · exit to close ".to_string(),
+        (true, label) => format!(" Ctrl-] back to canopy · quit {label} to close "),
+        (false, _) => " click or Tab to type ".to_string(),
     };
     // `── shell · feat-auth ~/…/wt/feat-auth ──── hint`, the path shortened to fit.
     let name = app
@@ -1323,7 +1462,7 @@ fn draw_shell(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .find(|w| w.path == shell.term.path)
         .map(|w| w.name.clone());
-    let mut title = vec![Span::raw(" shell ")];
+    let mut title = vec![Span::raw(format!(" {} ", shell.label))];
     if let Some(n) = &name {
         title.push(Span::styled("· ", dim));
         title.push(Span::styled(format!("{n} "), Style::new().add_modifier(Modifier::BOLD)));
@@ -1398,14 +1537,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.shell_focus {
-        let line = Line::from(vec![
-            Span::raw(" "),
-            key("Ctrl-]"),
-            text(" back to canopy  "),
-            key("exit"),
-            text(" close the shell  "),
-            text("keys go to the shell"),
-        ]);
+        let label = app.shell.as_ref().map_or("shell", |s| s.label.as_str());
+        let mut spans = vec![Span::raw(" "), key("Ctrl-]"), text(" back to canopy  ")];
+        if label == "shell" {
+            spans.extend([key("exit"), text(" close the shell  "), text("keys go to the shell")]);
+        } else {
+            spans.push(Span::styled(
+                format!("quit {label} to close it  keys go to {label}"),
+                Style::new().fg(C_DIM),
+            ));
+        }
+        let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), hints);
         return;
     }
@@ -1431,6 +1573,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         text(" expand  "),
         key("Enter"),
         text(" full diff  "),
+        key("b"),
+        text(" vs base  "),
+        key("t"),
+        text(" git TUI  "),
         key("Tab"),
         text(" panel  "),
         key("v"),
@@ -1481,6 +1627,8 @@ const HELP: &[(&str, &str)] = &[
     ("v", "stacked / side-by-side layout"),
     ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
     ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
+    ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
+    ("b", "diff vs base: all changes since the fork"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("y y", "copy the sha / path / file under the cursor"),
     ("y h  y s", "copy sha / short sha"),

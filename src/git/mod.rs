@@ -3,6 +3,7 @@
 //! Every invocation goes through [`command`], which disables optional locks so that reading status
 //! never takes `index.lock` while an agent is committing. Nothing here writes to the repository.
 
+pub mod changes;
 pub mod log;
 pub mod refs;
 pub mod status;
