@@ -27,7 +27,7 @@ OPTIONS:
     -V, --version           print version
 
 KEYS:
-    ↑↓/jk move · Space expand · Enter full diff · Tab switch panel · v layout · ? help · q quit
+    ↑↓/jk move · Space expand · Enter full diff · Tab switch panel · v layout · y copy · ? help · q quit
 ";
 
 struct Args {

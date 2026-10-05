@@ -4,6 +4,7 @@
 //! Both overview panels are expandable lists (see [`inset`]): a row expands in place into its
 //! diff summary, a file into its diff, and Enter opens the full-screen [`DiffView`].
 
+pub mod copy;
 mod diff_view;
 mod inset;
 mod render;
@@ -55,6 +56,12 @@ pub enum UiMsg {
     TermExited(u64),
     /// Neither herdr nor tmux could split a pane for a shell in this worktree: use the inset.
     ShellInset(PathBuf),
+    /// A copy finished: the footer notice, and the OSC 52 sequence to write when no clipboard
+    /// program or tmux took the text.
+    Copied {
+        notice: String,
+        osc52: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +215,9 @@ pub struct App {
     pub shell_focus: bool,
     /// A one-off message for the footer, cleared by the next key or click.
     pub notice: Option<String>,
+    /// `y` was pressed: the next key picks what to copy.
+    pub copy_pending: bool,
+    clipboard: Vec<crate::clipboard::Method>,
     /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
     next_id: u64,
@@ -240,6 +250,8 @@ impl App {
             shell: None,
             shell_focus: false,
             notice: None,
+            copy_pending: false,
+            clipboard: crate::clipboard::methods(),
             with_herdr: true,
             next_id: 0,
             tx,
@@ -574,18 +586,35 @@ impl App {
                 }
             }
             UiMsg::ShellInset(path) => self.open_shell_inset(&path),
+            UiMsg::Copied { notice, osc52 } => {
+                if let Some(seq) = osc52 {
+                    // Between frames, so it can't land inside ratatui's output.
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(seq.as_bytes()).and_then(|()| out.flush());
+                }
+                self.notice = Some(notice);
+            }
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
                     d.loaded(result);
                 }
             }
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                match self.diff.as_mut() {
-                    Some(d) if !self.help => {
-                        let action = d.on_key(k);
-                        self.diff_action(action);
+                if std::mem::take(&mut self.copy_pending) {
+                    self.on_copy_key(k);
+                } else if self.starts_copy(k) {
+                    self.notice = None;
+                    self.copy_pending = true;
+                } else {
+                    match self.diff.as_mut() {
+                        Some(d) if !self.help => {
+                            self.notice = None;
+                            let action = d.on_key(k);
+                            self.diff_action(action);
+                        }
+                        _ => self.on_key(k),
                     }
-                    _ => self.on_key(k),
                 }
                 self.rebuild();
             }

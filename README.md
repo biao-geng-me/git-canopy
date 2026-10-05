@@ -79,6 +79,7 @@ git canopy [OPTIONS] [PATH]
 | `v` | stacked / side-by-side layout |
 | `a`, double-click an agent marker | herdr: jump to the worktree's agent pane |
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
+| `y` + key | copy to the clipboard (see [Copying](#copying)) |
 | `r` | refresh now |
 | `?` | help |
 | `q`, `Ctrl-C` | quit |
@@ -140,6 +141,26 @@ works:
 3. **An inset** in the lower half of the graph's space: a real terminal (your `$SHELL` on a pty).
    Keys go to the shell while it has focus; `Ctrl-]` hands them back to canopy, a click or `Tab`
    returns to it, and `exit` closes it. The mouse wheel scrolls its history. One inset shell at a time.
+
+## Copying
+
+`y` followed by a key copies something about the line under the cursor (or the open diff) to the
+system clipboard; while `y` waits, the footer lists what is available there.
+
+| Keys | Copies |
+| --- | --- |
+| `yy` | the obvious thing: the file on a file line, the sha on a commit, the path on a worktree |
+| `yh` / `ys` | full / short commit sha (a worktree's HEAD) |
+| `yb` | branch name |
+| `ym` / `yM` | commit subject / full message |
+| `yp` | worktree path |
+| `yf` | file path (on a file, or the file open in the diff view) |
+| `yd` | the diff, as a patch `git apply` accepts: the commit, the worktree's uncommitted changes (untracked files included), or just the file under the cursor |
+
+The text goes to a local clipboard program when there is one (`clip.exe` on WSL, `pbcopy`,
+`wl-copy`, `xclip`, `xsel`), else into tmux's buffer (`tmux load-buffer -w`, which tmux passes on to
+the terminal's clipboard), else straight to the terminal as an OSC 52 escape sequence, which most
+terminals support and which also works over SSH.
 
 ## Notes
 

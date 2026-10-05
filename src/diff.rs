@@ -108,6 +108,91 @@ fn worktree_diff(wt: &Path, has_head: bool) -> Result<DiffDoc> {
     Ok(doc)
 }
 
+/// Untracked files bigger than this are left out of a copied patch.
+const MAX_PATCH_UNTRACKED_BYTES: u64 = 1024 * 1024;
+
+/// Raw diff text of `target` for copying, limited to `file` if given: `git show` output for a
+/// commit; for a worktree the `diff-index` patch plus untracked files as new-file sections, in a
+/// form `git apply` accepts. Unlike [`load`]'s lines, nothing is sanitized or truncated.
+pub fn patch(target: &Target, file: Option<&str>) -> Result<String> {
+    let spec = file.map(|f| format!(":(literal){f}"));
+    let spec = spec.as_deref();
+    match target {
+        Target::Commit { dir, id } => {
+            // A single file without the commit header, so it pastes as a plain patch.
+            let format = if file.is_some() { "--format=" } else { "--format=medium" };
+            let mut args = vec![
+                "show",
+                "--no-show-signature",
+                "--no-color",
+                "--no-ext-diff",
+                format,
+                "-p",
+                id,
+                "--",
+            ];
+            args.extend(spec);
+            Ok(String::from_utf8_lossy(&git::run(dir, &args)?).into_owned())
+        }
+        Target::Worktree { path, has_head } => {
+            let base = if *has_head {
+                "HEAD".to_string()
+            } else {
+                let out = git::run(path, &["hash-object", "-t", "tree", "--stdin"])?;
+                String::from_utf8_lossy(&out).trim().to_string()
+            };
+            let mut args = vec!["diff-index", "-p", "-M", "--no-color", "--no-ext-diff", &base, "--"];
+            args.extend(spec);
+            let mut out = String::from_utf8_lossy(&git::run(path, &args)?).into_owned();
+            let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+            args.extend(spec);
+            let raw = git::run(path, &args)?;
+            for name in git::split_nul(&raw).map(git::lossy) {
+                out.push_str(&untracked_patch(path, &name));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// An untracked file as a `git apply`-able new-file section (binary and huge files only noted).
+fn untracked_patch(wt: &Path, name: &str) -> String {
+    let mut out = format!("diff --git a/{name} b/{name}\nnew file mode 100644\n");
+    let read = std::fs::File::open(wt.join(name)).and_then(|f| {
+        let size = f.metadata()?.len();
+        let mut buf = Vec::new();
+        f.take(MAX_PATCH_UNTRACKED_BYTES + 1).read_to_end(&mut buf)?;
+        Ok((size, buf))
+    });
+    let text = match read {
+        Ok((size, _)) if size > MAX_PATCH_UNTRACKED_BYTES => Err(format!("{size} bytes, not included")),
+        Ok((_, buf)) => match String::from_utf8(buf) {
+            Ok(t) if !t.contains('\0') => Ok(t),
+            _ => Err("binary, not included".into()),
+        },
+        Err(e) => Err(format!("cannot read: {e}")),
+    };
+    match text {
+        Ok(t) if t.is_empty() => {}
+        Ok(t) => {
+            // Lines keep their own endings (CRLF files stay CRLF, so the patch still applies).
+            let lines: Vec<&str> = t.split_inclusive('\n').collect();
+            let _ = write!(out, "--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n", lines.len());
+            for l in lines {
+                out.push('+');
+                out.push_str(l);
+            }
+            if !t.ends_with('\n') {
+                out.push_str("\n\\ No newline at end of file\n");
+            }
+        }
+        Err(note) => {
+            let _ = writeln!(out, "# untracked file ({note})");
+        }
+    }
+    out
+}
+
 /// An untracked file as a new-file section, read directly from disk (no git process per file).
 fn untracked_file(wt: &Path, name: &str) -> FileDiff {
     let mut out = format!("diff --git a/{name} b/{name}\nnew file (untracked)\n");

@@ -49,11 +49,12 @@ fn refresh_and_diff_leave_index_untouched() {
     }
     drop(h);
     for wt in &wts {
-        diff::load(&Target::Worktree {
+        let target = Target::Worktree {
             path: wt.clone(),
             has_head: true,
-        })
-        .unwrap();
+        };
+        diff::load(&target).unwrap();
+        diff::patch(&target, None).unwrap(); // `yd`
     }
 
     let after: Vec<_> = wts.iter().map(|w| index_state(w)).collect();

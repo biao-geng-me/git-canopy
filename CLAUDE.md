@@ -211,6 +211,17 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   Tested live: the inset in a private tmux, the herdr split in a fully separate herdr instance
   (relative `HOME` under the scratchpad), agent focus and the split request against a fake socket
   server.
+- **Copying (`y` chords):** `y` then a key (`y` obvious thing, `h`/`s` sha, `b` branch, `m`/`M`
+  subject/message, `p` path, `f` file, `d` diff) copies from the line under the cursor or the open
+  diff (`ui/copy.rs`, `CopyCtx`); the footer lists what's available while `y` is pending. Text is
+  produced and handed over off the UI thread (message via `git log -1 --format=%B`, diffs via
+  `diff::patch`, which returns raw `git apply`-able text — the view's lines are sanitized, tabs
+  expanded — with untracked files as new-file sections). Delivery (`clipboard.rs`, no deps), first
+  that works: a local program (`clip.exe` fed UTF-16LE *without* BOM — verified: with one the BOM
+  ends up in the clipboard; `pbcopy`, `wl-copy`, `xclip`, `xsel`; skipped over SSH), `tmux
+  load-buffer -w -`, else OSC 52, which only the UI thread writes (between frames). Tested live:
+  tmux buffer, OSC 52 caught by a private tmux with `set-clipboard on`, and `clip.exe` read back
+  with PowerShell's `Get-Clipboard`.
 - **Worktree row fields are clickable:** render records each row's agent-marker and path column
   ranges (`App::wt_fields`); a double-click on them focuses the agent / opens a shell, anywhere else
   opens the diff as before.

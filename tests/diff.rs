@@ -73,3 +73,62 @@ fn commit_and_worktree_diffs() {
     assert_eq!(doc.overview, ["No uncommitted changes."]);
     assert!(doc.files.is_empty());
 }
+
+/// `git apply -R --check` of `patch` in `wt`: the patch describes exactly what is there.
+fn reverse_applies(wt: &std::path::Path, patch: &str) -> bool {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["apply", "-R", "--check", "-"])
+        .current_dir(wt)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(patch.as_bytes()).unwrap();
+    child.wait().unwrap().success()
+}
+
+#[test]
+fn copied_patches_are_real_patches() {
+    let fx = common::Fixture::new();
+    let wt = fx.wt("feat-auth");
+    // A CRLF untracked file without a final newline must survive too.
+    std::fs::write(wt.join("crlf.txt"), "one\r\ntwo").unwrap();
+    let target = Target::Worktree {
+        path: wt.clone(),
+        has_head: true,
+    };
+
+    let all = diff::patch(&target, None).unwrap();
+    for f in ["src/auth.rs", "src/session.rs", "notes.md", "crlf.txt"] {
+        assert!(all.contains(&format!("diff --git a/{f} b/{f}")), "{f} in\n{all}");
+    }
+    assert!(all.contains("+two\n\\ No newline at end of file\n"));
+    assert!(reverse_applies(&wt, &all), "whole worktree patch:\n{all}");
+
+    // One file: tracked, or untracked.
+    let one = diff::patch(&target, Some("src/auth.rs")).unwrap();
+    assert_eq!(one.matches("diff --git").count(), 1);
+    assert!(reverse_applies(&wt, &one));
+    let one = diff::patch(&target, Some("notes.md")).unwrap();
+    assert!(one.starts_with("diff --git a/notes.md b/notes.md\nnew file mode 100644\n"));
+    assert!(reverse_applies(&wt, &one));
+
+    // A commit: `git show` with its header; one file without it.
+    let common_dir = git::discover(&fx.repo()).unwrap().common_dir;
+    let (wts, _) = git::worktree::list(&fx.repo()).unwrap();
+    let id = wts
+        .iter()
+        .find(|w| w.path.ends_with("refactor-db"))
+        .and_then(|w| w.head.clone())
+        .unwrap();
+    let target = Target::Commit {
+        dir: common_dir,
+        id: id.clone(),
+    };
+    let all = diff::patch(&target, None).unwrap();
+    assert!(all.starts_with(&format!("commit {id}")));
+    assert!(all.contains("+// step 4"));
+    let one = diff::patch(&target, Some("src/db.rs")).unwrap();
+    assert!(one.starts_with("diff --git a/src/db.rs b/src/db.rs"), "{one}");
+}

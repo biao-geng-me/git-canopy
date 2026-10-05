@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::copy;
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
 use super::{App, Focus, InsetText, LayoutMode, WtFields};
@@ -1269,10 +1270,15 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
     if d.hscroll > 0 {
         msg.push_str(&format!("  ·  scrolled right {} columns", d.hscroll));
     }
-    f.render_widget(
-        Paragraph::new(Span::styled(format!(" {msg}"), Style::new().fg(C_DIM))),
-        details,
-    );
+    let details_line = match &app.notice {
+        Some(n) => Span::styled(format!(" {n}"), Style::new().fg(C_MODIFIED)),
+        None => Span::styled(format!(" {msg}"), Style::new().fg(C_DIM)),
+    };
+    f.render_widget(Paragraph::new(details_line), details);
+    if app.copy_pending {
+        f.render_widget(Paragraph::new(copy_hints(app)), hints);
+        return;
+    }
 
     let key = |k: &'static str| Span::styled(k, Style::new().fg(Color::Cyan));
     let text = |t: &'static str| Span::styled(t, Style::new().fg(C_DIM));
@@ -1292,6 +1298,8 @@ fn draw_diff_footer(f: &mut Frame, app: &App, area: Rect) {
         text(" pan  "),
         key("r"),
         text(" reload  "),
+        key("y"),
+        text(" copy  "),
         key("q"),
         text(" back"),
     ]);
@@ -1385,6 +1393,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             details,
         );
     }
+    if app.copy_pending {
+        f.render_widget(Paragraph::new(copy_hints(app)), hints);
+        return;
+    }
     if app.shell_focus {
         let line = Line::from(vec![
             Span::raw(" "),
@@ -1423,6 +1435,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         text(" panel  "),
         key("v"),
         text(" layout  "),
+        key("y"),
+        text(" copy  "),
         key("?"),
         text(" help  "),
         key("q"),
@@ -1435,6 +1449,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if left_width + spans_width(&right) < hints.width as usize {
         f.render_widget(Paragraph::new(Line::from(right).right_aligned()), hints);
     }
+}
+
+/// The footer while a `y` chord is pending: what each second key would copy here.
+fn copy_hints(app: &App) -> Line<'static> {
+    let ctx = app.copy_ctx();
+    let key = |k: String| Span::styled(k, Style::new().fg(Color::Cyan));
+    let text = |t: String| Span::styled(t, Style::new().fg(C_DIM));
+    let mut spans = vec![Span::styled(" copy ", Style::new().add_modifier(Modifier::BOLD))];
+    if let Some(d) = ctx.default {
+        spans.extend([key("y".into()), text(format!(" {}  ", d.label()))]);
+    }
+    for (c, field) in copy::FIELDS {
+        if ctx.has(field) {
+            spans.extend([key(c.to_string()), text(format!(" {}  ", field.label()))]);
+        }
+    }
+    spans.extend([key("Esc".into()), text(" cancel".into())]);
+    Line::from(spans)
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -1450,6 +1482,10 @@ const HELP: &[(&str, &str)] = &[
     ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
     ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
+    ("y y", "copy the sha / path / file under the cursor"),
+    ("y h  y s", "copy sha / short sha"),
+    ("y b  y m  y M", "copy branch / subject / message"),
+    ("y p  y f  y d", "copy worktree path / file path / diff"),
     ("r", "refresh now"),
     ("?", "toggle this help"),
     ("q  Ctrl-C", "quit"),
