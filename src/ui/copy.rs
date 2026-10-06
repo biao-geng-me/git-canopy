@@ -158,7 +158,9 @@ impl App {
                 Some(id.clone()),
                 Field::Sha,
             ),
-            diff::Target::Worktree { path, .. } | diff::Target::Branch { path, .. } => {
+            diff::Target::Worktree { path, .. }
+            | diff::Target::Branch { path, .. }
+            | diff::Target::Overlaps { path, .. } => {
                 let wi = wts.iter().position(|w| &w.path == path);
                 (wi, wi.and_then(|wi| wts[wi].head.clone()), Field::Path)
             }

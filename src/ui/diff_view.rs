@@ -241,6 +241,7 @@ mod tests {
             adds: n,
             dels: 0,
             lines: (0..n).map(|i| format!("+{i}")).collect(),
+            note: None,
         }
     }
 

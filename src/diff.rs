@@ -1,7 +1,8 @@
 //! Loading diffs for the diff view: a commit (`git show`), a worktree's uncommitted changes
 //! (`git diff-index HEAD` plus untracked files), or everything a worktree changed since it forked
-//! from the base branch (`git diff-index <merge base>` plus untracked files), split into an
-//! overview and one section per file. Runs off the UI thread.
+//! from the base branch (`git diff-index <merge base>` plus untracked files), or what a worktree
+//! and the others it overlaps with each did to their shared files, split into an overview and
+//! one section per file. Runs off the UI thread.
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::git;
+use crate::model::Overlap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -20,13 +22,20 @@ pub enum Target {
     /// Everything the worktree at `path` changed since its merge base with branch `base`:
     /// commits and uncommitted changes together.
     Branch { path: PathBuf, base: String },
+    /// The files the worktree at `path` (named `name`) and other worktrees (or the base branch)
+    /// both changed: per shared file, what each side did to it in its own work.
+    Overlaps {
+        path: PathBuf,
+        name: String,
+        overlaps: Vec<Overlap>,
+    },
 }
 
 impl Target {
     /// The worktree whose working tree this diff reads (`None` for a commit).
     pub fn worktree(&self) -> Option<&Path> {
         match self {
-            Target::Worktree { path, .. } | Target::Branch { path, .. } => Some(path),
+            Target::Worktree { path, .. } | Target::Branch { path, .. } | Target::Overlaps { path, .. } => Some(path),
             Target::Commit { .. } => None,
         }
     }
@@ -41,6 +50,8 @@ pub struct FileDiff {
     pub dels: usize,
     /// The file's section, starting with its `diff --git` header.
     pub lines: Vec<String>,
+    /// Shown after the counts in the file list (overlaps: the other side's name).
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,7 +104,132 @@ pub fn load(target: &Target) -> Result<DiffDoc> {
             }
             Ok(doc)
         }
+        Target::Overlaps { path, name, overlaps } => overlaps_doc(path, name, overlaps),
     }
+}
+
+/// One entry per other side and shared file: this worktree's own work on the file, then the
+/// other side's.
+fn overlaps_doc(path: &Path, name: &str, overlaps: &[Overlap]) -> Result<DiffDoc> {
+    let mut doc = DiffDoc::default();
+    if overlaps.is_empty() {
+        doc.overview
+            .push(format!("[{name}] no longer overlaps with other worktrees."));
+        return Ok(doc);
+    }
+    doc.overview.extend([
+        format!("Files [{name}] and other worktrees (or the base branch) both changed in their own"),
+        "work, committed or not: likely merge conflicts, or two agents doing the same thing. Each".into(),
+        "file shows what each side did to it, from where its own work began to its working tree.".into(),
+    ]);
+    for o in overlaps {
+        let n = o.files.len();
+        doc.overview.push(String::new());
+        doc.overview.push(format!(
+            "{} ({n} file{}):",
+            side_label(o),
+            if n == 1 { "" } else { "s" }
+        ));
+        doc.overview.extend(o.files.iter().map(|f| format!("    {f}")));
+
+        let mine = parse(&side_patch(path, Some(path), &o.from, "HEAD", &o.files)?).files;
+        let theirs = parse(&side_patch(
+            path,
+            o.path.as_deref(),
+            &o.other_from,
+            &o.other_head,
+            &o.files,
+        )?)
+        .files;
+        for file in &o.files {
+            // An untracked directory (`dir/`) stands for the files under it.
+            let of = |sections: &[FileDiff]| -> Vec<FileDiff> {
+                sections
+                    .iter()
+                    .filter(|s| s.path == *file || (file.ends_with('/') && s.path.starts_with(file.as_str())))
+                    .cloned()
+                    .collect()
+            };
+            let (mine, theirs) = (of(&mine), of(&theirs));
+            let mut lines = side_lines(&format!("{name} (this worktree)"), &o.from, &mine);
+            lines.push(String::new());
+            lines.extend(side_lines(&side_label(o), &o.other_from, &theirs));
+            doc.files.push(FileDiff {
+                path: file.clone(),
+                status: match &mine[..] {
+                    [one] => one.status,
+                    _ => 'M',
+                },
+                adds: mine.iter().map(|f| f.adds).sum(),
+                dels: mine.iter().map(|f| f.dels).sum(),
+                lines,
+                note: Some(format!("↔ {}", o.with)),
+            });
+        }
+    }
+    Ok(doc)
+}
+
+fn side_label(o: &Overlap) -> String {
+    match o.path {
+        Some(_) => o.with.clone(),
+        None => format!("{} (base branch)", o.with),
+    }
+}
+
+/// A side's part of an overlap entry: a `──` heading, then its diff sections.
+fn side_lines(label: &str, from: &str, sections: &[FileDiff]) -> Vec<String> {
+    let short = &from[..from.len().min(7)];
+    let mut lines = vec![format!("── {label}, since {short} ──")];
+    if sections.is_empty() {
+        lines.push("(no difference any more)".into());
+    }
+    for s in sections {
+        lines.extend(s.lines.iter().cloned());
+    }
+    lines
+}
+
+/// What one side of an overlap did to `files`, as raw patch text: from `from` to the working
+/// tree at `wt` (untracked files included), or, for a side without a worktree (the base
+/// branch), from `from` to `head` in the repository at `dir`.
+fn side_patch(dir: &Path, wt: Option<&Path>, from: &str, head: &str, files: &[String]) -> Result<String> {
+    if files.is_empty() {
+        return Ok(String::new());
+    }
+    let specs: Vec<String> = files.iter().map(|f| format!(":(literal){f}")).collect();
+    let mut args = match wt {
+        Some(_) => vec![
+            "diff-index",
+            "-p",
+            "--no-renames",
+            "--no-color",
+            "--no-ext-diff",
+            from,
+            "--",
+        ],
+        None => vec![
+            "diff-tree",
+            "-r",
+            "-p",
+            "--no-renames",
+            "--no-color",
+            "--no-ext-diff",
+            from,
+            head,
+            "--",
+        ],
+    };
+    args.extend(specs.iter().map(String::as_str));
+    let mut out = String::from_utf8_lossy(&git::run(wt.unwrap_or(dir), &args)?).into_owned();
+    if let Some(wt) = wt {
+        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        for name in git::split_nul(&git::run(wt, &args)?).map(git::lossy) {
+            out.push_str(&untracked_patch(wt, &name));
+        }
+    }
+    Ok(out)
 }
 
 /// The worktree and the commit a worktree target is compared against: HEAD (the empty tree on
@@ -107,7 +243,7 @@ fn worktree_base(target: &Target) -> Result<(PathBuf, String)> {
                 .ok_or_else(|| anyhow::anyhow!("no history in common with {base}"))?;
             Ok((path.clone(), mb))
         }
-        Target::Commit { .. } => anyhow::bail!("not a worktree"),
+        Target::Commit { .. } | Target::Overlaps { .. } => anyhow::bail!("not a worktree diff"),
     }
 }
 
@@ -148,6 +284,7 @@ fn worktree_diff(wt: &Path, from: &str) -> Result<DiffDoc> {
                     lines: vec![format!(
                         "(content not shown: more than {MAX_UNTRACKED_SHOWN} untracked files)"
                     )],
+                    note: None,
                 }
             });
         }
@@ -192,6 +329,32 @@ pub fn patch(target: &Target, file: Option<&str>) -> Result<String> {
             let raw = git::run(path, &args)?;
             for name in git::split_nul(&raw).map(git::lossy) {
                 out.push_str(&untracked_patch(path, &name));
+            }
+            Ok(out)
+        }
+        Target::Overlaps { path, name, overlaps } => {
+            // Both sides' patches with a comment line before each: for pasting to an agent, not
+            // for `git apply` (they're two versions of the same files).
+            let mut out = String::new();
+            for o in overlaps {
+                let files: Vec<String> = match file {
+                    Some(f) => o.files.iter().filter(|p| *p == f).cloned().collect(),
+                    None => o.files.clone(),
+                };
+                if files.is_empty() {
+                    continue;
+                }
+                let short = |c: &str| c[..c.len().min(7)].to_string();
+                let _ = writeln!(out, "# {name} (this worktree), since {}", short(&o.from));
+                out.push_str(&side_patch(path, Some(path), &o.from, "HEAD", &files)?);
+                let _ = writeln!(out, "# {}, since {}", side_label(o), short(&o.other_from));
+                out.push_str(&side_patch(
+                    path,
+                    o.path.as_deref(),
+                    &o.other_from,
+                    &o.other_head,
+                    &files,
+                )?);
             }
             Ok(out)
         }
@@ -272,6 +435,7 @@ fn untracked_file(wt: &Path, name: &str) -> FileDiff {
         adds,
         dels: 0,
         lines: sanitize(&out),
+        note: None,
     }
 }
 
@@ -347,6 +511,7 @@ fn file_section(lines: Vec<String>) -> FileDiff {
         adds,
         dels,
         lines,
+        note: None,
     }
 }
 

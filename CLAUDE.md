@@ -288,7 +288,14 @@ Agents often work in several projects at once; one canopy should be able to watc
   `dir/`, matching everything under them, `model::shared_files`). Merge bases and commit diffs are
   cached; O(n²) merge-base calls at startup (190 for 20 worktrees, parallel, after the graph is up),
   then only for moved HEADs. Shown on the row (`⚠ name +n`), in the details footer (files), and in
-  the diff file list (`⚠ also in name`).
+  the diff file list (`⚠ also in name`). `o` / a double-click on the `⚠` field opens
+  `diff::Target::Overlaps`: per other side and shared file one entry (`↔ name` in the list) with
+  both sides' diffs under `── name, since <sha> ──` headings, each from its own-work start (kept
+  in `model::Overlap` as `from`/`other_from`/`other_head`) to its working tree (`diff-index`, plus
+  untracked files), or `diff-tree` to the base tip for a base side without a worktree. Two
+  `diff-index` calls per pair, not per file. The view reloads when this worktree, any other side
+  in it, or the overlaps change. `yd` gives both sides' raw patches with `#` comment lines: for
+  pasting to an agent, not for `git apply`.
 - **Diff vs base (`b`):** `diff::Target::Branch { path, base }` resolves `merge-base <base> HEAD` at
   load time (so it never goes stale) and shows `diff-index -p <merge base>` + untracked, like the
   worktree diff. Copy (`yd`) gives the same as a patch.

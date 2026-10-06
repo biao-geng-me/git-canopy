@@ -95,6 +95,7 @@ pub struct Areas {
 pub struct WtFields {
     pub agent: Option<Range<u16>>,
     pub path: Option<Range<u16>>,
+    pub overlap: Option<Range<u16>>,
 }
 
 /// A shell (or a git TUI) in an inset below the graph.
@@ -487,6 +488,18 @@ impl App {
         Some((w.status.clone(), w.changed_at))
     }
 
+    /// For an open overlaps view: the state of the other worktrees in it, which it shows too.
+    fn overlap_side_stamps(&self) -> Vec<Option<(Option<crate::git::status::Status>, Option<i64>)>> {
+        match self.diff.as_ref().map(|d| &d.target) {
+            Some(diff::Target::Overlaps { overlaps, .. }) => overlaps
+                .iter()
+                .filter_map(|o| o.path.clone())
+                .map(|p| self.worktree_stamp(&Key::Worktree(p)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn diff_target(&self, key: &Key) -> Option<diff::Target> {
         Some(match key {
             Key::Commit(id) => diff::Target::Commit {
@@ -642,7 +655,9 @@ impl App {
         let first_wts = self.snap.worktrees.is_empty();
         let first_graph = self.snap.graph.rows.is_empty();
         let graph_changed = !Arc::ptr_eq(&self.snap.graph, &snap.graph);
+        let others_before = self.overlap_side_stamps();
         self.snap = snap;
+        let others_changed = others_before != self.overlap_side_stamps();
         self.map_agents();
         self.refresh_docs();
         self.rebuild();
@@ -675,7 +690,26 @@ impl App {
             },
             _ => false,
         };
-        if stale {
+        // An overlaps view follows the worktree's overlaps (other worktrees changing).
+        let overlaps_now = match self.diff.as_ref().map(|d| &d.target) {
+            Some(diff::Target::Overlaps { path, overlaps, .. }) => self
+                .snap
+                .worktrees
+                .iter()
+                .find(|w| &w.path == path)
+                .map(|w| &w.overlaps)
+                .filter(|now| *now != overlaps)
+                .cloned(),
+            _ => None,
+        };
+        let overlaps_changed = overlaps_now.is_some();
+        if let Some(now) = overlaps_now
+            && let Some(diff::Target::Overlaps { overlaps, .. }) = self.diff.as_mut().map(|d| &mut d.target)
+        {
+            *overlaps = now;
+        }
+        let loaded = self.diff.as_ref().is_some_and(|d| d.doc.is_some());
+        if stale || (loaded && (overlaps_changed || others_changed)) {
             self.reload_diff();
         }
     }
@@ -790,6 +824,11 @@ impl App {
             }
             KeyCode::Char('t') => self.open_git_tui(),
             KeyCode::Char('b') => self.open_branch_diff(),
+            KeyCode::Char('o') => {
+                if let Some(wi) = self.focused_wi() {
+                    self.open_overlaps(wi);
+                }
+            }
             KeyCode::Char('v') => {
                 self.layout = match self.layout {
                     LayoutMode::Stacked => LayoutMode::Side,
@@ -1008,6 +1047,9 @@ impl App {
         if fields.path.as_ref().is_some_and(|r| r.contains(&col)) {
             return Some(WtField::Path(self.snap.worktrees.get(wi)?.path.clone()));
         }
+        if fields.overlap.as_ref().is_some_and(|r| r.contains(&col)) {
+            return Some(WtField::Overlap(wi));
+        }
         None
     }
 
@@ -1068,6 +1110,28 @@ impl App {
         self.next_id += 1;
         let view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&Key::Worktree(path)));
         self.diff = Some(view);
+        self.spawn_diff_load();
+    }
+
+    /// `o`: what worktree `wi` and the worktrees it overlaps with each did to their shared files.
+    fn open_overlaps(&mut self, wi: usize) {
+        let Some(w) = self.snap.worktrees.get(wi).filter(|w| w.has_worktree()) else {
+            return;
+        };
+        if w.overlaps.is_empty() {
+            self.notice = Some(format!("[{}] doesn't overlap with other worktrees", w.name));
+            return;
+        }
+        let names: Vec<&str> = w.overlaps.iter().map(|o| o.with.as_str()).collect();
+        let title = format!("[{}] overlaps with {}", w.name, names.join(", "));
+        let target = diff::Target::Overlaps {
+            path: w.path.clone(),
+            name: w.name.clone(),
+            overlaps: w.overlaps.clone(),
+        };
+        let stamp = self.worktree_stamp(&Key::Worktree(w.path.clone()));
+        self.next_id += 1;
+        self.diff = Some(DiffView::new(self.next_id, title, target, stamp));
         self.spawn_diff_load();
     }
 
@@ -1159,6 +1223,7 @@ impl App {
                     match self.wt_field_at(f, idx, m.column - inner.x) {
                         Some(WtField::Agent) => self.focus_agent(),
                         Some(WtField::Path(path)) => self.open_shell(path, None),
+                        Some(WtField::Overlap(wi)) => self.open_overlaps(wi),
                         None => self.open_full(f, idx),
                     }
                 } else {
@@ -1291,6 +1356,7 @@ impl App {
 enum WtField {
     Agent,
     Path(PathBuf),
+    Overlap(usize),
 }
 
 /// A shell in `path` in a tmux pane split below canopy's, when canopy runs inside tmux. tmux

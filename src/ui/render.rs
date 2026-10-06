@@ -439,6 +439,12 @@ fn common_parent<'a>(paths: impl Iterator<Item = &'a std::path::Path>) -> Option
     Some(common)
 }
 
+/// The columns `field` will take when appended after `before` (`None` when it's empty).
+fn field_range(before: &[Span], field: &[Span]) -> Option<std::ops::Range<u16>> {
+    let (at, w) = (spans_width(before) as u16, spans_width(field) as u16);
+    (w > 0).then_some(at..at + w)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wt_line(
     row: WtRow,
@@ -459,10 +465,7 @@ fn wt_line(
     spans.push(Span::raw(" "));
     if cols.agent > 0 {
         let aw = spans_width(&row.agent);
-        if aw > 0 {
-            let at = spans_width(&spans) as u16;
-            fields.agent = Some(at..at + aw as u16);
-        }
+        fields.agent = field_range(&spans, &row.agent);
         spans.extend(row.agent);
         spans.push(Span::raw(" ".repeat(cols.agent - aw + 1)));
     }
@@ -479,6 +482,7 @@ fn wt_line(
         }
     }
     if !wide {
+        fields.overlap = field_range(&spans, &row.overlap);
         spans.extend(row.overlap);
         return (Line::from(spans), fields);
     }
@@ -489,6 +493,7 @@ fn wt_line(
     }
     if cols.overlap > 0 {
         let ow = spans_width(&row.overlap);
+        fields.overlap = field_range(&spans, &row.overlap);
         spans.extend(row.overlap);
         spans.push(Span::raw(" ".repeat(cols.overlap - ow + 2)));
     }
@@ -1151,6 +1156,9 @@ fn diff_line_style(line: &str) -> Style {
     let b = line.as_bytes();
     if line.starts_with("diff --git ") || line.starts_with("diff --cc ") {
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("── ") {
+        // A side's heading in the overlaps view.
+        Style::new().fg(C_OVERLAP).add_modifier(Modifier::BOLD)
     } else if line.starts_with("commit ") {
         Style::new().fg(Color::Yellow)
     } else if line == "---" {
@@ -1245,10 +1253,12 @@ fn add_del_spans(adds: usize, dels: usize) -> Vec<Span<'static>> {
 }
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
-    // Files that other worktrees changed too (for a worktree's diff): file → their names.
+    // Files that other worktrees changed too (for a worktree's diff): file → their names. The
+    // overlaps view itself names the other side on each entry instead.
     let overlapping: std::collections::HashMap<String, Vec<String>> = app
         .diff
         .as_ref()
+        .filter(|d| !matches!(d.target, crate::diff::Target::Overlaps { .. }))
         .and_then(|d| d.target.worktree())
         .and_then(|p| app.snap.worktrees.iter().find(|w| w.path == p))
         .map(|w| {
@@ -1334,12 +1344,14 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                             .find(|(k, _)| k.ends_with('/') && file.path.starts_with(k.as_str()))
                             .map(|(_, v)| v)
                     });
-                    if let Some(names) = also {
+                    let note = match (&file.note, also) {
+                        (Some(n), _) => Some(n.clone()),
+                        (None, Some(names)) => Some(format!("⚠ also in {}", names.join(", "))),
+                        (None, None) => None,
+                    };
+                    if let Some(note) = note {
                         spans.push(Span::raw(" ".repeat(counts_w - cw + 2)));
-                        spans.push(Span::styled(
-                            format!("⚠ also in {}", names.join(", ")),
-                            Style::new().fg(C_OVERLAP),
-                        ));
+                        spans.push(Span::styled(note, Style::new().fg(C_OVERLAP)));
                     }
                     Line::from(spans)
                 }
@@ -1565,29 +1577,46 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(line), details);
     }
 
-    let left = Line::from(vec![
-        Span::raw(" "),
-        key("↑↓"),
-        text(" move  "),
-        key("Space"),
-        text(" expand  "),
-        key("Enter"),
-        text(" full diff  "),
-        key("b"),
-        text(" vs base  "),
-        key("t"),
-        text(" git TUI  "),
-        key("Tab"),
-        text(" panel  "),
-        key("v"),
-        text(" layout  "),
-        key("y"),
-        text(" copy  "),
-        key("?"),
-        text(" help  "),
-        key("q"),
-        text(" quit"),
-    ]);
+    // `o` only where it does something: on a worktree that overlaps with another.
+    let overlaps = app
+        .focused_wi()
+        .and_then(|wi| app.snap.worktrees.get(wi))
+        .is_some_and(|w| !w.overlaps.is_empty());
+    let o_hint = if overlaps {
+        vec![key("o"), text(" overlaps  ")]
+    } else {
+        Vec::new()
+    };
+    let left = Line::from(
+        vec![
+            Span::raw(" "),
+            key("↑↓"),
+            text(" move  "),
+            key("Space"),
+            text(" expand  "),
+            key("Enter"),
+            text(" full diff  "),
+            key("b"),
+            text(" vs base  "),
+        ]
+        .into_iter()
+        .chain(o_hint)
+        .chain([
+            key("t"),
+            text(" git TUI  "),
+            key("Tab"),
+            text(" panel  "),
+            key("v"),
+            text(" layout  "),
+            key("y"),
+            text(" copy  "),
+            key("?"),
+            text(" help  "),
+            key("q"),
+            text(" quit"),
+        ])
+        .collect::<Vec<_>>(),
+    );
     let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
     let mut right = herdr_summary(app);
@@ -1629,6 +1658,7 @@ const HELP: &[(&str, &str)] = &[
     ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
     ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
     ("b", "diff vs base: all changes since the fork"),
+    ("o  dbl-click ⚠", "overlaps: both sides' changes to shared files"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("y y", "copy the sha / path / file under the cursor"),
     ("y h  y s", "copy sha / short sha"),

@@ -905,12 +905,15 @@ impl Worker {
             if files.is_empty() {
                 continue;
             }
-            for (me, other) in [(a, b), (b, a)] {
+            for (me, other, me_from, other_from) in [(a, b, from_i, from_j), (b, a, from_j, from_i)] {
                 if let Some(wi) = me.wi {
                     overlaps[wi].push(Overlap {
                         with: other.name.clone(),
                         path: other.path.clone(),
                         files: files.clone(),
+                        from: me_from.clone(),
+                        other_from: other_from.clone(),
+                        other_head: other.head.clone(),
                     });
                 }
             }

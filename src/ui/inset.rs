@@ -280,6 +280,7 @@ mod tests {
             adds: n,
             dels: 0,
             lines,
+            note: None,
         }
     }
 

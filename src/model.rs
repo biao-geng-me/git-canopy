@@ -132,6 +132,12 @@ pub struct Overlap {
     /// The other worktree; `None` for the base branch when no worktree has it checked out.
     pub path: Option<PathBuf>,
     pub files: Vec<String>,
+    /// Where this worktree's own work starts, as far as this pair is concerned.
+    pub from: String,
+    /// Where the other side's own work starts, and its HEAD (the base branch's tip when it has
+    /// no worktree).
+    pub other_from: String,
+    pub other_head: String,
 }
 
 /// Paths in both `a` and `b`. An entry ending in `/` (an untracked directory, as `git status`

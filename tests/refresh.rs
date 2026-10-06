@@ -230,4 +230,38 @@ fn change_sizes_and_overlaps() {
     let ov = find(&s, "refactor-db").overlaps;
     assert_eq!(ov[0].with, "feat-auth");
     assert_eq!(ov[0].files, ["src/auth.rs"]);
+
+    // The overlaps view: per shared file, this side's work (untracked here), then the other's.
+    let target = canopy::diff::Target::Overlaps {
+        path: fx.wt("refactor-db"),
+        name: "refactor-db".into(),
+        overlaps: ov,
+    };
+    let doc = canopy::diff::load(&target).unwrap();
+    assert!(
+        doc.overview.iter().any(|l| l == "feat-auth (1 file):"),
+        "{:?}",
+        doc.overview
+    );
+    assert_eq!(doc.files.len(), 1);
+    let f = &doc.files[0];
+    assert_eq!((f.path.as_str(), f.status, f.adds), ("src/auth.rs", 'A', 1));
+    assert_eq!(f.note.as_deref(), Some("↔ feat-auth"));
+    let heading = |prefix: &str| f.lines.iter().position(|l| l.starts_with(prefix)).unwrap();
+    let (mine, theirs) = (
+        heading("── refactor-db (this worktree), since "),
+        heading("── feat-auth, since "),
+    );
+    assert!(mine < theirs);
+    assert!(f.lines[mine..theirs].iter().any(|l| l == "+pub fn login2() {}"));
+    assert!(
+        f.lines[theirs..]
+            .iter()
+            .any(|l| l.starts_with('+') && l.contains("login"))
+    );
+    assert!(!f.lines[theirs..].iter().any(|l| l == "+pub fn login2() {}"));
+
+    let patch = canopy::diff::patch(&target, Some("src/auth.rs")).unwrap();
+    assert!(patch.starts_with("# refactor-db (this worktree), since "));
+    assert!(patch.contains("\n# feat-auth, since ") && patch.contains("+pub fn login2() {}"));
 }

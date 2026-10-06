@@ -29,7 +29,7 @@ OPTIONS:
     -V, --version           print version
 
 KEYS:
-    ↑↓/jk move · Space expand · Enter full diff · b diff vs base · t git TUI · s shell · y copy · ? help
+    ↑↓/jk move · Space expand · Enter full diff · b diff vs base · o overlaps · t git TUI · s shell · y copy · ? help
 ";
 
 struct Args {
