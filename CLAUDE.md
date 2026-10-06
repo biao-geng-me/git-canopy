@@ -289,8 +289,11 @@ Agents often work in several projects at once; one canopy should be able to watc
   cached; O(n²) merge-base calls at startup (190 for 20 worktrees, parallel, after the graph is up),
   then only for moved HEADs. Shown on the row (`⚠ name +n`), in the details footer (files), and in
   the diff file list (`⚠ also in name`). `o` / a double-click on the `⚠` field opens
-  `diff::Target::Overlaps`: per other side and shared file one entry (`↔ name` in the list) with
-  both sides' diffs under `── name, since <sha> ──` headings, each from its own-work start (kept
+  `diff::Target::Overlaps`: one entry per shared file, its file list drawn as a table
+  (`DiffDoc::columns` = this worktree then each other side, `FileDiff::cells` = each side's
+  `+a -d`, `·` when untouched; the path column takes what the side columns leave, min 16, cut from
+  the left since the diff pane's title has the full path), and every side's diff of the file
+  under `── name, since <sha> ──` headings, this worktree first, each from its own-work start (kept
   in `model::Overlap` as `from`/`other_from`/`other_head`) to its working tree (`diff-index`, plus
   untracked files), or `diff-tree` to the base tip for a base side without a worktree. Two
   `diff-index` calls per pair, not per file. The view reloads when this worktree, any other side

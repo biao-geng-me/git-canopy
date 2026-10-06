@@ -50,8 +50,9 @@ pub struct FileDiff {
     pub dels: usize,
     /// The file's section, starting with its `diff --git` header.
     pub lines: Vec<String>,
-    /// Shown after the counts in the file list (overlaps: the other side's name).
-    pub note: Option<String>,
+    /// In a table doc: this file's `(adds, dels)` per column, `None` where that side didn't
+    /// touch it.
+    pub cells: Vec<Option<(usize, usize)>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -59,6 +60,9 @@ pub struct DiffDoc {
     /// Everything before the first file: commit header and message, diffstat, untracked list.
     pub overview: Vec<String>,
     pub files: Vec<FileDiff>,
+    /// When not empty, the file list is a table with these column headers (the overlaps view:
+    /// one column per side), filled from each file's `cells`.
+    pub columns: Vec<String>,
 }
 
 /// Untracked files shown with content; the rest are only listed.
@@ -108,8 +112,8 @@ pub fn load(target: &Target) -> Result<DiffDoc> {
     }
 }
 
-/// One entry per other side and shared file: this worktree's own work on the file, then the
-/// other side's.
+/// One entry per shared file, with a column per side (this worktree first): what each side did
+/// to the file in its own work, this worktree's diff first.
 fn overlaps_doc(path: &Path, name: &str, overlaps: &[Overlap]) -> Result<DiffDoc> {
     let mut doc = DiffDoc::default();
     if overlaps.is_empty() {
@@ -131,41 +135,96 @@ fn overlaps_doc(path: &Path, name: &str, overlaps: &[Overlap]) -> Result<DiffDoc
             if n == 1 { "" } else { "s" }
         ));
         doc.overview.extend(o.files.iter().map(|f| format!("    {f}")));
+    }
 
-        let mine = parse(&side_patch(path, Some(path), &o.from, "HEAD", &o.files)?).files;
-        let theirs = parse(&side_patch(
-            path,
-            o.path.as_deref(),
-            &o.other_from,
-            &o.other_head,
-            &o.files,
-        )?)
-        .files;
-        for file in &o.files {
-            // An untracked directory (`dir/`) stands for the files under it.
-            let of = |sections: &[FileDiff]| -> Vec<FileDiff> {
-                sections
-                    .iter()
-                    .filter(|s| s.path == *file || (file.ends_with('/') && s.path.starts_with(file.as_str())))
-                    .cloned()
-                    .collect()
-            };
-            let (mine, theirs) = (of(&mine), of(&theirs));
-            let mut lines = side_lines(&format!("{name} (this worktree)"), &o.from, &mine);
-            lines.push(String::new());
-            lines.extend(side_lines(&side_label(o), &o.other_from, &theirs));
-            doc.files.push(FileDiff {
-                path: file.clone(),
-                status: match &mine[..] {
-                    [one] => one.status,
-                    _ => 'M',
-                },
-                adds: mine.iter().map(|f| f.adds).sum(),
-                dels: mine.iter().map(|f| f.dels).sum(),
-                lines,
-                note: Some(format!("↔ {}", o.with)),
-            });
+    // This worktree's side, once per place its own work starts (normally one: its fork from
+    // base; another when a pair splits later, e.g. a branch built on this one).
+    let mut mine: Vec<(&str, Vec<FileDiff>)> = Vec::new();
+    for o in overlaps {
+        if mine.iter().any(|(from, _)| *from == o.from) {
+            continue;
         }
+        let mut files: Vec<String> = overlaps
+            .iter()
+            .filter(|p| p.from == o.from)
+            .flat_map(|p| p.files.iter().cloned())
+            .collect();
+        files.sort();
+        files.dedup();
+        mine.push((
+            &o.from,
+            parse(&side_patch(path, Some(path), &o.from, "HEAD", &files)?).files,
+        ));
+    }
+    let theirs: Vec<Vec<FileDiff>> = overlaps
+        .iter()
+        .map(|o| side_patch(path, o.path.as_deref(), &o.other_from, &o.other_head, &o.files).map(|p| parse(&p).files))
+        .collect::<Result<_>>()?;
+
+    doc.columns = std::iter::once(name.to_string())
+        .chain(overlaps.iter().map(|o| match o.path {
+            Some(_) => o.with.clone(),
+            None => format!("{} (base)", o.with),
+        }))
+        .collect();
+    let mut files: Vec<&String> = overlaps.iter().flat_map(|o| &o.files).collect();
+    files.sort();
+    files.dedup();
+    for file in files {
+        // An untracked directory (`dir/`) stands for the files under it.
+        let of = |sections: &[FileDiff]| -> Vec<FileDiff> {
+            sections
+                .iter()
+                .filter(|s| s.path == *file || (file.ends_with('/') && s.path.starts_with(file.as_str())))
+                .cloned()
+                .collect()
+        };
+        let counts = |sections: &[FileDiff]| -> (usize, usize) {
+            (
+                sections.iter().map(|f| f.adds).sum(),
+                sections.iter().map(|f| f.dels).sum(),
+            )
+        };
+        let with: Vec<usize> = (0..overlaps.len())
+            .filter(|&k| overlaps[k].files.contains(file))
+            .collect();
+        let mut lines = Vec::new();
+        let mut my_first: Option<Vec<FileDiff>> = None;
+        for (from, sections) in &mine {
+            if !with.iter().any(|&k| overlaps[k].from == *from) {
+                continue;
+            }
+            let sections = of(sections);
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(side_lines(&format!("{name} (this worktree)"), from, &sections));
+            my_first.get_or_insert(sections);
+        }
+        let my = my_first.unwrap_or_default();
+        let mut cells = vec![Some(counts(&my))];
+        for (k, o) in overlaps.iter().enumerate() {
+            if !with.contains(&k) {
+                cells.push(None);
+                continue;
+            }
+            let sections = of(&theirs[k]);
+            cells.push(Some(counts(&sections)));
+            lines.push(String::new());
+            lines.extend(side_lines(&side_label(o), &o.other_from, &sections));
+        }
+        let (adds, dels) = counts(&my);
+        doc.files.push(FileDiff {
+            path: file.clone(),
+            status: match &my[..] {
+                [one] => one.status,
+                _ => 'M',
+            },
+            adds,
+            dels,
+            lines,
+            cells,
+        });
     }
     Ok(doc)
 }
@@ -284,7 +343,7 @@ fn worktree_diff(wt: &Path, from: &str) -> Result<DiffDoc> {
                     lines: vec![format!(
                         "(content not shown: more than {MAX_UNTRACKED_SHOWN} untracked files)"
                     )],
-                    note: None,
+                    cells: Vec::new(),
                 }
             });
         }
@@ -435,7 +494,7 @@ fn untracked_file(wt: &Path, name: &str) -> FileDiff {
         adds,
         dels: 0,
         lines: sanitize(&out),
-        note: None,
+        cells: Vec::new(),
     }
 }
 
@@ -511,7 +570,7 @@ fn file_section(lines: Vec<String>) -> FileDiff {
         adds,
         dels,
         lines,
-        note: None,
+        cells: Vec::new(),
     }
 }
 

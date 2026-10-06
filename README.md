@@ -40,9 +40,10 @@ tree doing, and which ones are dirty?" on one screen:
   forked) changed some of the same files: a likely merge conflict, or two agents doing the same work.
   The footer lists the files; in the diff view they are marked `⚠ also in feat-x`. Only each branch's
   own work counts: what it got from the base branch, or from a branch it was built on, doesn't.
-  `o` (or a double-click on the `⚠`) opens the details: one entry per shared file and other side,
-  showing what this worktree did to the file and then what the other side did, each since its own
-  work began, uncommitted changes included. It reloads while either side keeps editing; `yd` copies
+  `o` (or a double-click on the `⚠`) opens the details: a table with one row per shared file and a
+  column per worktree (this one first) holding its `+a -d` for that file (`·`: didn't touch it).
+  The selected file's diff pane shows what this worktree did to it, then what each other side did,
+  each since its own work began, uncommitted changes included. It reloads while either side keeps editing; `yd` copies
   both sides' patches (to paste to an agent).
 - **Git TUI on demand:** `t` opens lazygit (or gitui, tig, `--git-tui`) in the selected worktree, the
   same way `s` opens a shell, for when you do want to stage, commit or rebase.

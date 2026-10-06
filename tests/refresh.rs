@@ -231,7 +231,8 @@ fn change_sizes_and_overlaps() {
     assert_eq!(ov[0].with, "feat-auth");
     assert_eq!(ov[0].files, ["src/auth.rs"]);
 
-    // The overlaps view: per shared file, this side's work (untracked here), then the other's.
+    // The overlaps view: one row per shared file, a column per side (this worktree first); the
+    // entry shows this side's work (untracked here), then the other's.
     let target = canopy::diff::Target::Overlaps {
         path: fx.wt("refactor-db"),
         name: "refactor-db".into(),
@@ -243,10 +244,11 @@ fn change_sizes_and_overlaps() {
         "{:?}",
         doc.overview
     );
+    assert_eq!(doc.columns, ["refactor-db", "feat-auth"]);
     assert_eq!(doc.files.len(), 1);
     let f = &doc.files[0];
     assert_eq!((f.path.as_str(), f.status, f.adds), ("src/auth.rs", 'A', 1));
-    assert_eq!(f.note.as_deref(), Some("↔ feat-auth"));
+    assert_eq!(f.cells, [Some((1, 0)), Some((3, 0))]);
     let heading = |prefix: &str| f.lines.iter().position(|l| l.starts_with(prefix)).unwrap();
     let (mine, theirs) = (
         heading("── refactor-db (this worktree), since "),
@@ -264,4 +266,21 @@ fn change_sizes_and_overlaps() {
     let patch = canopy::diff::patch(&target, Some("src/auth.rs")).unwrap();
     assert!(patch.starts_with("# refactor-db (this worktree), since "));
     assert!(patch.contains("\n# feat-auth, since ") && patch.contains("+pub fn login2() {}"));
+
+    // A third worktree on the same file: still one row, now with a column per side.
+    std::fs::write(fx.wt("fix-parser").join("src/auth.rs"), "a\nb\n").unwrap();
+    let s = wait_for(&rx, Duration::from_secs(5), |s| {
+        find(s, "feat-auth").overlaps.len() == 2
+    });
+    let w = find(&s, "feat-auth");
+    let doc = canopy::diff::load(&canopy::diff::Target::Overlaps {
+        path: w.path.clone(),
+        name: w.name.clone(),
+        overlaps: w.overlaps.clone(),
+    })
+    .unwrap();
+    assert_eq!(doc.columns, ["feat-auth", "fix-parser", "refactor-db"]);
+    let rows: Vec<_> = doc.files.iter().map(|f| (f.path.as_str(), f.cells.clone())).collect();
+    assert_eq!(rows, [("src/auth.rs", vec![Some((3, 0)), Some((2, 0)), Some((1, 0))])]);
+    assert_eq!(doc.files[0].lines.iter().filter(|l| l.starts_with("── ")).count(), 3);
 }

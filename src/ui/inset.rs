@@ -280,13 +280,14 @@ mod tests {
             adds: n,
             dels: 0,
             lines,
-            note: None,
+            cells: Vec::new(),
         }
     }
 
     fn entry(files: Vec<FileDiff>) -> Entry {
         let mut e = Entry::default();
         e.set(Ok(DiffDoc {
+            columns: Vec::new(),
             overview: [
                 "commit x",
                 "Author: a",
@@ -309,6 +310,7 @@ mod tests {
     fn message_body_skips_subject() {
         assert_eq!(entry(vec![]).message, ["body line"]);
         let worktree = DiffDoc {
+            columns: Vec::new(),
             overview: vec!["Untracked files (1):".into(), "    notes.md".into()],
             files: vec![],
         };

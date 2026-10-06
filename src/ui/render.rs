@@ -11,6 +11,7 @@ use super::copy;
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
 use super::{App, Focus, InsetText, LayoutMode, WtFields};
+use crate::diff::FileDiff;
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::herdr::{self, AgentState};
 use crate::model::WorktreeView;
@@ -1252,6 +1253,83 @@ fn add_del_spans(adds: usize, dels: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// The file list as a table (the overlaps view): status, path, then one `+a -d` column per side.
+struct FileTable {
+    path: usize,
+    cols: Vec<usize>,
+}
+
+impl FileTable {
+    /// Paths get what the side columns leave, at least this much (cut from the left; the full
+    /// path is in the diff pane's title).
+    const MIN_PATH: usize = 16;
+    const MAX_HEADER: usize = 24;
+    /// Status letter and its padding before the path.
+    const LEAD: usize = 4;
+
+    fn new(columns: &[String], files: &[FileDiff], width: usize) -> Self {
+        let cols: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                let cells = files
+                    .iter()
+                    .map(|f| spans_width(&Self::cell(f.cells.get(k).copied().flatten())));
+                cells.fold(name.width().min(Self::MAX_HEADER), usize::max)
+            })
+            .collect();
+        let used = Self::LEAD + cols.iter().map(|w| w + 2).sum::<usize>();
+        let longest = files.iter().map(|f| f.path.width()).max().unwrap_or(0).max(4);
+        let path = longest.min(width.saturating_sub(used).max(Self::MIN_PATH));
+        FileTable { path, cols }
+    }
+
+    /// `+a -d`; `·` where that side didn't touch the file, `±0` where it no longer differs (or
+    /// only binary content changed).
+    fn cell(c: Option<(usize, usize)>) -> Vec<Span<'static>> {
+        let dim = Style::new().fg(C_DIM);
+        match c {
+            None => vec![Span::styled("·", dim)],
+            Some((0, 0)) => vec![Span::styled("±0", dim)],
+            Some((a, d)) => add_del_spans(a, d),
+        }
+    }
+
+    fn header(&self, columns: &[String]) -> Line<'static> {
+        let dim = Style::new().fg(C_DIM);
+        let mut spans = vec![
+            Span::raw(" ".repeat(Self::LEAD)),
+            Span::styled(pad("file".into(), self.path), dim),
+        ];
+        for (k, (name, w)) in columns.iter().zip(&self.cols).enumerate() {
+            // This worktree first, then the sides it overlaps with.
+            let style = match k {
+                0 => Style::new().add_modifier(Modifier::BOLD),
+                _ => Style::new().fg(C_OVERLAP).add_modifier(Modifier::BOLD),
+            };
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(pad(truncate(name, *w), *w), style));
+        }
+        Line::from(spans)
+    }
+
+    fn row(&self, file: &FileDiff) -> Line<'static> {
+        let mut spans = vec![
+            Span::styled(format!(" {} ", file.status), Style::new().fg(status_color(file.status))),
+            Span::raw(" "),
+            Span::raw(pad(truncate_left(&file.path, self.path), self.path)),
+        ];
+        for (k, w) in self.cols.iter().enumerate() {
+            let cell = Self::cell(file.cells.get(k).copied().flatten());
+            let cw = spans_width(&cell);
+            spans.push(Span::raw("  "));
+            spans.extend(cell);
+            spans.push(Span::raw(" ".repeat(w.saturating_sub(cw))));
+        }
+        Line::from(spans)
+    }
+}
+
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     // Files that other worktrees changed too (for a worktree's diff): file → their names. The
     // overlaps view itself names the other side on each entry instead.
@@ -1282,7 +1360,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     // File list on top (only when there are files), the selected entry's diff below.
     let body_area = if d.has_files() {
-        let want = d.entries() as u16 + CHROME;
+        let header = d.header_rows();
+        let want = (d.entries() + header) as u16 + CHROME;
         let h = want
             .min((area.height * 2 / 5).max(5))
             .min(area.height.saturating_sub(3));
@@ -1300,6 +1379,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         let block = panel(title.clone(), d.pane == Pane::Files).title_top(Line::from(summary).right_aligned());
         let inner = block.inner(list);
         f.render_widget(block, list);
+        let [head_area, inner] = Layout::vertical([Constraint::Length(header as u16), Constraint::Min(0)]).areas(inner);
 
         let rows = inner.height as usize;
         if d.sel < d.list_offset {
@@ -1322,10 +1402,15 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or(0);
         let longest = d.files().iter().map(|f| f.path.width()).max().unwrap_or(0);
         let path_w = longest.min(width.saturating_sub(4 + counts_w + 2));
+        let table = (header > 0).then(|| FileTable::new(d.columns(), d.files(), width));
+        if let Some(t) = &table {
+            f.render_widget(Paragraph::new(t.header(d.columns())), head_area);
+        }
         let lines: Vec<Line> = (d.list_offset..d.entries())
             .take(rows)
             .map(|i| match i.checked_sub(1).map(|fi| &d.files()[fi]) {
                 None => Line::from(vec![Span::styled(" ≡ ", dim), Span::styled(overview_label, dim)]),
+                Some(file) if table.is_some() => table.as_ref().unwrap().row(file),
                 Some(file) => {
                     let counts = add_del_spans(file.adds, file.dels);
                     let path = pad(truncate(&file.path, path_w), path_w);
@@ -1344,14 +1429,12 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                             .find(|(k, _)| k.ends_with('/') && file.path.starts_with(k.as_str()))
                             .map(|(_, v)| v)
                     });
-                    let note = match (&file.note, also) {
-                        (Some(n), _) => Some(n.clone()),
-                        (None, Some(names)) => Some(format!("⚠ also in {}", names.join(", "))),
-                        (None, None) => None,
-                    };
-                    if let Some(note) = note {
+                    if let Some(names) = also {
                         spans.push(Span::raw(" ".repeat(counts_w - cw + 2)));
-                        spans.push(Span::styled(note, Style::new().fg(C_OVERLAP)));
+                        spans.push(Span::styled(
+                            format!("⚠ also in {}", names.join(", ")),
+                            Style::new().fg(C_OVERLAP),
+                        ));
                     }
                     Line::from(spans)
                 }

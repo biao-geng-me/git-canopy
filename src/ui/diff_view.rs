@@ -70,6 +70,19 @@ impl DiffView {
         }
     }
 
+    /// Column headers when the file list is a table (see `DiffDoc::columns`).
+    pub fn columns(&self) -> &[String] {
+        match &self.doc {
+            Some(Ok(d)) => &d.columns,
+            _ => &[],
+        }
+    }
+
+    /// Rows above the entries in the file list: the table's header.
+    pub fn header_rows(&self) -> usize {
+        usize::from(self.has_files() && !self.columns().is_empty())
+    }
+
     pub fn entries(&self) -> usize {
         1 + self.files().len()
     }
@@ -213,8 +226,9 @@ impl DiffView {
             MouseEventKind::Down(MouseButton::Left) if over_list => {
                 self.pane = Pane::Files;
                 let a = super::render::content(self.list_area);
-                if a.contains(pos) {
-                    self.select(self.list_offset + (m.row - a.y) as usize);
+                let row = (m.row.saturating_sub(a.y) as usize).checked_sub(self.header_rows());
+                if let Some(row) = row.filter(|_| a.contains(pos)) {
+                    self.select(self.list_offset + row);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.body_area.contains(pos) => self.pane = Pane::Body,
@@ -241,7 +255,7 @@ mod tests {
             adds: n,
             dels: 0,
             lines: (0..n).map(|i| format!("+{i}")).collect(),
-            note: None,
+            cells: Vec::new(),
         }
     }
 
@@ -257,6 +271,7 @@ mod tests {
         );
         v.body_area = Rect::new(0, 0, 80, 11); // 10 body rows under the title rule
         v.loaded(Ok(DiffDoc {
+            columns: Vec::new(),
             overview: vec!["commit x".into()],
             files: vec![file("a", 50), file("b", 3)],
         }));
@@ -296,6 +311,7 @@ mod tests {
         v.scroll_by(7);
         v.begin_reload(2);
         v.loaded(Ok(DiffDoc {
+            columns: Vec::new(),
             overview: vec![],
             files: vec![file("new", 1), file("a", 60)],
         }));
@@ -304,6 +320,7 @@ mod tests {
         // The selected file disappeared: clamp, back to the top.
         v.begin_reload(3);
         v.loaded(Ok(DiffDoc {
+            columns: Vec::new(),
             overview: vec!["No uncommitted changes.".into()],
             files: vec![],
         }));
