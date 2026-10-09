@@ -1067,7 +1067,7 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
                 Span::styled("  ·  ", dim),
                 Span::raw(c.author.clone()),
                 Span::styled("  ·  ", dim),
-                Span::raw(format!("{} ({} ago)", utc_date(c.time), age(c.time, now_secs()))),
+                Span::raw(format!("{} ({} ago)", local_date(c.time), age(c.time, now_secs()))),
             ];
             if c.parents.len() > 1 {
                 spans.push(Span::styled(format!("  ·  merge of {}", c.parents.len()), dim));
@@ -1134,6 +1134,35 @@ fn secs(ms: u128) -> String {
     } else {
         format!("{:.1}s", ms as f64 / 1000.0)
     }
+}
+
+/// `YYYY-MM-DD HH:MM EDT` in the local timezone (`TZ`, else `/etc/localtime`, via libc), or
+/// [`utc_date`] when libc can't convert.
+pub fn local_date(t: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let tt = t as libc::time_t;
+    if unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+        return utc_date(t);
+    }
+    let zone = if tm.tm_zone.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_string_lossy().into_owned()
+    };
+    let zone = if zone.is_empty() {
+        let off = tm.tm_gmtoff / 60;
+        format!("{}{:02}{:02}", if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60)
+    } else {
+        zone
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} {zone}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }
 
 /// `YYYY-MM-DD HH:MM UTC` from unix seconds (civil-from-days, no timezone database needed).
@@ -1800,6 +1829,10 @@ mod tests {
         assert_eq!(utc_date(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc_date(1700003600), "2023-11-14 23:13 UTC");
         assert_eq!(utc_date(951782400), "2000-02-29 00:00 UTC");
+        // Whatever the machine's timezone: date, time, then a zone name or offset.
+        let local = local_date(1700003600);
+        assert_eq!(local.as_bytes()[10], b' ', "{local}");
+        assert!(local.starts_with("2023-11-1") && local.len() > 17, "{local}");
         assert_eq!(age(100, 100), "0s");
         assert_eq!(age(0, 7200), "2h");
         assert_eq!(age(0, 86400 * 3), "3d");
