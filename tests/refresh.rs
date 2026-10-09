@@ -284,3 +284,81 @@ fn change_sizes_and_overlaps() {
     assert_eq!(rows, [("src/auth.rs", vec![Some((3, 0)), Some((2, 0)), Some((1, 0))])]);
     assert_eq!(doc.files[0].lines.iter().filter(|l| l.starts_with("── ")).count(), 3);
 }
+
+/// Run git in `dir` with the user's config ignored and a fixed identity.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn merged_worktrees_are_marked_for_cleanup() {
+    use canopy::model::{Cleanup, Landed};
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    let wt = |name: &str| fx.wt(name).to_string_lossy().into_owned();
+    // ff-done: fast-forwarded into main. squashed: squash-merged into main.
+    git(&repo, &["worktree", "add", "-q", "-b", "ff-done", &wt("ff-done"), "main"]);
+    std::fs::write(fx.wt("ff-done").join("ff.txt"), "ff\n").unwrap();
+    git(&fx.wt("ff-done"), &["add", "ff.txt"]);
+    git(&fx.wt("ff-done"), &["commit", "-qm", "ff work"]);
+    git(&repo, &["merge", "-q", "--ff-only", "ff-done"]);
+    git(&repo, &["worktree", "add", "-q", "-b", "squashed", &wt("squashed"), "main"]);
+    for line in ["one\n", "one\ntwo\n"] {
+        std::fs::write(fx.wt("squashed").join("sq.txt"), line).unwrap();
+        git(&fx.wt("squashed"), &["add", "sq.txt"]);
+        git(&fx.wt("squashed"), &["commit", "-qm", "sq work"]);
+    }
+    git(&repo, &["merge", "-q", "--squash", "squashed"]);
+    git(&repo, &["commit", "-qm", "squash of squashed"]);
+
+    let cfg = Config {
+        interval: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let (_h, rx) = spawn(&fx, cfg);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| {
+        find(s, "ff-done").landed.is_some() && find(s, "squashed").landed.is_some()
+    });
+    let landed = |name: &str| find(&s, name).landed;
+    let cleanup = |name: &str| find(&s, name).cleanup(s.base.as_deref(), false);
+    assert_eq!(landed("ff-done"), Some(Landed::Merged));
+    assert_eq!(landed("squashed"), Some(Landed::Applied));
+    // docs sits at main with no commits of its own (and has untracked files).
+    assert_eq!(landed("docs"), Some(Landed::Unused));
+    for name in ["main", "feat-auth", "fix-parser", "refactor-db", "detached"] {
+        assert_eq!(landed(name), None, "{name}");
+    }
+    assert_eq!(cleanup("ff-done"), Cleanup::Safe);
+    assert_eq!(cleanup("squashed"), Cleanup::Safe);
+    assert_eq!(find(&s, "squashed").cleanup(s.base.as_deref(), true), Cleanup::No);
+    // main has squashed's work now, which is no overlap.
+    assert!(find(&s, "squashed").overlaps.is_empty());
+    assert!(!find(&s, "main").overlaps.iter().any(|o| o.with == "squashed"));
+    for name in ["main", "docs", "feat-auth", "refactor-db", "detached"] {
+        assert_eq!(cleanup(name), Cleanup::No, "{name}");
+    }
+
+    // An untracked file would be lost; a modified one isn't merged work at all.
+    std::fs::write(fx.wt("ff-done").join("scratch.txt"), "x").unwrap();
+    std::fs::write(fx.wt("squashed").join("sq.txt"), "changed\n").unwrap();
+    let s = wait_for(&rx, Duration::from_secs(5), |s| {
+        find(s, "ff-done").is_dirty() && find(s, "squashed").is_dirty()
+    });
+    assert_eq!(find(&s, "ff-done").cleanup(s.base.as_deref(), false), Cleanup::Untracked);
+    assert_eq!(find(&s, "squashed").cleanup(s.base.as_deref(), false), Cleanup::No);
+
+    // New work on top of the squash: no longer merged.
+    git(&fx.wt("squashed"), &["commit", "-qam", "more work"]);
+    wait_for(&rx, Duration::from_secs(5), |s| {
+        let w = find(s, "squashed");
+        !w.is_dirty() && w.landed.is_none()
+    });
+}

@@ -128,11 +128,19 @@ The mouse works too: click to select, wheel to scroll.
 | `✎` | uncommitted changes |
 | `⚠` | conflicts or an operation in progress (merge, rebase, cherry-pick, …) |
 | `⚠ name` (light red, after the counts) | overlaps: `name` changed some of the same files |
+| `⌫` (green) | safe to clean up: its work is in the base branch (`merged`), nothing uncommitted, no agent busy |
+| `⌫` (yellow) | the same, but it has untracked files that cleaning up would lose |
 | `✗` | prunable: the worktree directory is gone |
 | `…` | status still loading |
 
 In the graph, `◉` marks a commit that is some worktree's HEAD, `○` a merge commit and `◌` uncommitted
 changes.
+
+`merged` (where `↑a ↓b` would be) means the worktree's work is already in the base branch: its HEAD
+is in base after commits of its own, or every file it changed has the same content in base
+(squash-merged, rebased or cherry-picked). `⌫` additionally needs a clean tree, no agent other than
+idle/done in it, and a worktree that could be removed at all (not the main one, not on the base
+branch, not locked). canopy only shows this; it doesn't remove anything.
 
 ## herdr agent activity
 

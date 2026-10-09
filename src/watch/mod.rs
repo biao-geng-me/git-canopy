@@ -31,7 +31,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use crate::fsinfo::{self, Events};
 use crate::git::{self, RepoPaths, changes::FileChange, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
-use crate::model::{self, Changes, Overlap, Snapshot, WorktreeView};
+use crate::model::{self, Changes, Landed, Overlap, Snapshot, WorktreeView};
 use trees::TreeWatch;
 
 /// Coalesce bursts of fs events (git writes several files per operation).
@@ -153,6 +153,8 @@ struct Worker {
     dirty_cache: HashMap<PathBuf, (u64, Arc<Vec<FileChange>>)>,
     /// Commit time per HEAD sha.
     head_cache: HashMap<String, i64>,
+    /// Whether a HEAD's work is in the base branch.
+    landed_cache: HashMap<LandedKey, Option<Landed>>,
 
     limit: usize,
     commits: Arc<Vec<Commit>>,
@@ -190,6 +192,7 @@ impl Worker {
             between_cache: HashMap::new(),
             dirty_cache: HashMap::new(),
             head_cache: HashMap::new(),
+            landed_cache: HashMap::new(),
             limit,
             commits: Arc::default(),
             commits_key: None,
@@ -563,6 +566,7 @@ impl Worker {
                     v.admin_dir = prev.admin_dir;
                     v.changes = prev.changes;
                     v.overlaps = prev.overlaps;
+                    v.landed = prev.landed;
                 }
                 if v.admin_dir.is_none() && v.has_worktree() {
                     v.admin_dir = git::worktree::admin_dir(&v.path);
@@ -723,17 +727,25 @@ impl Worker {
     /// visible changed.
     fn refresh_changes(&mut self) -> bool {
         let dir = self.repo_dir().to_path_buf();
-        for cache_len in [self.mb_cache.len(), self.between_cache.len(), self.dirty_cache.len()] {
+        for cache_len in [
+            self.mb_cache.len(),
+            self.between_cache.len(),
+            self.dirty_cache.len(),
+            self.landed_cache.len(),
+        ] {
             if cache_len > 4096 {
                 self.mb_cache.clear();
                 self.between_cache.clear();
                 self.dirty_cache.clear();
+                self.landed_cache.clear();
             }
         }
         let Some(base_sha) = self.base_sha.clone() else {
             let mut changed = false;
             for w in &mut self.worktrees {
-                changed |= w.changes.take().is_some() || !std::mem::take(&mut w.overlaps).is_empty();
+                changed |= w.changes.take().is_some()
+                    || !std::mem::take(&mut w.overlaps).is_empty()
+                    || w.landed.take().is_some();
             }
             return changed;
         };
@@ -888,6 +900,58 @@ impl Worker {
             });
         }
 
+        // Whether each worktree's work is already in the base branch. HEAD in base: merged if
+        // the branch ever moved (its reflog has more than the creation entry), else unused.
+        // HEAD not in base: applied if every file it changed since forking is the same there.
+        enum Check {
+            Reflog(String),
+            Content(Vec<String>),
+        }
+        const MAX_APPLIED_FILES: usize = 2000;
+        let mut checks: Vec<(LandedKey, Check)> = Vec::new();
+        for (s, f) in sides.iter().zip(&fork) {
+            let (Some(wi), Some(f)) = (s.wi, f) else { continue };
+            let w = &self.worktrees[wi];
+            let Some((ahead, _)) = w.vs_base.filter(|_| !s.is_base) else { continue };
+            let key = (base_sha.clone(), s.head.clone(), w.branch.clone());
+            if self.landed_cache.contains_key(&key) {
+                continue;
+            }
+            let check = if ahead == 0 {
+                let Some(b) = &w.branch else { continue };
+                Check::Reflog(b.clone())
+            } else {
+                let Some(committed) = self.between_cache.get(&(f.clone(), s.head.clone())) else {
+                    continue;
+                };
+                if committed.is_empty() || committed.len() > MAX_APPLIED_FILES {
+                    self.landed_cache.insert(key, None);
+                    continue;
+                }
+                Check::Content(committed.iter().map(|c| c.path.clone()).collect())
+            };
+            checks.push((key, check));
+        }
+        let found = par_map(&checks, PARALLELISM, |((base, head, _), check)| match check {
+            Check::Reflog(b) => match git::changes::reflog_len(&dir, b, 2) {
+                Ok(n) if n >= 2 => Some(Landed::Merged),
+                Ok(1) => Some(Landed::Unused),
+                _ => None,
+            },
+            Check::Content(paths) => git::changes::same_content(&dir, head, base, paths)
+                .ok()
+                .and_then(|same| same.then_some(Landed::Applied)),
+        });
+        for ((key, _), v) in checks.into_iter().zip(found) {
+            self.landed_cache.insert(key, v);
+        }
+        let mut landed: Vec<Option<Landed>> = vec![None; self.worktrees.len()];
+        for s in &sides {
+            let Some(wi) = s.wi else { continue };
+            let key = (base_sha.clone(), s.head.clone(), self.worktrees[wi].branch.clone());
+            landed[wi] = self.landed_cache.get(&key).copied().flatten();
+        }
+
         // Overlaps: per pair, the files both sides changed in their own work (committed or not).
         let touched = |s: &Side, from: &str| -> Option<Vec<String>> {
             let committed = self.between_cache.get(&(from.to_string(), s.head.clone()))?;
@@ -896,8 +960,13 @@ impl Worker {
             Some(v)
         };
         let mut overlaps: Vec<Vec<Overlap>> = vec![Vec::new(); self.worktrees.len()];
+        // A merged worktree's work is in base already: overlapping it means nothing.
+        let merged = |s: &Side| s.wi.is_some_and(|wi| matches!(landed[wi], Some(Landed::Merged | Landed::Applied)));
         for (i, j, from_i, from_j) in &pairs {
             let (a, b) = (&sides[*i], &sides[*j]);
+            if merged(a) || merged(b) {
+                continue;
+            }
             let (Some(ta), Some(tb)) = (touched(a, from_i), touched(b, from_j)) else {
                 continue;
             };
@@ -920,11 +989,12 @@ impl Worker {
         }
 
         let mut changed = false;
-        for ((w, ch), mut ov) in self.worktrees.iter_mut().zip(changes).zip(overlaps) {
+        for (((w, ch), mut ov), l) in self.worktrees.iter_mut().zip(changes).zip(overlaps).zip(landed) {
             ov.sort_by(|a, b| b.files.len().cmp(&a.files.len()).then_with(|| a.with.cmp(&b.with)));
-            changed |= w.changes != ch || w.overlaps != ov;
+            changed |= w.changes != ch || w.overlaps != ov || w.landed != l;
             w.changes = ch;
             w.overlaps = ov;
+            w.landed = l;
         }
         changed
     }
@@ -1010,6 +1080,9 @@ fn watch_dirs(watcher: &mut RecommendedWatcher, ignored: Vec<PathBuf>, dirs: Vec
     }
     Some(tw)
 }
+
+/// (base sha, HEAD, branch).
+type LandedKey = (String, String, Option<String>);
 
 fn sorted_pair(a: String, b: String) -> (String, String) {
     if a <= b { (a, b) } else { (b, a) }

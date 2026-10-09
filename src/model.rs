@@ -45,6 +45,31 @@ pub struct WorktreeView {
     pub changes: Option<Arc<Changes>>,
     /// Other worktrees (or the base branch) that changed some of the same files.
     pub overlaps: Vec<Overlap>,
+    /// Whether its commits are already in the base branch (`None`: not known to be, or it is
+    /// the base branch).
+    pub landed: Option<Landed>,
+}
+
+/// How a worktree's committed work relates to the base branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landed {
+    /// HEAD is in the base branch (merged or fast-forwarded), after commits of its own.
+    Merged,
+    /// HEAD isn't in the base branch, but every file it changed since forking has the same
+    /// content there: squash-merged, rebased or cherry-picked.
+    Applied,
+    /// The branch never moved since it was created: no work of its own yet.
+    Unused,
+}
+
+/// Whether removing a worktree (and its branch) would lose nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Merged, nothing uncommitted, no agent busy in it.
+    Safe,
+    /// Merged and no tracked changes, but untracked files would be lost.
+    Untracked,
+    No,
 }
 
 impl WorktreeView {
@@ -75,6 +100,29 @@ impl WorktreeView {
     /// Whether `git status` can run here at all.
     pub fn has_worktree(&self) -> bool {
         !self.bare && self.prunable.is_none()
+    }
+
+    pub fn is_merged(&self) -> bool {
+        matches!(self.landed, Some(Landed::Merged | Landed::Applied))
+    }
+
+    /// Whether this worktree could be removed without losing anything. Never the main worktree
+    /// or one on the `base` branch; not while locked, mid-operation or while an agent is busy
+    /// in it (`agent_busy`).
+    pub fn cleanup(&self, base: Option<&str>, agent_busy: bool) -> Cleanup {
+        let Some(st) = &self.status else { return Cleanup::No };
+        let removable = self.has_worktree()
+            && !self.is_main
+            && (base.is_none() || self.branch.as_deref() != base)
+            && self.locked.is_none()
+            && self.op.is_none();
+        if !removable || !self.is_merged() || agent_busy || st.staged + st.modified + st.unmerged > 0 {
+            Cleanup::No
+        } else if st.untracked > 0 {
+            Cleanup::Untracked
+        } else {
+            Cleanup::Safe
+        }
     }
 }
 

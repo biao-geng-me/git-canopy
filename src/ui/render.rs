@@ -14,7 +14,7 @@ use super::{App, Focus, InsetText, LayoutMode, WtFields};
 use crate::diff::FileDiff;
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::herdr::{self, AgentState};
-use crate::model::WorktreeView;
+use crate::model::{Cleanup, Landed, WorktreeView};
 
 pub const C_STAGED: Color = Color::Green;
 pub const C_MODIFIED: Color = Color::Yellow;
@@ -167,6 +167,16 @@ pub fn marker(w: &WorktreeView) -> Span<'static> {
     }
 }
 
+/// `⌫` when a worktree could be cleaned up: green when nothing would be lost, yellow when its
+/// untracked files would be.
+pub fn cleanup_span(c: Cleanup) -> Option<Span<'static>> {
+    match c {
+        Cleanup::Safe => Some(Span::styled("⌫", Style::new().fg(Color::Green))),
+        Cleanup::Untracked => Some(Span::styled("⌫", Style::new().fg(C_MODIFIED))),
+        Cleanup::No => None,
+    }
+}
+
 /// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts.
 pub fn count_spans(w: &WorktreeView) -> Vec<Span<'static>> {
     let mut out = Vec::new();
@@ -202,11 +212,14 @@ pub fn count_spans(w: &WorktreeView) -> Vec<Span<'static>> {
     out
 }
 
-/// Ahead/behind: vs the base branch (`↑a ↓b`), and vs upstream (`⇡a ⇣b`) when not in sync.
+/// Ahead/behind: vs the base branch (`↑a ↓b`, or `merged` once its work is in base), and vs
+/// upstream (`⇡a ⇣b`) when not in sync.
 fn ab_spans(w: &WorktreeView, base: Option<&str>) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let is_base = base.is_some() && w.branch.as_deref() == base;
-    if !is_base && let Some((a, b)) = w.vs_base {
+    if w.is_merged() {
+        out.push(Span::styled("merged", Style::new().fg(Color::Green)));
+    } else if !is_base && let Some((a, b)) = w.vs_base {
         if a > 0 {
             out.push(Span::styled(format!("↑{a}"), Style::new().fg(Color::Green)));
         }
@@ -242,9 +255,12 @@ fn ab_spans(w: &WorktreeView, base: Option<&str>) -> Vec<Span<'static>> {
     spaced
 }
 
-/// What a worktree changed since forking from the base branch: `+412 -38` (empty when nothing).
+/// What a worktree changed since forking from the base branch: `+412 -38` (empty when nothing,
+/// or when that is in base already).
 fn size_spans(w: &WorktreeView) -> Vec<Span<'static>> {
-    let Some(ch) = &w.changes else { return Vec::new() };
+    let Some(ch) = w.changes.as_ref().filter(|_| !w.is_merged()) else {
+        return Vec::new();
+    };
     let k = |n: u64| {
         if n >= 10_000 {
             format!("{}k", n / 1000)
@@ -320,7 +336,7 @@ fn wt_rows(app: &App, wide: bool) -> Vec<WtRow> {
                 style = style.fg(C_DIM);
             }
             WtRow {
-                marker: marker(w),
+                marker: cleanup_span(app.cleanup(wi)).unwrap_or_else(|| marker(w)),
                 name: Span::styled(w.name.clone(), style),
                 agent: app.agent_activity(wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
                 counts: count_spans(w),
@@ -787,8 +803,11 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
                     .worktrees
                     .iter()
                     .position(|w| w.name == l.text && w.prunable.is_none());
-                if let Some(act) = wi.and_then(|wi| app.agent_activity(wi)) {
-                    spans.extend(agent_spans(act, false));
+                if let Some(wi) = wi {
+                    if let Some(act) = app.agent_activity(wi) {
+                        spans.extend(agent_spans(act, false));
+                    }
+                    spans.extend(cleanup_span(app.cleanup(wi)));
                 }
                 spans.push(Span::raw(" "));
             }
@@ -876,11 +895,12 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
                 if let Some(act) = app.agent_activity(wi) {
                     spans.extend(agent_spans(act, false));
                 }
+                spans.extend(cleanup_span(app.cleanup(wi)));
                 spans.push(Span::raw(" "));
                 spans.extend(count_spans(w));
                 spans.push(Span::styled(
                     " uncommitted",
-                    Style::new().fg(C_DIM).add_modifier(Modifier::ITALIC),
+                    Style::new().fg(Color::Red).add_modifier(Modifier::ITALIC),
                 ));
             }
             Line::from(spans)
@@ -986,7 +1006,8 @@ pub fn tilde(p: &std::path::Path) -> String {
     }
 }
 
-fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
+fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
+    let w = app.snap.worktrees.get(wi)?;
     let dim = Style::new().fg(C_DIM);
     let mut spans = vec![Span::raw(tilde(&w.path))];
     let sep = || Span::styled("  ·  ", dim);
@@ -1031,7 +1052,27 @@ fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
             }
         }
     }
-    if watching && !w.watched && w.has_worktree() {
+    let base = app.snap.base.as_deref().unwrap_or("base");
+    let landed = match w.landed {
+        Some(Landed::Merged) => Some(format!("merged into {base}")),
+        Some(Landed::Applied) => Some(format!("in {base} (squashed or rebased)")),
+        Some(Landed::Unused) => Some("no commits of its own".to_string()),
+        None => None,
+    };
+    if let Some(text) = landed {
+        spans.push(sep());
+        let style = if w.is_merged() { Style::new().fg(Color::Green) } else { dim };
+        spans.push(Span::styled(text, style));
+    }
+    match app.cleanup(wi) {
+        Cleanup::Safe => spans.push(Span::styled(", safe to clean up", Style::new().fg(Color::Green))),
+        Cleanup::Untracked => spans.push(Span::styled(
+            ", cleaning up would lose untracked files",
+            Style::new().fg(C_MODIFIED),
+        )),
+        Cleanup::No => {}
+    }
+    if app.snap.watching && !w.watched && w.has_worktree() {
         spans.push(sep());
         spans.push(Span::styled("not watched: polled", dim));
     }
@@ -1047,18 +1088,14 @@ fn worktree_details(w: &WorktreeView, watching: bool) -> Line<'static> {
             Style::new().fg(C_CONFLICT),
         ));
     }
-    Line::from(spans)
+    Some(Line::from(spans))
 }
 
 fn graph_details(app: &App) -> Option<Line<'static>> {
     let g = &app.snap.graph;
     let row = app.graph.lines.get(app.graph.pos.sel)?.row();
     match g.rows.get(row)?.kind {
-        RowKind::Uncommitted(wi) => app
-            .snap
-            .worktrees
-            .get(wi)
-            .map(|w| worktree_details(w, app.snap.watching)),
+        RowKind::Uncommitted(wi) => worktree_details(app, wi),
         RowKind::Commit(ci) => {
             let c = &g.commits[ci];
             let dim = Style::new().fg(C_DIM);
@@ -1676,7 +1713,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let line = match app.focus {
-        Focus::Worktrees => app.selected_worktree().map(|w| worktree_details(w, app.snap.watching)),
+        Focus::Worktrees => app
+            .wt
+            .lines
+            .get(app.wt.pos.sel)
+            .and_then(|l| worktree_details(app, l.row())),
         Focus::Graph => graph_details(app),
     };
     if app.notice.is_some() {

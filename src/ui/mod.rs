@@ -31,7 +31,7 @@ use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
 use crate::graph::RowKind;
 use crate::herdr;
-use crate::model::Snapshot;
+use crate::model::{Cleanup, Snapshot};
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
 use inset::{Entry, Expansion, Item, Key, Open, VLine};
@@ -728,6 +728,16 @@ impl App {
     /// The agents working in worktree `wi`, summarized.
     pub fn agent_activity(&self, wi: usize) -> Option<herdr::Activity> {
         herdr::activity(self.herdr.as_ref()?, self.agents.get(wi)?)
+    }
+
+    /// Whether worktree `wi` could be removed (with its branch) without losing anything. Any
+    /// agent in it that isn't idle or done counts as busy.
+    pub fn cleanup(&self, wi: usize) -> Cleanup {
+        let Some(w) = self.snap.worktrees.get(wi) else { return Cleanup::No };
+        let busy = self
+            .agent_activity(wi)
+            .is_some_and(|a| !matches!(a.state, herdr::AgentState::Idle | herdr::AgentState::Done));
+        w.cleanup(self.snap.base.as_deref(), busy)
     }
 
     /// How many of this repo's agents are in `state`.

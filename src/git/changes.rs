@@ -84,6 +84,39 @@ pub fn worktree(wt: &Path, from: &str, paths: Option<&[String]>) -> Result<Vec<F
         .collect())
 }
 
+/// Whether every path in `paths` has the same content (or is absent) in commits `a` and `b`.
+pub fn same_content(dir: &Path, a: &str, b: &str, paths: &[String]) -> Result<bool> {
+    let mut args: Vec<String> = ["diff-tree", "-r", "--quiet", "--no-renames", "--no-ext-diff", a, b, "--"]
+        .map(String::from)
+        .to_vec();
+    args.extend(paths.iter().map(|p| format!(":(literal){p}")));
+    let out = super::command(dir, &args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!("git diff-tree: {}", lossy(&out.stderr).trim()),
+    }
+}
+
+/// Number of entries in a branch's reflog, counting at most `max` (0 when it has none, e.g.
+/// `core.logAllRefUpdates` off).
+pub fn reflog_len(dir: &Path, branch: &str, max: usize) -> Result<usize> {
+    let out = super::run(
+        dir,
+        &[
+            "log",
+            "-g",
+            "--format=%H",
+            &format!("-n{max}"),
+            &format!("refs/heads/{branch}"),
+            "--",
+        ],
+    )?;
+    Ok(out.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count())
+}
+
 /// `adds\tdels\tpath\0` records (`-\t-\t` for binary files), as written by `--numstat -z
 /// --no-renames`.
 pub fn parse_numstat(bytes: &[u8]) -> Vec<FileChange> {

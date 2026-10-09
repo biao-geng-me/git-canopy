@@ -156,8 +156,16 @@ races the agent and breaks the "never interfere" guarantee); a key hands off to 
   opens a shell; a change-size column (`+412 −38` vs the base branch, uncommitted included); `b` diffs
   a worktree against its merge base with the base branch (everything the agent did); overlap warnings
   between worktrees that touch the same files.
-- **Later:** graph search and a per-worktree filter; cleanup hints (merged into base, prunable, idle for
-  days; shown, not acted on); `e` opens `$EDITOR` at the file/line under the cursor.
+- **Cleanup (step 1 built, step 2 planned):** `⌫` marks worktrees that are safe to clean up (see
+  Design decisions). Next: canopy's first write, a confirm popup (`C`) listing the `⌫` worktrees
+  with checkboxes that removes the checked ones *and their local branches* (user's call), re-checking
+  status and agents right before acting, never `--force`, never touching remotes, reporting the old
+  sha for recovery. herdr-managed worktrees go through herdr's `worktree.remove` (takes a
+  `workspace_id`; verify against a throwaway herdr first whether it deletes the branch and refuses
+  dirty trees), others through `git worktree remove` + `git branch -d/-D`. This revises the
+  read-only rule for this one explicit, confirmed, verified-safe action.
+- **Later:** graph search and a per-worktree filter; `e` opens `$EDITOR` at the file/line under the
+  cursor.
 - Not planned: notifications (herdr already notifies on blocked agents).
 
 ### Multi-repo (planned for 0.4, not built)
@@ -299,6 +307,19 @@ Agents often work in several projects at once; one canopy should be able to watc
   `diff-index` calls per pair, not per file. The view reloads when this worktree, any other side
   in it, or the overlaps change. `yd` gives both sides' raw patches with `#` comment lines: for
   pasting to an agent, not for `git apply`.
+- **Merged / safe to clean up:** `WorktreeView::landed`, computed in the worker per (base sha, HEAD,
+  branch) and cached. HEAD in base (`ahead == 0`): `Merged` if the branch's reflog has more than its
+  creation entry (fast-forwarded or merged after commits of its own), else `Unused` (a fresh
+  worktree, which must not read as "done"); no reflog / detached: unknown. HEAD not in base:
+  `Applied` when every file it changed since the fork is identical at the base tip (`diff-tree
+  --quiet <head> <base> -- <paths>`, read-only, unlike `merge-tree --write-tree`), which catches
+  squash merges, rebases and cherry-picks; conservative when base has changed those files again.
+  Merged worktrees show `merged` instead of `↑a ↓b`, no change size, and take no part in overlaps
+  (their work being in base isn't a conflict). `WorktreeView::cleanup` adds the rest: not the main
+  worktree, not on base, not locked or mid-operation, no staged/modified/unmerged files, no agent
+  other than idle/done (`App::cleanup`) → `⌫` green (`Safe`), yellow when only untracked files would
+  be lost (`Untracked`). Same glyph after `[name]` in the graph; the details line spells it out.
+  `⌫`, not `✓`, which is herdr's "done". The `◌` row's "uncommitted" word is red.
 - **Diff vs base (`b`):** `diff::Target::Branch { path, base }` resolves `merge-base <base> HEAD` at
   load time (so it never goes stale) and shows `diff-index -p <merge base>` + untracked, like the
   worktree diff. Copy (`yd`) gives the same as a patch.
