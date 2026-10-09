@@ -167,14 +167,22 @@ pub fn marker(w: &WorktreeView) -> Span<'static> {
     }
 }
 
+const CLEANUP_GLYPH: &str = "⌫";
+
 /// `⌫` when a worktree could be cleaned up: green when nothing would be lost, yellow when its
 /// untracked files would be.
 pub fn cleanup_span(c: Cleanup) -> Option<Span<'static>> {
     match c {
-        Cleanup::Safe => Some(Span::styled("⌫", Style::new().fg(Color::Green))),
-        Cleanup::Untracked => Some(Span::styled("⌫", Style::new().fg(C_MODIFIED))),
+        Cleanup::Safe => Some(Span::styled(CLEANUP_GLYPH, Style::new().fg(Color::Green))),
+        Cleanup::Untracked => Some(Span::styled(CLEANUP_GLYPH, Style::new().fg(C_MODIFIED))),
         Cleanup::No => None,
     }
+}
+
+/// Spaces after the worktree rows' marker column: two when a row shows `⌫`, which many fonts
+/// draw wider than its cell.
+fn marker_gap(rows: &[WtRow]) -> usize {
+    if rows.iter().any(|r| r.marker.content == CLEANUP_GLYPH) { 2 } else { 1 }
 }
 
 /// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts.
@@ -366,7 +374,8 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
     let overlap = rows.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
     // side margins + marker + gaps
     let natural = 2
-        + 2
+        + 1
+        + marker_gap(&rows)
         + name
         + 1
         + if agent > 0 { agent + 1 } else { 0 }
@@ -403,6 +412,8 @@ fn pad(s: String, width: usize) -> String {
 
 /// Column widths shared by all worktree rows.
 struct WtCols {
+    /// Spaces between the marker and the name.
+    marker_gap: usize,
     name: usize,
     /// herdr agent marker column (0 when no worktree has an agent).
     agent: usize,
@@ -474,7 +485,7 @@ fn wt_line(
 ) -> (Line<'static>, WtFields) {
     let dim = Style::new().fg(C_DIM);
     let mut fields = WtFields::default();
-    let mut spans = vec![row.marker, Span::raw(" ")];
+    let mut spans = vec![row.marker, Span::raw(" ".repeat(cols.marker_gap))];
     spans.push(Span::styled(
         pad(truncate(&row.name.content, cols.name), cols.name),
         row.name.style,
@@ -615,7 +626,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let name_natural = rows.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
     let size = rows.iter().map(|r| spans_width(&r.size)).max().unwrap_or(0);
     let overlap = rows.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
-    let fixed = 2
+    let gap = marker_gap(&rows);
+    let fixed = 1
+        + gap
         + 1
         + counts
         + if ab > 0 { 1 + ab } else { 0 }
@@ -655,6 +668,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     };
     let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
     let cols = WtCols {
+        marker_gap: gap,
         name: name_natural
             .min(NAME_MAX)
             .min(width.saturating_sub(fixed + agent).max(6)),
@@ -807,7 +821,9 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
                     if let Some(act) = app.agent_activity(wi) {
                         spans.extend(agent_spans(act, false));
                     }
-                    spans.extend(cleanup_span(app.cleanup(wi)));
+                    if let Some(c) = cleanup_span(app.cleanup(wi)) {
+                        spans.extend([c, Span::raw(" ")]);
+                    }
                 }
                 spans.push(Span::raw(" "));
             }
@@ -895,7 +911,9 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
                 if let Some(act) = app.agent_activity(wi) {
                     spans.extend(agent_spans(act, false));
                 }
-                spans.extend(cleanup_span(app.cleanup(wi)));
+                if let Some(c) = cleanup_span(app.cleanup(wi)) {
+                    spans.extend([c, Span::raw(" ")]);
+                }
                 spans.push(Span::raw(" "));
                 spans.extend(count_spans(w));
                 spans.push(Span::styled(
