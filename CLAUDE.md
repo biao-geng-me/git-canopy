@@ -279,6 +279,11 @@ Agents often work in several projects at once; one canopy should be able to watc
 - **Worktree row fields are clickable:** render records each row's agent-marker and path column
   ranges (`App::wt_fields`); a double-click on them focuses the agent / opens a shell, anywhere else
   opens the diff as before.
+- **Mouse:** the line under the pointer gets a faint highlight (`HOVER`, fainter than the
+  selection; `App::hover` is a screen row, so it follows scrolling, and keys clear it). Motion
+  events only redraw when the hovered row changes. Clicking a worktree always jumps the graph to it,
+  even if it was already selected (the graph cursor may have been moved away); a second click on it
+  toggles its graph row, like Space in the list.
 - **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
   the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/
@@ -381,7 +386,8 @@ Agents often work in several projects at once; one canopy should be able to watc
   body's column; the subject is not truncated while open), the message body wrapped to the panel width, one line per
   file, and for open files their diff
   from the first hunk (max 200 lines, then "… n more"). The cursor moves over every visual line
-  (magit-style). Space/click toggles a row or file; Space/← inside a diff folds the enclosing section;
+  (magit-style). Space, or a click on the line already selected in the focused panel, toggles a row
+  or file (a first click only focuses/selects); Space/← inside a diff folds the enclosing section;
   Enter/double-click opens the full view at that file/line (a double-click undoes its first click's
   toggle); Esc folds the row under the cursor (or everything). Wrapping is recomputed when the graph
   width changes (`App::set_wrap_width`, called from render). The worktree panel doesn't expand

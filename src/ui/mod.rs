@@ -206,8 +206,8 @@ struct Click {
     at: Instant,
     panel: Focus,
     line: usize,
-    /// Whether the click expanded/collapsed something (undone if it becomes a double-click).
-    toggled: bool,
+    /// The line the click expanded/collapsed, if any (undone if it becomes a double-click).
+    toggled: Option<(Focus, usize)>,
 }
 
 pub struct App {
@@ -252,6 +252,10 @@ pub struct App {
     next_id: u64,
     tx: Sender<UiMsg>,
     last_click: Option<Click>,
+    /// The mouse pointer's panel and screen row, for the hover highlight (cleared by a key).
+    pub hover: Option<(Focus, u16)>,
+    /// Whether the last handled message changed anything on screen.
+    redraw: bool,
     /// Graph row count when "load more" was last requested, to ask only once per page.
     more_requested_at: usize,
     worker: watch::Handle,
@@ -288,6 +292,8 @@ impl App {
             next_id: 0,
             tx,
             last_click: None,
+            hover: None,
+            redraw: true,
             more_requested_at: 0,
             worker,
         }
@@ -664,6 +670,7 @@ impl App {
                 }
             }
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                self.hover = None;
                 if self.confirm.is_some() {
                     self.on_confirm_key(k);
                 } else if std::mem::take(&mut self.copy_pending) {
@@ -682,6 +689,15 @@ impl App {
                     }
                 }
                 self.rebuild();
+            }
+            UiMsg::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved => {
+                let hover = if self.diff.is_some() || self.confirm.is_some() || self.help {
+                    None
+                } else {
+                    self.hover_at(Position::new(m.column, m.row))
+                };
+                self.redraw = hover != self.hover;
+                self.hover = hover;
             }
             UiMsg::Input(Event::Mouse(_)) if self.confirm.is_some() => {}
             UiMsg::Input(Event::Mouse(m)) => {
@@ -1330,8 +1346,20 @@ impl App {
         }
     }
 
+    /// The panel and screen row under the pointer, when it is over a line of a panel's content.
+    fn hover_at(&self, pos: Position) -> Option<(Focus, u16)> {
+        if self.shell.is_some() && self.areas.shell.contains(pos) {
+            return None;
+        }
+        [(Focus::Worktrees, self.areas.worktrees), (Focus::Graph, self.areas.graph)]
+            .into_iter()
+            .find(|(_, a)| render::content(*a).contains(pos))
+            .map(|(f, _)| (f, pos.y))
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        self.hover = self.hover_at(pos);
         if let Some(shell) = self.shell.as_mut()
             && self.areas.shell.contains(pos)
         {
@@ -1356,6 +1384,7 @@ impl App {
         let Some((f, area)) = hit else { return };
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                let was_focused = self.focus == f;
                 self.focus = f;
                 let inner = render::content(area);
                 if !inner.contains(pos) {
@@ -1365,9 +1394,12 @@ impl App {
                 if idx >= self.panel(f).lines.len() {
                     return;
                 }
-                let before = self.panel(f).lines.get(self.panel(f).pos.sel).map(|l| l.row());
+                // The first click selects; a click on the line already selected (in the focused
+                // panel) expands/collapses it.
+                let selected = was_focused && self.panel(f).pos.sel == idx;
                 self.set_cursor(f, idx);
-                if f == Focus::Worktrees && before != Some(self.panel(f).lines[idx].row()) {
+                if f == Focus::Worktrees {
+                    // Always, also when the graph cursor was moved away from this worktree.
                     self.jump_graph_to_selected();
                 }
                 let now = Instant::now();
@@ -1378,8 +1410,8 @@ impl App {
                 if let Some(first) = double {
                     // Double-click: undo the first click's expand/collapse, then act on what was
                     // clicked: a worktree's agent marker or path, else open the full view.
-                    if first.toggled {
-                        self.toggle_at(f, idx);
+                    if let Some((tf, tl)) = first.toggled {
+                        self.toggle_at(tf, tl);
                     }
                     self.last_click = None;
                     match self.wt_field_at(f, idx, m.column - inner.x) {
@@ -1389,7 +1421,16 @@ impl App {
                         None => self.open_full(f, idx),
                     }
                 } else {
-                    let toggled = self.toggle_at(f, idx);
+                    let toggled = if !selected {
+                        None
+                    } else if f == Focus::Worktrees {
+                        // Like Space in the list: act on the worktree's row in the graph.
+                        let on_row = self.graph_cursor_to_selected_worktree();
+                        let l = self.graph.pos.sel;
+                        (on_row && self.toggle_at(Focus::Graph, l)).then_some((Focus::Graph, l))
+                    } else {
+                        self.toggle_at(f, idx).then_some((f, idx))
+                    };
                     self.last_click = Some(Click {
                         at: now,
                         panel: f,
@@ -1608,15 +1649,22 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, 
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Receiver<UiMsg>) -> Result<()> {
+    let mut draw = true;
     loop {
-        terminal.draw(|f| render::draw(f, app))?;
+        if draw {
+            terminal.draw(|f| render::draw(f, app))?;
+        }
         let Ok(msg) = rx.recv() else { return Ok(()) };
+        app.redraw = true;
         app.handle(msg);
+        draw = app.redraw;
         // Coalesce whatever else is queued so bursts of input or snapshots cost one redraw.
         while !app.quit
             && let Ok(msg) = rx.try_recv()
         {
+            app.redraw = true;
             app.handle(msg);
+            draw |= app.redraw;
         }
         if app.quit {
             return Ok(());

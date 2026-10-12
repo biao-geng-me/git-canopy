@@ -44,7 +44,7 @@ tree doing, and which ones are dirty?" on one screen:
   and its path.
 - **Graph** (top): the commit graph of all branches, remotes and tags, with authors. Each worktree's
   HEAD is labelled `[name]`, and a dirty worktree gets a `◌` "uncommitted" row right above its HEAD.
-- **Expand in place** (graph): `Space` (or a click) on a commit or a `◌` row unfolds its full
+- **Expand in place** (graph): `Space` (or a click on the selected line) on a commit or a `◌` row unfolds its full
   subject and message (wrapped) and its changed files right there; `Space` on a file unfolds its diff.
   `Esc` folds back. `Enter` (or a double-click) opens the full diff view.
 - **Layout:** stacked by default; `v` (or `--layout side`) puts the worktrees beside the graph.
@@ -121,7 +121,7 @@ git canopy [OPTIONS] [PATH]
 | --- | --- |
 | `↑` `↓` / `j` `k` | move, through expanded lines too (selecting a worktree jumps the graph to it) |
 | `PgUp` `PgDn`, `Ctrl-u` `Ctrl-d`, `g` `G` | page, half page, first, last |
-| `Space`, click | graph: expand / collapse a commit or `◌` row (message, files), or a file (its diff) |
+| `Space`, click the selected line | graph: expand / collapse a commit or `◌` row (message, files), or a file (its diff) |
 | `→` `←` / `l` `h` | expand / collapse (from inside a diff, `←` folds the enclosing file, then the row) |
 | `Esc` | fold the expansion under the cursor back to its row (on a folded row: fold everything) |
 | `Enter`, double-click | full diff view, opened at the file and line under the cursor |
@@ -153,7 +153,7 @@ to the list. Anywhere: `n` / `p` next/previous file, `PgUp` `PgDn` `Space` scrol
 sideways, `r` reloads, `q` goes back to the overview. A worktree diff reloads by itself when that
 worktree's status changes, keeping the selected file and scroll position.
 
-The mouse works too: click to select, wheel to scroll.
+The mouse works too: the line under the pointer is faintly highlighted; a click selects, a second click on the selected line expands or collapses it (on a worktree: its row in the graph), a double-click opens the full view; the wheel scrolls. Clicking a worktree always moves the graph to it, also when the graph cursor was moved elsewhere.
 
 ### Markers
 

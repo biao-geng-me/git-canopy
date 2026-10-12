@@ -30,6 +30,8 @@ const C_HASH: Color = Color::Indexed(136);
 pub const C_OVERLAP: Color = Color::LightRed;
 const SEL_FOCUSED: Color = Color::Indexed(238);
 const SEL_UNFOCUSED: Color = Color::Indexed(235);
+/// The line under the mouse pointer: fainter than the selection.
+const HOVER: Color = Color::Indexed(236);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, rule, footer] =
@@ -111,8 +113,16 @@ pub fn content(area: Rect) -> Rect {
     panel(Line::default(), false).inner(area)
 }
 
-/// Paint `lines` into `inner`, one per row, highlighting row `sel` across the full width.
-fn paint_rows(f: &mut Frame, inner: Rect, lines: Vec<Line<'static>>, sel: Option<usize>, focused: bool) {
+/// Paint `lines` into `inner`, one per row, highlighting row `sel` across the full width, and
+/// faintly the row `hover` (a screen row) under the mouse pointer.
+fn paint_rows(
+    f: &mut Frame,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    sel: Option<usize>,
+    hover: Option<u16>,
+    focused: bool,
+) {
     for (i, line) in lines.into_iter().enumerate() {
         if i as u16 >= inner.height {
             break;
@@ -125,9 +135,16 @@ fn paint_rows(f: &mut Frame, inner: Rect, lines: Vec<Line<'static>>, sel: Option
         let mut p = Paragraph::new(line);
         if sel == Some(i) {
             p = p.style(Style::new().bg(if focused { SEL_FOCUSED } else { SEL_UNFOCUSED }));
+        } else if hover == Some(row.y) {
+            p = p.style(Style::new().bg(HOVER));
         }
         f.render_widget(p, row);
     }
+}
+
+/// The screen row under the mouse pointer in panel `p` (see `App::hover`).
+fn hover_row(app: &App, p: Focus) -> Option<u16> {
+    app.hover.filter(|&(f, _)| f == p).map(|(_, y)| y)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -723,7 +740,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
         .collect();
     app.wt_fields = fields;
     let sel = app.wt.pos.sel.checked_sub(app.wt.pos.offset);
-    paint_rows(f, inner, lines, sel, true);
+    paint_rows(f, inner, lines, sel, hover_row(app, Focus::Worktrees), true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1018,7 +1035,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
     let sel = app.graph.pos.sel.checked_sub(app.graph.pos.offset);
-    paint_rows(f, inner, lines, sel, true);
+    paint_rows(f, inner, lines, sel, hover_row(app, Focus::Graph), true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1537,7 +1554,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect();
         let sel = d.sel.checked_sub(d.list_offset);
-        paint_rows(f, inner, lines, sel, d.pane == Pane::Files);
+        paint_rows(f, inner, lines, sel, None, d.pane == Pane::Files);
         body
     } else {
         d.list_area = Rect::default();
