@@ -2,9 +2,14 @@
 name = "git-canopy"
 version = "0.3.0"
 edition = "2024"
-description = "Live TUI showing every git worktree of a repo at a glance"
+description = "Many trees, one canopy: a live TUI showing every git worktree of a repo at a glance"
+authors = ["Biao Geng <biao.geng.me@gmail.com>"]
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/biao-geng-me/git-canopy"
+homepage = "https://github.com/biao-geng-me/git-canopy"
+keywords = ["git", "worktree", "tui", "agents", "graph"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "canopy"

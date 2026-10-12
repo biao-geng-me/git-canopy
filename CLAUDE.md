@@ -195,7 +195,12 @@ Agents often work in several projects at once; one canopy should be able to watc
 
 ## Conventions
 
-- Commit after each milestone (small, descriptive messages). No remote is configured; don't push.
+- Commit after each milestone (small, descriptive messages). Remote: `origin` =
+  github.com/biao-geng-me/git-canopy (public). Push and publish releases only when the user asks.
+- Releases: bump `Cargo.toml`, commit "Release x.y.z", annotated tag `vx.y.z` ("canopy x.y.z"), then a
+  GitHub release with `canopy-x86_64-unknown-linux-musl.tar.gz` (static musl build: `canopy`,
+  README, LICENSE) and its `.sha256` (`scripts/release.sh`). The asset name has no version so
+  `releases/latest/download/...` in the README stays valid.
 - Keep `cargo clippy` clean and `cargo test` green.
 - README.md for users; this file for design intent — update it when design decisions change.
 

@@ -1,5 +1,7 @@
 # canopy
 
+*Many trees, one canopy.*
+
 A live-updating terminal view of every git worktree of a repo, the view from above the trees.
 
 When several agents (or people) each work in their own linked worktree, canopy answers "what is every
@@ -54,14 +56,26 @@ you over to a git TUI.
 
 ## Install
 
-Requires `git` (2.36 or newer) at runtime, and a Rust toolchain to build.
+Requires `git` (2.36 or newer) at runtime. Linux (including WSL2) is what canopy is built and tested
+on; other Unixes may work.
+
+**Prebuilt (Linux x86_64):** a fully static binary is attached to each
+[release](https://github.com/biao-geng-me/git-canopy/releases):
 
 ```sh
-cargo install --path .            # installs the `canopy` binary
-ln -s "$(command -v canopy)" ~/.local/bin/git-canopy   # optional: makes `git canopy` work
+curl -L https://github.com/biao-geng-me/git-canopy/releases/latest/download/canopy-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz -C ~/.local/bin canopy
 ```
 
-For a fully static Linux binary: `cargo build --release --target x86_64-unknown-linux-musl`.
+**From source** (needs a Rust toolchain):
+
+```sh
+cargo install --git https://github.com/biao-geng-me/git-canopy   # installs the `canopy` binary
+```
+
+Optional: `ln -s "$(command -v canopy)" ~/.local/bin/git-canopy` makes `git canopy` work.
+
+For a fully static Linux binary from a checkout: `cargo build --release --target x86_64-unknown-linux-musl`.
 
 ## Usage
 
@@ -236,6 +250,8 @@ scripts/mkfixture.sh [DIR]       # throwaway repo with worktrees in every intere
 scripts/mkbigrepo.sh [DIR]       # 20k commits, 15 worktrees, for performance checks
 cargo run --release --example startup -- DIR/repo   # time to first worktree list / statuses / graph
 cargo run --example herdr -- . 30                      # what canopy sees from herdr (read-only calls)
+scripts/install-dev.sh           # canopy/git-canopy on PATH -> target/release, rebuilt after each commit
+scripts/release.sh               # static release tarball + sha256 in target/dist
 ```
 
 See `CLAUDE.md` for the design notes.
