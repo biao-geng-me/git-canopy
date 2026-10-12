@@ -367,3 +367,24 @@ fn merged_worktrees_are_marked_for_cleanup() {
         !w.is_dirty() && w.landed.is_none()
     });
 }
+
+#[test]
+fn moved_head_refreshes_status() {
+    // A commit made from another machine on a network filesystem: the branch moves but this
+    // machine sees no event for the worktree's index or files. Only the refs change is noticed
+    // (here by its event, otherwise by the refs poll), and that alone must refresh the status.
+    let fx = common::Fixture::new();
+    let cfg = Config {
+        interval: Duration::from_secs(3600),
+        ..Config::default()
+    };
+    let (_h, rx) = spawn(&fx, cfg);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| {
+        s.statuses_loaded && s.worktrees.iter().any(|w| w.watched)
+    });
+    assert!(!find(&s, "refactor-db").is_dirty());
+
+    // Move the branch back one commit from the main checkout: its files now differ from HEAD.
+    git(&fx.repo(), &["update-ref", "refs/heads/refactor-db", "refactor-db~1"]);
+    wait_for(&rx, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+}

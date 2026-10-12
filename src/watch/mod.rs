@@ -141,6 +141,10 @@ struct Worker {
     refs: Vec<RefEntry>,
     /// Hash of raw `worktree list` + `for-each-ref` output.
     fingerprint: u64,
+    /// Worktrees whose HEAD or branch moved in the last refs reload: their status is stale. A
+    /// commit made from another machine on a network filesystem sends no event here, so the
+    /// refs poll is the first to notice it.
+    moved: HashSet<PathBuf>,
     base: Option<String>,
     base_sha: Option<String>,
     ab_cache: HashMap<(String, String), (u32, u32)>,
@@ -185,6 +189,7 @@ impl Worker {
             worktrees: Vec::new(),
             refs: Vec::new(),
             fingerprint: 0,
+            moved: HashSet::new(),
             base: None,
             base_sha: None,
             ab_cache: HashMap::new(),
@@ -419,7 +424,7 @@ impl Worker {
         }
     }
 
-    /// New worktrees need a watch, a poll slot and a first status.
+    /// New worktrees need a watch, a poll slot and a first status; moved ones a fresh status.
     fn after_worktree_list_change(&mut self, targets: &mut HashSet<PathBuf>) {
         self.ensure_worktrees_watch();
         self.sync_tree_watches();
@@ -430,6 +435,7 @@ impl Worker {
                 .filter(|w| w.status.is_none() && w.has_worktree())
                 .map(|w| w.path.clone()),
         );
+        targets.extend(self.moved.drain());
     }
 
     fn full_refresh(&mut self) {
@@ -439,6 +445,7 @@ impl Worker {
         self.sync_tree_watches();
         self.due.clear();
         self.schedule();
+        self.moved.clear();
         self.refresh_status(None);
         self.refresh_graph();
         self.refresh_changes();
@@ -552,12 +559,16 @@ impl Worker {
 
         let mut old: HashMap<PathBuf, WorktreeView> = self.worktrees.drain(..).map(|w| (w.path.clone(), w)).collect();
         let current = self.paths.toplevel.as_deref();
+        let moved = &mut self.moved;
         let mut views: Vec<WorktreeView> = entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
                 let mut v = WorktreeView::from_entry(e, i == 0, current);
                 if let Some(prev) = old.remove(&v.path) {
+                    if prev.head != v.head || prev.branch != v.branch {
+                        moved.insert(v.path.clone());
+                    }
                     // Keep the last status until the next status run replaces it.
                     v.status = prev.status;
                     v.status_error = prev.status_error;

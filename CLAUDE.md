@@ -366,6 +366,10 @@ Agents often work in several projects at once; one canopy should be able to watc
 - **Refresh:** every poll tick re-runs `worktree list` + `for-each-ref` (cheap) and all statuses; the
   refs fingerprint gates the log/graph reload, so polling alone covers repos where fs events don't fire.
   fs events only reduce latency. Startup publishes three snapshots: worktree list, + statuses, + graph.
+  A worktree whose HEAD or branch moved in a refs reload gets a fresh status right away
+  (`Worker::moved`): a commit from another machine sharing the filesystem sends no index event
+  here, and the stale (pre-commit, dirty) status would otherwise last until the 10-min fallback,
+  hiding `⌫` meanwhile.
 - **Repo-wide git commands run with `-C <common dir>`**, which works for bare and non-bare repos alike.
 - **Worktree diff uses `git diff-index -p --stat -M HEAD`, not `git diff HEAD`.** Verified on git 2.43:
   porcelain `git diff` refreshes and rewrites the index (taking `index.lock`) when it sees stat-dirty
