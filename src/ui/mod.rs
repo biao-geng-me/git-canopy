@@ -27,6 +27,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::{Position, Rect};
 
+use crate::cleanup;
 use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
 use crate::graph::RowKind;
@@ -63,6 +64,11 @@ pub enum UiMsg {
         notice: String,
         osc52: Option<String>,
     },
+    /// The checks for removing a worktree finished: what removing it will do, for the confirm
+    /// popup, or why it can't be removed.
+    CleanupPlan(Result<cleanup::Plan, String>),
+    /// Removing a worktree finished: the footer notice.
+    CleanupDone(Result<String, String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +227,10 @@ pub struct App {
     pub notice: Option<String>,
     /// `y` was pressed: the next key picks what to copy.
     pub copy_pending: bool,
+    /// Removing a worktree, waiting for the user to confirm.
+    pub confirm: Option<cleanup::Plan>,
+    /// A removal is being checked or carried out (one at a time).
+    cleaning: bool,
     clipboard: Vec<crate::clipboard::Method>,
     /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
@@ -257,6 +267,8 @@ impl App {
             shell_focus: false,
             notice: None,
             copy_pending: false,
+            confirm: None,
+            cleaning: false,
             clipboard: crate::clipboard::methods(),
             with_herdr: true,
             git_tui: None,
@@ -614,13 +626,30 @@ impl App {
                 }
                 self.notice = Some(notice);
             }
+            UiMsg::CleanupPlan(plan) => match plan {
+                Ok(plan) => {
+                    self.notice = None;
+                    self.confirm = Some(plan);
+                }
+                Err(e) => {
+                    self.cleaning = false;
+                    self.notice = Some(e);
+                }
+            },
+            UiMsg::CleanupDone(result) => {
+                self.cleaning = false;
+                self.notice = Some(result.unwrap_or_else(|e| e));
+                self.worker.request(Request::Refresh);
+            }
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
                     d.loaded(result);
                 }
             }
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                if std::mem::take(&mut self.copy_pending) {
+                if self.confirm.is_some() {
+                    self.on_confirm_key(k);
+                } else if std::mem::take(&mut self.copy_pending) {
                     self.on_copy_key(k);
                 } else if self.starts_copy(k) {
                     self.notice = None;
@@ -637,6 +666,7 @@ impl App {
                 }
                 self.rebuild();
             }
+            UiMsg::Input(Event::Mouse(_)) if self.confirm.is_some() => {}
             UiMsg::Input(Event::Mouse(m)) => {
                 match self.diff.as_mut() {
                     Some(d) => {
@@ -734,10 +764,12 @@ impl App {
     /// agent in it that isn't idle or done counts as busy.
     pub fn cleanup(&self, wi: usize) -> Cleanup {
         let Some(w) = self.snap.worktrees.get(wi) else { return Cleanup::No };
-        let busy = self
-            .agent_activity(wi)
-            .is_some_and(|a| !matches!(a.state, herdr::AgentState::Idle | herdr::AgentState::Done));
-        w.cleanup(self.snap.base.as_deref(), busy)
+        w.cleanup(self.snap.base.as_deref(), self.agent_busy(wi))
+    }
+
+    fn agent_busy(&self, wi: usize) -> bool {
+        self.agent_activity(wi)
+            .is_some_and(|a| !matches!(a.state, herdr::AgentState::Idle | herdr::AgentState::Done))
     }
 
     /// How many of this repo's agents are in `state`.
@@ -833,6 +865,7 @@ impl App {
                 }
             }
             KeyCode::Char('t') => self.open_git_tui(),
+            KeyCode::Backspace => self.start_cleanup(),
             KeyCode::Char('b') => self.open_branch_diff(),
             KeyCode::Char('o') => {
                 if let Some(wi) = self.focused_wi() {
@@ -1087,6 +1120,90 @@ impl App {
             }
             let _ = tx.send(UiMsg::ShellInset(path, command));
         });
+    }
+
+    /// Backspace: remove the focused worktree with its branch (and herdr workspace) once the user
+    /// confirms. Only for worktrees marked `⌫` (their work is in base, nothing would be lost);
+    /// everything is checked again off the UI thread before the confirm popup opens.
+    fn start_cleanup(&mut self) {
+        if self.cleaning {
+            self.notice = Some("a removal is already in progress".into());
+            return;
+        }
+        let Some(wi) = self.cleanup_target() else { return };
+        let w = self.snap.worktrees[wi].clone();
+        match self.cleanup(wi) {
+            Cleanup::Safe => {}
+            Cleanup::Untracked => {
+                let n = w.status.as_ref().map_or(0, |s| s.untracked);
+                self.notice = Some(format!(
+                    "can't remove {}: {n} untracked file{} would be lost; delete them first (s opens a shell there)",
+                    w.name,
+                    if n == 1 { "" } else { "s" }
+                ));
+                return;
+            }
+            Cleanup::No => {
+                let why = w
+                    .cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(wi))
+                    .unwrap_or_else(|| "it isn't safe to remove".into());
+                self.notice = Some(format!("can't remove {}: {why}", w.name));
+                return;
+            }
+        }
+        let Some(base) = self.snap.base.clone() else { return };
+        let common = self.snap.common_dir.clone();
+        let sock = if self.with_herdr && self.herdr.is_some() { herdr::socket_path() } else { None };
+        let tx = self.tx.clone();
+        self.cleaning = true;
+        self.notice = Some(format!("checking {}…", w.name));
+        spawn_named("canopy-cleanup", move || {
+            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
+            let plan = cleanup::plan(&common, &w, &base, sock, own.as_deref())
+                .map_err(|e| format!("can't remove {}: {e:#}", w.name));
+            let _ = tx.send(UiMsg::CleanupPlan(plan));
+        });
+    }
+
+    /// The worktree Backspace acts on. On a graph commit that several worktrees have checked out
+    /// (a merged branch and its base), the one that can be cleaned up.
+    fn cleanup_target(&self) -> Option<usize> {
+        let focused = self.focused_wi()?;
+        if self.focus != Focus::Graph {
+            return Some(focused);
+        }
+        let head = self.snap.worktrees[focused].head.as_ref();
+        let candidates: Vec<usize> = (0..self.snap.worktrees.len())
+            .filter(|&wi| head.is_some() && self.snap.worktrees[wi].head.as_ref() == head)
+            .collect();
+        [Cleanup::Safe, Cleanup::Untracked]
+            .iter()
+            .find_map(|c| candidates.iter().copied().find(|&wi| self.cleanup(wi) == *c))
+            .or(Some(focused))
+    }
+
+    /// Keys while the confirm popup is open: `y`/Enter removes, Esc/`n`/`q` cancels.
+    fn on_confirm_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let Some(plan) = self.confirm.take() else { return };
+                self.notice = Some(format!("removing {}…", plan.name));
+                let tx = self.tx.clone();
+                spawn_named("canopy-cleanup", move || {
+                    let own = std::env::var("HERDR_WORKSPACE_ID").ok();
+                    let res = cleanup::run(&plan, own.as_deref())
+                        .map_err(|e| format!("didn't remove {}: {e:#}", plan.name));
+                    let _ = tx.send(UiMsg::CleanupDone(res));
+                });
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                self.confirm = None;
+                self.cleaning = false;
+                self.notice = None;
+            }
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            _ => {}
+        }
     }
 
     /// `t`: a git TUI (lazygit, gitui, tig, or `--git-tui`) in the focused worktree, opened like

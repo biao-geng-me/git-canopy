@@ -38,6 +38,13 @@ impl Json {
         }
     }
 
+    pub fn num(&self) -> Option<f64> {
+        match self {
+            Json::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     pub fn arr(&self) -> Option<&[Json]> {
         match self {
             Json::Arr(a) => Some(a),

@@ -2,9 +2,9 @@
 //!
 //! Talks to the herdr server over its Unix socket (newline-delimited JSON). One connection makes
 //! requests (`agent.list`, `workspace.list`); a second one holds an `events.subscribe` stream whose
-//! events are only used as signals to re-read. Everything is read-only except [`focus`] and
-//! [`open_shell_pane`], which the user triggers explicitly. When herdr isn't reachable the feature
-//! stays hidden.
+//! events are only used as signals to re-read. Everything is read-only except [`focus`],
+//! [`open_shell_pane`] and [`remove_worktree_at`], which the user triggers explicitly. When herdr
+//! isn't reachable the feature stays hidden.
 
 pub mod json;
 
@@ -60,6 +60,8 @@ pub struct Agent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
     pub id: String,
+    pub label: String,
+    pub panes: usize,
     /// The worktree the herdr workspace belongs to, if any (canonicalized when it exists).
     pub checkout: Option<PathBuf>,
 }
@@ -115,6 +117,8 @@ pub fn parse_workspaces(resp: &Json) -> Option<Vec<Workspace>> {
             .filter_map(|w| {
                 Some(Workspace {
                     id: w.get_str("workspace_id")?.to_string(),
+                    label: w.get_str("label").unwrap_or_default().to_string(),
+                    panes: w.get("pane_count").and_then(Json::num).unwrap_or(0.0) as usize,
                     checkout: path_of(w.get("worktree").and_then(|t| t.get_str("checkout_path"))),
                 })
             })
@@ -266,7 +270,7 @@ pub fn run_params(pane_id: &str, command: &str) -> String {
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
-pub use client::{focus, focus_at, open_shell_pane, open_shell_pane_at, spawn, spawn_with};
+pub use client::{focus, focus_at, open_shell_pane, open_shell_pane_at, read_view_at, remove_worktree_at, spawn, spawn_with};
 
 /// Without Unix sockets the feature is unavailable.
 #[cfg(not(unix))]

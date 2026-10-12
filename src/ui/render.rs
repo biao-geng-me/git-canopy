@@ -74,6 +74,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_graph(f, app, graph_area);
     draw_shell(f, app, shell_area);
     draw_footer(f, app, footer);
+    if let Some(plan) = &app.confirm {
+        draw_confirm(f, plan);
+    }
     if app.help {
         draw_help(f);
     }
@@ -1083,7 +1086,7 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
         spans.push(Span::styled(text, style));
     }
     match app.cleanup(wi) {
-        Cleanup::Safe => spans.push(Span::styled(", safe to clean up", Style::new().fg(Color::Green))),
+        Cleanup::Safe => spans.push(Span::styled(", safe to clean up (Backspace)", Style::new().fg(Color::Green))),
         Cleanup::Untracked => spans.push(Span::styled(
             ", cleaning up would lose untracked files",
             Style::new().fg(C_MODIFIED),
@@ -1830,6 +1833,7 @@ const HELP: &[(&str, &str)] = &[
     ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
     ("b", "diff vs base: all changes since the fork"),
     ("o  dbl-click ⚠", "overlaps: both sides' changes to shared files"),
+    ("Backspace", "clean up a ⌫ worktree: checkout, branch, herdr workspace"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("y y", "copy the sha / path / file under the cursor"),
     ("y h  y s", "copy sha / short sha"),
@@ -1848,6 +1852,79 @@ const HELP: &[(&str, &str)] = &[
     ("r", "reload"),
     ("q", "back"),
 ];
+
+/// The confirm popup for removing a worktree: exactly what will happen.
+fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
+    let area = f.area();
+    let w = area.width.min(88);
+    let inner = w.saturating_sub(4) as usize;
+    let dim = Style::new().fg(C_DIM);
+    let bullet = |text: String| Line::from(vec![Span::styled(" • ", dim), Span::raw(truncate(&text, inner.saturating_sub(3)))]);
+    let how = match plan.landed {
+        Landed::Applied => "squashed or rebased",
+        _ => "merged",
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(" Remove "),
+            Span::styled(plan.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw("?"),
+        ]),
+        Line::styled(format!(" its work is in {} ({how}); nothing uncommitted", plan.base), dim),
+        Line::raw(""),
+    ];
+    if let Some(ws) = &plan.workspace {
+        let panes = if ws.panes == 1 { "1 pane".to_string() } else { format!("{} panes", ws.panes) };
+        lines.push(bullet(format!("closes herdr workspace {} ({panes})", ws.label)));
+    }
+    // Long paths keep their end, the part that names the worktree.
+    let removes = if plan.workspace.is_some() { "herdr removes " } else { "removes " };
+    let room = inner.saturating_sub(3 + removes.len());
+    lines.push(bullet(format!("{removes}{}", truncate_left(&tilde(&plan.path), room))));
+    if plan.ignored_total > 0 {
+        let more = plan.ignored_total.saturating_sub(plan.ignored.len());
+        let mut list = plan.ignored.join(", ");
+        if more > 0 {
+            list.push_str(&format!(" +{more}"));
+        }
+        lines.push(Line::styled(
+            truncate(&format!("     with ignored files: {list}"), inner),
+            Style::new().fg(C_MODIFIED),
+        ));
+    }
+    if let Some(b) = &plan.branch {
+        lines.push(bullet(format!("deletes branch {b} (at {})", &plan.head[..plan.head.len().min(7)])));
+    }
+    for a in &plan.stray_agents {
+        lines.push(Line::styled(
+            truncate(&format!(" ! agent {a} stays open in a deleted directory"), inner),
+            Style::new().fg(C_MODIFIED),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(" y", Style::new().fg(Color::Cyan)),
+        Span::styled(" / ", dim),
+        Span::styled("Enter", Style::new().fg(Color::Cyan)),
+        Span::raw(" remove    "),
+        Span::styled("Esc", Style::new().fg(Color::Cyan)),
+        Span::raw(" cancel"),
+    ]));
+    let h = (lines.len() as u16 + 4).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(C_MODIFIED))
+        .title(" clean up ")
+        .padding(Padding::new(1, 1, 1, 1));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
 
 fn draw_help(f: &mut Frame) {
     let area = f.area();

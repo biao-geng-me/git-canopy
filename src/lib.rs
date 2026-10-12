@@ -3,6 +3,7 @@
 //! Layers: `git` (shelling out + parsers), `model` (snapshot types), `graph` (lane layout),
 //! `watch` (background refresh), `ui` (ratatui front end, renders snapshots only).
 
+pub mod cleanup;
 pub mod clipboard;
 pub mod diff;
 pub mod fsinfo;

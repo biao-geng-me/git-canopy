@@ -84,6 +84,9 @@ pub fn worktree(wt: &Path, from: &str, paths: Option<&[String]>) -> Result<Vec<F
         .collect())
 }
 
+/// Branches that changed more files than this aren't checked for having landed in base.
+pub const MAX_APPLIED_FILES: usize = 2000;
+
 /// Whether every path in `paths` has the same content (or is absent) in commits `a` and `b`.
 pub fn same_content(dir: &Path, a: &str, b: &str, paths: &[String]) -> Result<bool> {
     let mut args: Vec<String> = ["diff-tree", "-r", "--quiet", "--no-renames", "--no-ext-diff", a, b, "--"]

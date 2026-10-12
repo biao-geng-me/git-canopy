@@ -106,23 +106,50 @@ impl WorktreeView {
         matches!(self.landed, Some(Landed::Merged | Landed::Applied))
     }
 
-    /// Whether this worktree could be removed without losing anything. Never the main worktree
-    /// or one on the `base` branch; not while locked, mid-operation or while an agent is busy
-    /// in it (`agent_busy`).
+    /// Whether this worktree could be removed without losing anything. Never the main worktree,
+    /// one on the `base` branch or the one canopy runs in; not while locked, mid-operation or
+    /// while an agent is busy in it (`agent_busy`).
     pub fn cleanup(&self, base: Option<&str>, agent_busy: bool) -> Cleanup {
-        let Some(st) = &self.status else { return Cleanup::No };
-        let removable = self.has_worktree()
-            && !self.is_main
-            && (base.is_none() || self.branch.as_deref() != base)
-            && self.locked.is_none()
-            && self.op.is_none();
-        if !removable || !self.is_merged() || agent_busy || st.staged + st.modified + st.unmerged > 0 {
-            Cleanup::No
-        } else if st.untracked > 0 {
-            Cleanup::Untracked
-        } else {
-            Cleanup::Safe
+        match (self.cleanup_blocker(base, agent_busy), &self.status) {
+            (None, Some(st)) if st.untracked > 0 => Cleanup::Untracked,
+            (None, Some(_)) => Cleanup::Safe,
+            _ => Cleanup::No,
         }
+    }
+
+    /// Why this worktree can't be cleaned up (untracked files aside, see [`Self::cleanup`]).
+    pub fn cleanup_blocker(&self, base: Option<&str>, agent_busy: bool) -> Option<String> {
+        let base_name = base.unwrap_or("the base branch");
+        let reason = if !self.has_worktree() {
+            "no worktree to remove".to_string()
+        } else if self.is_main {
+            "the main worktree can't be removed".to_string()
+        } else if base.is_some() && self.branch.as_deref() == base {
+            format!("it has the base branch {base_name} checked out")
+        } else if self.is_current {
+            "canopy runs in this worktree".to_string()
+        } else if let Some(op) = self.op {
+            format!("{op} in progress")
+        } else if self.locked.is_some() {
+            "it is locked".to_string()
+        } else if !self.is_merged() {
+            match (self.landed, self.vs_base) {
+                (Some(Landed::Unused), _) => "it has no commits of its own yet".to_string(),
+                (_, Some((ahead, _))) if ahead > 0 => {
+                    format!("not merged: {ahead} commit{} not in {base_name}", if ahead == 1 { "" } else { "s" })
+                }
+                _ => format!("not known to be merged into {base_name}"),
+            }
+        } else if agent_busy {
+            "an agent is busy in it".to_string()
+        } else {
+            match &self.status {
+                None => "status not loaded yet".to_string(),
+                Some(st) if st.staged + st.modified + st.unmerged > 0 => "it has uncommitted changes".to_string(),
+                Some(_) => return None,
+            }
+        };
+        Some(reason)
     }
 }
 
@@ -316,6 +343,45 @@ mod tests {
         // A full working-tree diff replaces everything.
         let ch = Changes::merge("mb".into(), &committed, &[fc("z", 1, 1)], None);
         assert_eq!(ch.files, [fc("z", 1, 1)]);
+    }
+
+    #[test]
+    fn cleanup_needs_merged_clean_and_removable() {
+        let st = |modified, untracked| Status {
+            modified,
+            untracked,
+            ..Default::default()
+        };
+        let merged = WorktreeView {
+            branch: Some("feat".into()),
+            landed: Some(Landed::Applied),
+            status: Some(st(0, 0)),
+            ..Default::default()
+        };
+        let base = Some("main");
+        assert_eq!(merged.cleanup(base, false), Cleanup::Safe);
+        assert_eq!(merged.cleanup(base, true), Cleanup::No);
+        let with = |f: &dyn Fn(&mut WorktreeView)| {
+            let mut w = merged.clone();
+            f(&mut w);
+            (w.cleanup(base, false), w.cleanup_blocker(base, false))
+        };
+        assert_eq!(with(&|w| w.status = Some(st(0, 2))), (Cleanup::Untracked, None));
+        let blocked = |f: &dyn Fn(&mut WorktreeView)| with(f).1.unwrap();
+        assert_eq!(blocked(&|w| w.status = Some(st(1, 0))), "it has uncommitted changes");
+        assert_eq!(blocked(&|w| w.is_main = true), "the main worktree can't be removed");
+        assert_eq!(blocked(&|w| w.is_current = true), "canopy runs in this worktree");
+        assert_eq!(blocked(&|w| w.locked = Some(String::new())), "it is locked");
+        assert_eq!(blocked(&|w| w.op = Some("REBASING")), "REBASING in progress");
+        assert_eq!(blocked(&|w| w.branch = Some("main".into())), "it has the base branch main checked out");
+        assert_eq!(
+            blocked(&|w| {
+                w.landed = None;
+                w.vs_base = Some((3, 0));
+            }),
+            "not merged: 3 commits not in main"
+        );
+        assert_eq!(blocked(&|w| w.landed = Some(Landed::Unused)), "it has no commits of its own yet");
     }
 
     #[test]

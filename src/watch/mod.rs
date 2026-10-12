@@ -907,7 +907,6 @@ impl Worker {
             Reflog(String),
             Content(Vec<String>),
         }
-        const MAX_APPLIED_FILES: usize = 2000;
         let mut checks: Vec<(LandedKey, Check)> = Vec::new();
         for (s, f) in sides.iter().zip(&fork) {
             let (Some(wi), Some(f)) = (s.wi, f) else { continue };
@@ -924,7 +923,7 @@ impl Worker {
                 let Some(committed) = self.between_cache.get(&(f.clone(), s.head.clone())) else {
                     continue;
                 };
-                if committed.is_empty() || committed.len() > MAX_APPLIED_FILES {
+                if committed.is_empty() || committed.len() > git::changes::MAX_APPLIED_FILES {
                     self.landed_cache.insert(key, None);
                     continue;
                 }

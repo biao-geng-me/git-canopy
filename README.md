@@ -99,6 +99,7 @@ git canopy [OPTIONS] [PATH]
 | `a`, double-click an agent marker | herdr: jump to the worktree's agent pane |
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
 | `t` | open a git TUI (lazygit, gitui, tig) in that worktree, like a shell |
+| `Backspace` | clean up a `⌫` worktree: remove its checkout, its branch and its herdr workspace, after confirming (see below) |
 | `y` + key | copy to the clipboard (see [Copying](#copying)) |
 | `r` | refresh now |
 | `?` | help |
@@ -140,7 +141,25 @@ changes.
 is in base after commits of its own, or every file it changed has the same content in base
 (squash-merged, rebased or cherry-picked). `⌫` additionally needs a clean tree, no agent other than
 idle/done in it, and a worktree that could be removed at all (not the main one, not on the base
-branch, not locked). canopy only shows this; it doesn't remove anything.
+branch, not locked, not the one canopy runs in).
+
+### Cleaning up
+
+`Backspace` on a `⌫` worktree (its row, or its `[name]` or `◌` row in the graph) removes it, after a
+popup that says exactly what will happen and waits for `y` / `Enter` (`Esc` cancels):
+
+- if a herdr workspace is backed by that checkout, herdr's `worktree.remove` deletes the checkout and
+  closes the workspace with its panes; otherwise `git worktree remove`;
+- ignored files in the checkout (`target/`, `node_modules/`, `.env`, …) go with it, and the popup
+  lists them;
+- then the branch is deleted, if it still points at the commit that was checked. The footer prints
+  the sha and the `git branch <name> <sha>` that restores it.
+
+Everything is checked again right before anything is removed: a clean tree (no untracked files
+either), the same HEAD, its work in the base branch, no busy agent. Nothing is forced: a worktree with
+untracked files is refused (delete them first, `s` opens a shell there), and git itself refuses a
+dirty checkout. Remote branches are never touched. On a worktree that isn't `⌫`, `Backspace` just says why
+not. This is the only thing canopy ever writes to a repository.
 
 ## herdr agent activity
 
@@ -151,9 +170,10 @@ inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns i
 - Worktree rows get `◆ blocked` (bold red), `▶ working`, `✓ done` or `· idle` for their most urgent
   agent, plus `×N` when several agents share a worktree; the graph's `[name]` labels get the same mark.
 - The footer sums it up: `herdr: 3 agents, 1 blocked`.
-- `a` (or a double-click on the marker) asks herdr to focus that worktree's agent pane. That and
-  opening a shell or git TUI pane (below) are the only things canopy ever asks herdr to do; it never
-  prompts, sends keys to, starts or stops agents.
+- `a` (or a double-click on the marker) asks herdr to focus that worktree's agent pane. That,
+  opening a shell or git TUI pane (below) and removing a worktree's workspace when you clean it up
+  (above) are the only things canopy ever asks herdr to do; it never prompts, sends keys to, starts
+  or stops agents.
 
 An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
 of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, `HERDR_SESSION`, or

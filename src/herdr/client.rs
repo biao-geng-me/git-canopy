@@ -81,6 +81,19 @@ pub fn open_shell_pane_at(path: &Path, pane_id: &str, cwd: &Path, command: Optio
     Ok(())
 }
 
+/// A fresh `agent.list` + `workspace.list` from the server at `path` (blocking).
+pub fn read_view_at(path: &Path) -> std::io::Result<View> {
+    Rpc::connect(path)?.read_view()
+}
+
+/// `worktree.remove` for the herdr workspace backed by a worktree checkout (blocking): herdr runs
+/// `git worktree remove` (never forced, so git refuses a dirty checkout) and closes the workspace
+/// with its panes. It leaves the branch. Errors carry herdr's message.
+pub fn remove_worktree_at(path: &Path, workspace_id: &str) -> std::io::Result<()> {
+    let params = format!("{{\"workspace_id\":{},\"force\":false}}", json::quote(workspace_id));
+    Rpc::connect(path)?.call("worktree.remove", &params).map(|_| ())
+}
+
 fn run(resolve: &dyn Fn() -> Option<PathBuf>, emit: &Emit) {
     let mut backoff = BACKOFF_MIN;
     let mut shown = true; // whether the last emit was a view (so "unreachable" is sent once)
@@ -137,8 +150,9 @@ impl Rpc {
             if v.get_str("id") != Some(&id) {
                 continue;
             }
-            if v.get("error").is_some() {
-                return Err(std::io::Error::other(line.trim_end().to_string()));
+            if let Some(err) = v.get("error") {
+                let msg = err.get_str("message").unwrap_or(line.trim_end());
+                return Err(std::io::Error::other(msg.to_string()));
             }
             return Ok(v);
         }

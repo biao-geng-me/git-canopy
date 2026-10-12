@@ -17,7 +17,8 @@ Existing tools each cover a piece, none covers the whole:
 **canopy's unique core:** an `--all` commit graph where each worktree's HEAD is labelled and gets a
 synthetic "uncommitted changes" node when dirty, kept live automatically, with diffs one keypress away.
 
-This is not another general git client. No staging, committing, rebasing, etc. Read-only monitoring.
+This is not another general git client. No staging, committing, rebasing, etc. Read-only monitoring,
+with one exception the user confirms each time: cleaning up a worktree whose work is already merged.
 
 ## Requirements
 
@@ -28,7 +29,8 @@ This is not another general git client. No staging, committing, rebasing, etc. R
 - **Overview first, details on demand:** the main screen answers "what is every tree doing, and which are
   dirty?" Drill-down (diff, full commit message) via keyboard and mouse.
 - **Never interfere with agents:** every git invocation uses `--no-optional-locks` (or
-  `GIT_OPTIONAL_LOCKS=0`) so `status` never grabs `index.lock` while an agent commits. Never write to the repo.
+  `GIT_OPTIONAL_LOCKS=0`) so `status` never grabs `index.lock` while an agent commits. Never write to the repo,
+  except the confirmed cleanup of a worktree verified safe (see Design decisions, Cleanup).
 
 ## Stack
 
@@ -125,8 +127,9 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   `s` (or a double-click on the path) opens a shell pane below canopy's via `pane.split` (see Shells);
   `t` does the same and then types ` exec <git tui>` into that new pane (`pane.send_input` with
   `keys: ["Enter"]`, the exact request `herdr pane run` sends, captured with a logging fake socket),
-  since `pane.split` takes no command. canopy never prompts, sends keys to, starts or stops agents;
-  the only input it sends goes to a pane it just created.
+  since `pane.split` takes no command; Backspace cleanup sends `worktree.remove` for the workspace
+  backed by the removed checkout (see Cleanup). canopy never prompts, sends keys to, starts or stops
+  agents; the only input it sends goes to a pane it just created.
 - **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
   every request opens a fresh connection; only the subscription connection stays open. Tests run the
@@ -149,21 +152,18 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 
 ## Roadmap after 0.2
 
-Still read-only. No git operations in canopy (staging, committing, rebasing in an agent's worktree
-races the agent and breaks the "never interfere" guarantee); a key hands off to a real git TUI instead.
+Still read-only apart from cleanup. No git operations on work in progress (staging, committing,
+rebasing in an agent's worktree races the agent and breaks the "never interfere" guarantee); a key
+hands off to a real git TUI instead. Cleanup is different: it only touches a worktree whose work is
+in base, with no busy agent, after the user confirms.
 
 - **0.3, reviewing agent work (built):** `t` opens a git TUI (lazygit, …) in the worktree, the same way `s`
   opens a shell; a change-size column (`+412 −38` vs the base branch, uncommitted included); `b` diffs
   a worktree against its merge base with the base branch (everything the agent did); overlap warnings
   between worktrees that touch the same files.
-- **Cleanup (step 1 built, step 2 planned):** `⌫` marks worktrees that are safe to clean up (see
-  Design decisions). Next: canopy's first write, a confirm popup (`C`) listing the `⌫` worktrees
-  with checkboxes that removes the checked ones *and their local branches* (user's call), re-checking
-  status and agents right before acting, never `--force`, never touching remotes, reporting the old
-  sha for recovery. herdr-managed worktrees go through herdr's `worktree.remove` (takes a
-  `workspace_id`; verify against a throwaway herdr first whether it deletes the branch and refuses
-  dirty trees), others through `git worktree remove` + `git branch -d/-D`. This revises the
-  read-only rule for this one explicit, confirmed, verified-safe action.
+- **Cleanup (built):** `⌫` marks worktrees that are safe to clean up; Backspace removes one (checkout,
+  branch, herdr workspace) after a confirm popup. canopy's one write, see Design decisions. Maybe
+  later: Backspace on a merged branch label without a worktree deletes just the branch.
 - **Later:** graph search and a per-worktree filter; `e` opens `$EDITOR` at the file/line under the
   cursor.
 - Not planned: notifications (herdr already notifies on blocked agents).
@@ -320,6 +320,28 @@ Agents often work in several projects at once; one canopy should be able to watc
   other than idle/done (`App::cleanup`) → `⌫` green (`Safe`), yellow when only untracked files would
   be lost (`Untracked`). Same glyph after `[name]` in the graph; the details line spells it out.
   `⌫`, not `✓`, which is herdr's "done". The `◌` row's "uncommitted" word is red.
+- **Cleanup (Backspace, `cleanup.rs`):** on a `⌫` worktree (its row, or its `[name]`/`◌` graph row;
+  on a commit several worktrees share, the cleanable one). Anything else gets a footer reason
+  (`WorktreeView::cleanup_blocker`, the same function behind `⌫`). `cleanup::plan` runs off the UI
+  thread: re-verifies (fresh `status`: no changes, *no untracked* files; same HEAD and branch;
+  `cleanup::landed` recomputed against the base tip), reads herdr fresh (busy agent in the worktree →
+  refuse; the workspace backed by the checkout is canopy's own `HERDR_WORKSPACE_ID` → refuse), and
+  lists ignored files (`ls-files -o -i --directory`), which `git worktree remove` deletes silently.
+  The popup shows exactly that; `y`/Enter runs `cleanup::run`, which verifies everything again, then
+  removes the checkout: herdr's `worktree.remove {workspace_id, force:false}` when a workspace is
+  backed by it, else `git worktree remove` (never `--force`); then `git branch -D` only if the branch
+  still points at the verified sha (`-D` because squash-merged branches fail `-d`; safe because of
+  our own check). Footer: the sha and `git branch <b> <sha>` to restore. Untracked files are refused
+  rather than forced (user can delete them, `s` opens a shell). Remotes never touched. Agents
+  outside that workspace with a cwd inside it (idle/done) are listed as left in a deleted directory;
+  unrelated workspaces are never closed. **herdr 0.9.3 `worktree.remove`, verified on a throwaway
+  server** (relative `HOME`, every `HERDR_*` unset): runs `git worktree remove`, so a dirty checkout
+  fails with `dirty_worktree_requires_force`; a clean one is removed (ignored files included) and
+  the workspace is closed with all its panes; **the branch is left**, hence canopy deletes it; works
+  the same for worktrees made by herdr (`worktree create`) or by git and opened in herdr. The main
+  checkout's workspace also has a `worktree` record (`is_linked_worktree: false`). Tests: plain git,
+  squash-merged, refusals after planning, and a fake herdr socket (`tests/cleanup.rs`); live: the
+  popup and both removal paths against the throwaway herdr in a private tmux.
 - **Diff vs base (`b`):** `diff::Target::Branch { path, base }` resolves `merge-base <base> HEAD` at
   load time (so it never goes stale) and shows `diff-index -p <merge base>` + untracked, like the
   worktree diff. Copy (`yd`) gives the same as a patch.
