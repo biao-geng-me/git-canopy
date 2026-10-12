@@ -171,11 +171,16 @@ pub fn marker(w: &WorktreeView) -> Span<'static> {
 }
 
 const CLEANUP_GLYPH: &str = "⌫";
+/// `⌫` of a worktree without commits of its own: removable, but nothing says its work is done.
+const C_UNUSED: Color = Color::Gray;
 
-/// `⌫` when a worktree could be cleaned up: green when nothing would be lost, yellow when its
-/// untracked files would be.
-pub fn cleanup_span(c: Cleanup) -> Option<Span<'static>> {
+/// `⌫` when a worktree could be cleaned up: green when its work is merged, gray when it has no
+/// commits of its own, yellow when untracked files would be lost.
+pub fn cleanup_span(c: Cleanup, w: &WorktreeView) -> Option<Span<'static>> {
     match c {
+        Cleanup::Safe if w.landed == Some(Landed::Unused) => {
+            Some(Span::styled(CLEANUP_GLYPH, Style::new().fg(C_UNUSED)))
+        }
         Cleanup::Safe => Some(Span::styled(CLEANUP_GLYPH, Style::new().fg(Color::Green))),
         Cleanup::Untracked => Some(Span::styled(CLEANUP_GLYPH, Style::new().fg(C_MODIFIED))),
         Cleanup::No => None,
@@ -347,7 +352,7 @@ fn wt_rows(app: &App, wide: bool) -> Vec<WtRow> {
                 style = style.fg(C_DIM);
             }
             WtRow {
-                marker: cleanup_span(app.cleanup(wi)).unwrap_or_else(|| marker(w)),
+                marker: cleanup_span(app.cleanup(wi), w).unwrap_or_else(|| marker(w)),
                 name: Span::styled(w.name.clone(), style),
                 agent: app.agent_activity(wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
                 counts: count_spans(w),
@@ -824,7 +829,7 @@ fn commit_prefix(app: &App, row: &Row, ci: usize, now: i64) -> Vec<Span<'static>
                     if let Some(act) = app.agent_activity(wi) {
                         spans.extend(agent_spans(act, false));
                     }
-                    if let Some(c) = cleanup_span(app.cleanup(wi)) {
+                    if let Some(c) = cleanup_span(app.cleanup(wi), &app.snap.worktrees[wi]) {
                         spans.extend([c, Span::raw(" ")]);
                     }
                 }
@@ -914,7 +919,7 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
                 if let Some(act) = app.agent_activity(wi) {
                     spans.extend(agent_spans(act, false));
                 }
-                if let Some(c) = cleanup_span(app.cleanup(wi)) {
+                if let Some(c) = cleanup_span(app.cleanup(wi), w) {
                     spans.extend([c, Span::raw(" ")]);
                 }
                 spans.push(Span::raw(" "));
@@ -1086,6 +1091,10 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
         spans.push(Span::styled(text, style));
     }
     match app.cleanup(wi) {
+        Cleanup::Safe if w.landed == Some(Landed::Unused) => spans.push(Span::styled(
+            ", nothing to lose: Backspace removes it",
+            Style::new().fg(C_UNUSED),
+        )),
         Cleanup::Safe => spans.push(Span::styled(", safe to clean up (Backspace)", Style::new().fg(Color::Green))),
         Cleanup::Untracked => spans.push(Span::styled(
             ", cleaning up would lose untracked files",
@@ -1861,9 +1870,10 @@ fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
     let inner = w.saturating_sub(4) as usize;
     let dim = Style::new().fg(C_DIM);
     let bullet = |text: String| Line::from(vec![Span::styled(" • ", dim), Span::raw(truncate(&text, inner.saturating_sub(3)))]);
-    let how = match plan.landed {
-        Landed::Applied => "squashed or rebased",
-        _ => "merged",
+    let state = match plan.landed {
+        Landed::Merged => format!("its work is in {} (merged)", plan.base),
+        Landed::Applied => format!("its work is in {} (squashed or rebased)", plan.base),
+        Landed::Unused => format!("no commits of its own (HEAD is in {})", plan.base),
     };
     let mut lines = vec![
         Line::from(vec![
@@ -1871,7 +1881,7 @@ fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
             Span::styled(plan.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("?"),
         ]),
-        Line::styled(format!(" its work is in {} ({how}); nothing uncommitted", plan.base), dim),
+        Line::styled(format!(" {state}; nothing uncommitted"), dim),
         Line::raw(""),
     ];
     if let Some(ws) = &plan.workspace {

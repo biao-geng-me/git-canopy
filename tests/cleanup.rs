@@ -134,10 +134,42 @@ fn refuses_when_something_changed_after_planning() {
     assert!(err.contains("isn't in main"), "{err}");
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
 
-    // A worktree with no commits of its own isn't "merged".
+}
+
+#[test]
+fn worktrees_without_commits_of_their_own_are_removed() {
+    let fx = common::Fixture::new();
+    let common = common_dir(&fx);
+
+    // A fresh branch at main: nothing committed to lose; its branch goes too.
     let fresh = fx.wt("fresh");
     git(&fx.repo(), &["worktree", "add", "-q", "-b", "fresh", &fresh.to_string_lossy(), "main"]);
-    assert!(cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None).is_err());
+    let plan = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None).unwrap();
+    assert_eq!(plan.landed, Landed::Unused);
+    cleanup::run(&plan, None).unwrap();
+    assert!(!fresh.exists() && !branch_exists(&fx.repo(), "fresh"));
+
+    // A detached checkout of an older main commit (the fixture's `detached`).
+    let det = fx.wt("detached");
+    let w = WorktreeView {
+        path: canopy::git::canonical(&det),
+        name: "detached".into(),
+        head: Some(git(&det, &["rev-parse", "HEAD"])),
+        ..Default::default()
+    };
+    let plan = cleanup::plan(&common, &w, "main", None, None).unwrap();
+    assert_eq!((plan.landed, plan.branch.as_deref()), (Landed::Unused, None));
+    cleanup::run(&plan, None).unwrap();
+    assert!(!det.exists());
+
+    // A new commit on a fresh branch is work of its own: refused.
+    let wip = fx.wt("wip");
+    git(&fx.repo(), &["worktree", "add", "-q", "-b", "wip", &wip.to_string_lossy(), "main"]);
+    std::fs::write(wip.join("wip.txt"), "x").unwrap();
+    git(&wip, &["add", "."]);
+    git(&wip, &["commit", "-qm", "wip"]);
+    let err = cleanup::plan(&common, &view(&wip, "wip"), "main", None, None).unwrap_err().to_string();
+    assert!(err.contains("isn't in main"), "{err}");
 }
 
 /// A herdr stand-in: one workspace backed by `checkout`, one agent in it with `status`;

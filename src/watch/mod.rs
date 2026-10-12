@@ -901,7 +901,8 @@ impl Worker {
         }
 
         // Whether each worktree's work is already in the base branch. HEAD in base: merged if
-        // the branch ever moved (its reflog has more than the creation entry), else unused.
+        // the branch ever moved (its reflog has more than the creation entry), else unused
+        // (also detached checkouts, and branches without a reflog: nothing to lose either way).
         // HEAD not in base: applied if every file it changed since forking is the same there.
         enum Check {
             Reflog(String),
@@ -917,7 +918,10 @@ impl Worker {
                 continue;
             }
             let check = if ahead == 0 {
-                let Some(b) = &w.branch else { continue };
+                let Some(b) = &w.branch else {
+                    self.landed_cache.insert(key, Some(Landed::Unused));
+                    continue;
+                };
                 Check::Reflog(b.clone())
             } else {
                 let Some(committed) = self.between_cache.get(&(f.clone(), s.head.clone())) else {
@@ -934,8 +938,7 @@ impl Worker {
         let found = par_map(&checks, PARALLELISM, |((base, head, _), check)| match check {
             Check::Reflog(b) => match git::changes::reflog_len(&dir, b, 2) {
                 Ok(n) if n >= 2 => Some(Landed::Merged),
-                Ok(1) => Some(Landed::Unused),
-                _ => None,
+                _ => Some(Landed::Unused),
             },
             Check::Content(paths) => git::changes::same_content(&dir, head, base, paths)
                 .ok()

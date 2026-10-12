@@ -8,13 +8,32 @@ When several agents (or people) each work in their own linked worktree, canopy a
 tree doing, and which ones are dirty?" on one screen:
 
 ```
-╭ worktrees 8 ✎4 ────────────────────╮╭ graph · base main ─────────────────────────────────────────╮
-│● main        clean    ⇣2           ││  │ ◌ [feat-auth] +3 ~2 ?1 uncommitted                       │
-│⚠ conflict    !1       ↑1 ↓1 MERGING││  │ ◉ 35d6da7  2h [feat-auth] add token refresh              │
-│✎ feat-auth   +3 ~2 ?1 ↑2           ││  │ ● e1223a9  3h auth: login                                │
-│✎ fix-parser  ~1       ↑1 ↓1        ││  │ │ ● eeb9f2a  1d (origin/main) upstream: more changelog   │
-│● refactor-db clean    ↑4           ││◉─┴─╯ e7dc7c6  1d [main] readme: badges                    │
-╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
+── graph · base main ───────────────────────────────────────────────────────────────────────
+ ◉─╮ dd701d0  5m [main] Merge branch 'fix-typo'
+ │ ◉ 863b572  1h [fix-typo]⌫  readme: fix typo
+ │ │ ◉ 2d7b362 12m [refactor-db] db: refactor step 4
+ │ │ ● 7762531 25m db: refactor step 3
+ │ │ ● d32a55b 40m db: refactor step 2
+ │ │ ● 9dfe097  1h db: refactor step 1
+ │ │ │ ◌ [fix-parser] ~1 uncommitted
+ │ │ │ ◉ 253406e  2h handle eof
+ │ │ │ │ ◌ [feat-auth] +3 ~2 ?1 uncommitted
+ │ │ │ │ ◉ 35d6da7 20m add token refresh
+ │ │ │ │ ● e1223a9  2h auth: login
+ │ │ │ │ │ ● eeb9f2a  1d (origin/main) upstream: more changelog
+ │ │ │ │ │ ● 1e5d2eb  1d upstream: changelog
+ │ │ │ │ │ │ ◌ [docs]⌫  ?2 uncommitted
+── worktrees 7 ✎ 3 ─────────────────────────────────────────────────────────────────────────
+ ●  main        clean    ⇡2⇣2                   dd701d0  5m                            repo
+ ⌫  detached    clean    ↓6                     86a259f  3d                     wt/detached
+ ✎  feat-auth   +3 ~2 ?1 ↑2 ↓2   +7  edited 8s  35d6da7 20m                    wt/feat-auth
+ ✎  fix-parser  ~1       ↑1 ↓3   +2  edited 3m  253406e  2h                   wt/fix-parser
+ ⌫  fix-typo    clean    merged                 863b572  1h                     wt/fix-typo
+ ●  refactor-db clean    ↑4 ↓2   +4             2d7b362 12m                  wt/refactor-db
+ ⌫  docs        ?2       ↓2          edited 1h  e7dc7c6  1d               wt/untracked-only
+────────────────────────────────────────────────────────────────────────────────────────────
+ ~/src/app/repo  ·  dd701d0e  ·  main → origin/main
+ ↑↓ move  Space expand  Enter full diff  b vs base  t git TUI  Tab panel  v layout  y copy
 ```
 
 - **Worktrees** (bottom): one row per worktree: state marker, branch (or directory name when detached),
@@ -145,6 +164,7 @@ The mouse works too: click to select, wheel to scroll.
 | `⚠` | conflicts or an operation in progress (merge, rebase, cherry-pick, …) |
 | `⚠ name` (light red, after the counts) | overlaps: `name` changed some of the same files |
 | `⌫` (green) | safe to clean up: its work is in the base branch (`merged`), nothing uncommitted, no agent busy |
+| `⌫` (gray) | safe to clean up: no commits of its own (HEAD is in the base branch, e.g. a fresh or a detached test checkout), nothing uncommitted |
 | `⌫` (yellow) | the same, but it has untracked files that cleaning up would lose |
 | `✗` | prunable: the worktree directory is gone |
 | `…` | status still loading |
@@ -154,9 +174,11 @@ changes.
 
 `merged` (where `↑a ↓b` would be) means the worktree's work is already in the base branch: its HEAD
 is in base after commits of its own, or every file it changed has the same content in base
-(squash-merged, rebased or cherry-picked). `⌫` additionally needs a clean tree, no agent other than
-idle/done in it, and a worktree that could be removed at all (not the main one, not on the base
-branch, not locked, not the one canopy runs in).
+(squash-merged, rebased or cherry-picked). A worktree whose HEAD is in base without commits of its
+own has nothing committed to lose either, so it can be cleaned up too (gray `⌫`): canopy can't tell
+whether such a tree is finished or not started, only that removing it loses no commits. `⌫`
+additionally needs a clean tree, no agent other than idle/done in it, and a worktree that could be
+removed at all (not the main one, not on the base branch, not locked, not the one canopy runs in).
 
 ### Cleaning up
 

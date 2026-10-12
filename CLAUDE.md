@@ -315,7 +315,9 @@ Agents often work in several projects at once; one canopy should be able to watc
 - **Merged / safe to clean up:** `WorktreeView::landed`, computed in the worker per (base sha, HEAD,
   branch) and cached. HEAD in base (`ahead == 0`): `Merged` if the branch's reflog has more than its
   creation entry (fast-forwarded or merged after commits of its own), else `Unused` (a fresh
-  worktree, which must not read as "done"); no reflog / detached: unknown. HEAD not in base:
+  branch, a detached checkout of a base commit, or no reflog). `Unused` is removable too (user's
+  call: no commits to lose, e.g. read-only test checkouts) but must not read as "done": gray `⌫`,
+  no `merged` label, details "nothing to lose". HEAD not in base:
   `Applied` when every file it changed since the fork is identical at the base tip (`diff-tree
   --quiet <head> <base> -- <paths>`, read-only, unlike `merge-tree --write-tree`), which catches
   squash merges, rebases and cherry-picks; conservative when base has changed those files again.

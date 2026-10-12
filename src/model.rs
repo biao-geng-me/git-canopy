@@ -58,16 +58,17 @@ pub enum Landed {
     /// HEAD isn't in the base branch, but every file it changed since forking has the same
     /// content there: squash-merged, rebased or cherry-picked.
     Applied,
-    /// The branch never moved since it was created: no work of its own yet.
+    /// HEAD is in the base branch with no commits of its own: a fresh branch (never moved since
+    /// it was created) or a detached checkout of a base commit. Nothing committed to lose.
     Unused,
 }
 
 /// Whether removing a worktree (and its branch) would lose nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cleanup {
-    /// Merged, nothing uncommitted, no agent busy in it.
+    /// Merged (or no commits of its own), nothing uncommitted, no agent busy in it.
     Safe,
-    /// Merged and no tracked changes, but untracked files would be lost.
+    /// The same, but untracked files would be lost.
     Untracked,
     No,
 }
@@ -132,10 +133,9 @@ impl WorktreeView {
             format!("{op} in progress")
         } else if self.locked.is_some() {
             "it is locked".to_string()
-        } else if !self.is_merged() {
-            match (self.landed, self.vs_base) {
-                (Some(Landed::Unused), _) => "it has no commits of its own yet".to_string(),
-                (_, Some((ahead, _))) if ahead > 0 => {
+        } else if self.landed.is_none() {
+            match self.vs_base {
+                Some((ahead, _)) if ahead > 0 => {
                     format!("not merged: {ahead} commit{} not in {base_name}", if ahead == 1 { "" } else { "s" })
                 }
                 _ => format!("not known to be merged into {base_name}"),
@@ -381,7 +381,8 @@ mod tests {
             }),
             "not merged: 3 commits not in main"
         );
-        assert_eq!(blocked(&|w| w.landed = Some(Landed::Unused)), "it has no commits of its own yet");
+        // No commits of its own: nothing committed to lose either.
+        assert_eq!(with(&|w| w.landed = Some(Landed::Unused)), (Cleanup::Safe, None));
     }
 
     #[test]

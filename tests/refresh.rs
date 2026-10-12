@@ -331,9 +331,11 @@ fn merged_worktrees_are_marked_for_cleanup() {
     let cleanup = |name: &str| find(&s, name).cleanup(s.base.as_deref(), false);
     assert_eq!(landed("ff-done"), Some(Landed::Merged));
     assert_eq!(landed("squashed"), Some(Landed::Applied));
-    // docs sits at main with no commits of its own (and has untracked files).
+    // docs sits at main with no commits of its own (and has untracked files); detached is a
+    // checkout of an older main commit.
     assert_eq!(landed("docs"), Some(Landed::Unused));
-    for name in ["main", "feat-auth", "fix-parser", "refactor-db", "detached"] {
+    assert_eq!(landed("detached"), Some(Landed::Unused));
+    for name in ["main", "feat-auth", "fix-parser", "refactor-db"] {
         assert_eq!(landed(name), None, "{name}");
     }
     assert_eq!(cleanup("ff-done"), Cleanup::Safe);
@@ -342,7 +344,10 @@ fn merged_worktrees_are_marked_for_cleanup() {
     // main has squashed's work now, which is no overlap.
     assert!(find(&s, "squashed").overlaps.is_empty());
     assert!(!find(&s, "main").overlaps.iter().any(|o| o.with == "squashed"));
-    for name in ["main", "docs", "feat-auth", "refactor-db", "detached"] {
+    // No commits of their own: nothing committed to lose, but docs' untracked files would be.
+    assert_eq!(cleanup("detached"), Cleanup::Safe);
+    assert_eq!(cleanup("docs"), Cleanup::Untracked);
+    for name in ["main", "feat-auth", "refactor-db"] {
         assert_eq!(cleanup(name), Cleanup::No, "{name}");
     }
 

@@ -1,6 +1,7 @@
-//! Removing a worktree whose work is in the base branch: its checkout, its branch and the herdr
-//! workspace backed by it. canopy's only write to a repository, made only after the user confirms
-//! a [`Plan`], and only after everything is checked again right before acting ([`run`]).
+//! Removing a worktree whose work is in the base branch (or that has no commits of its own): its
+//! checkout, its branch and the herdr workspace backed by it. canopy's only write to a repository,
+//! made only after the user confirms a [`Plan`], and only after everything is checked again right
+//! before acting ([`run`]).
 //!
 //! Nothing is forced: `git worktree remove` (or herdr's `worktree.remove`, which runs it) refuses
 //! a dirty checkout by itself, and the branch is deleted only while it still points at the commit
@@ -126,8 +127,8 @@ fn verify(common_dir: &Path, path: &Path, head: &str, branch: Option<&str>, base
         .map(|o| String::from_utf8_lossy(&o).trim().to_string())
         .with_context(|| format!("no base branch {base}"))?;
     match landed(common_dir, &base_sha, head, branch)? {
-        Some(l @ (Landed::Merged | Landed::Applied)) => Ok(l),
-        _ => bail!("its work isn't in {base}"),
+        Some(l) => Ok(l),
+        None => bail!("its work isn't in {base}"),
     }
 }
 
@@ -135,12 +136,9 @@ fn verify(common_dir: &Path, path: &Path, head: &str, branch: Option<&str>, base
 pub fn landed(dir: &Path, base_sha: &str, head: &str, branch: Option<&str>) -> Result<Option<Landed>> {
     let (_, ahead) = git::left_right_count(dir, base_sha, head)?;
     if ahead == 0 {
-        let Some(b) = branch else { return Ok(None) };
-        return Ok(match changes::reflog_len(dir, b, 2)? {
-            n if n >= 2 => Some(Landed::Merged),
-            1 => Some(Landed::Unused),
-            _ => None,
-        });
+        // Nothing committed to lose; the reflog only tells merged work from none.
+        let moved = branch.is_some_and(|b| changes::reflog_len(dir, b, 2).is_ok_and(|n| n >= 2));
+        return Ok(Some(if moved { Landed::Merged } else { Landed::Unused }));
     }
     let Some(fork) = changes::merge_base(dir, base_sha, head)? else {
         return Ok(None);
