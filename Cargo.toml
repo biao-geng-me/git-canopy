@@ -1,6 +1,6 @@
 [package]
 name = "git-canopy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Live TUI showing every git worktree of a repo at a glance"
 license = "MIT"
