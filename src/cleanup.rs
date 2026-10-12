@@ -31,6 +31,8 @@ pub struct Plan {
     pub landed: Landed,
     /// herdr socket, when herdr is in use and reachable.
     pub herdr: Option<PathBuf>,
+    /// Where herdr creates worktrees (`herdr::worktree_dir`).
+    pub herdr_dir: Option<PathBuf>,
     /// The herdr workspace backed by this checkout: herdr removes the checkout and closes it.
     pub workspace: Option<herdr::Workspace>,
     /// Idle or done agents in this worktree outside that workspace: their panes stay open, in a
@@ -42,22 +44,21 @@ pub struct Plan {
 }
 
 /// Check `w` again and work out what removing it involves. `herdr`: the socket when herdr is in
-/// use; `own_workspace`: the herdr workspace canopy itself runs in (never closed).
+/// use; `herdr_dir`: where herdr creates worktrees; `own_workspace`: the herdr workspace canopy
+/// itself runs in (never closed).
 pub fn plan(
     common_dir: &Path,
     w: &WorktreeView,
     base: &str,
     herdr: Option<PathBuf>,
+    herdr_dir: Option<&Path>,
     own_workspace: Option<&str>,
 ) -> Result<Plan> {
     let head = w.head.clone().context("no HEAD")?;
     let landed = verify(common_dir, &w.path, &head, w.branch.as_deref(), base)?;
     let view = herdr.as_deref().and_then(|p| herdr::read_view_at(p).ok());
     let herdr = herdr.filter(|_| view.is_some());
-    let (workspace, stray_agents) = match &view {
-        Some(view) => herdr_part(view, &w.path, own_workspace)?,
-        None => (None, Vec::new()),
-    };
+    let (workspace, stray_agents) = herdr_part(view.as_ref(), &w.path, herdr_dir, own_workspace)?;
     let (ignored, ignored_total) = ignored(&w.path);
     Ok(Plan {
         common_dir: common_dir.to_path_buf(),
@@ -68,6 +69,7 @@ pub fn plan(
         base: base.to_string(),
         landed,
         herdr,
+        herdr_dir: herdr_dir.map(Path::to_path_buf),
         workspace,
         stray_agents,
         ignored,
@@ -78,13 +80,11 @@ pub fn plan(
 /// Carry out `plan` after checking it once more. Returns the notice for the footer.
 pub fn run(plan: &Plan, own_workspace: Option<&str>) -> Result<String> {
     verify(&plan.common_dir, &plan.path, &plan.head, plan.branch.as_deref(), &plan.base)?;
-    let workspace = match &plan.herdr {
-        Some(sock) => {
-            let view = herdr::read_view_at(sock).context("herdr didn't answer")?;
-            herdr_part(&view, &plan.path, own_workspace)?.0
-        }
+    let view = match &plan.herdr {
+        Some(sock) => Some(herdr::read_view_at(sock).context("herdr didn't answer")?),
         None => None,
     };
+    let workspace = herdr_part(view.as_ref(), &plan.path, plan.herdr_dir.as_deref(), own_workspace)?.0;
     let path = plan.path.to_string_lossy().into_owned();
     match (&workspace, &plan.herdr) {
         (Some(ws), Some(sock)) => herdr::remove_worktree_at(sock, &ws.id).context("herdr")?,
@@ -126,10 +126,20 @@ fn verify(common_dir: &Path, path: &Path, head: &str, branch: Option<&str>, base
     let base_sha = git::run(common_dir, &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")])
         .map(|o| String::from_utf8_lossy(&o).trim().to_string())
         .with_context(|| format!("no base branch {base}"))?;
-    match landed(common_dir, &base_sha, head, branch)? {
-        Some(l) => Ok(l),
+    let landed = match landed(common_dir, &base_sha, head, branch)? {
+        Some(l) => l,
         None => bail!("its work isn't in {base}"),
+    };
+    let used = git::worktree::admin_dir(path).and_then(|a| git::worktree::last_used(&a));
+    let w = WorktreeView {
+        landed: Some(landed),
+        git_used_at: used,
+        ..Default::default()
+    };
+    if let Some(ago) = w.fresh_for() {
+        bail!("it has no commits yet and git used it {} min ago: an agent may be starting there", ago / 60);
     }
+    Ok(landed)
 }
 
 /// Whether `head`'s work is in the base branch (at `base_sha`); see `model::Landed`.
@@ -151,9 +161,20 @@ pub fn landed(dir: &Path, base_sha: &str, head: &str, branch: Option<&str>) -> R
 }
 
 /// The herdr workspace backed by the checkout at `path`, and the other agents in it. Fails when
-/// an agent there is busy, or when that workspace is canopy's own.
-fn herdr_part(view: &herdr::View, path: &Path, own_workspace: Option<&str>) -> Result<(Option<herdr::Workspace>, Vec<String>)> {
-    let ws = view.workspaces.iter().find(|w| w.checkout.as_deref() == Some(path)).cloned();
+/// an agent there is busy, when that workspace is canopy's own, or when herdr made the checkout
+/// (it is under `herdr_dir`) but no workspace here has it: another herdr server, e.g. on another
+/// machine sharing the filesystem, may have agents in it that this one can't see.
+fn herdr_part(
+    view: Option<&herdr::View>,
+    path: &Path,
+    herdr_dir: Option<&Path>,
+    own_workspace: Option<&str>,
+) -> Result<(Option<herdr::Workspace>, Vec<String>)> {
+    let ws = view.and_then(|v| v.workspaces.iter().find(|w| w.checkout.as_deref() == Some(path)).cloned());
+    if ws.is_none() && herdr_dir.is_some_and(|d| path.starts_with(d)) {
+        bail!("{}", crate::model::HERDR_UNSEEN);
+    }
+    let Some(view) = view else { return Ok((None, Vec::new())) };
     if let (Some(ws), Some(own)) = (&ws, own_workspace)
         && ws.id == own
     {

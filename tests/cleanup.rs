@@ -1,6 +1,7 @@
 //! Removing merged worktrees: with plain git, and through a fake herdr server (which removes the
 //! checkout like herdr does and closes the workspace); refusals when something changed after the
-//! confirm popup opened, an agent is busy, or the workspace is canopy's own.
+//! confirm popup opened, an agent is busy, the workspace is canopy's own, a checkout herdr made
+//! has no workspace this herdr knows, or a worktree without commits was used just now.
 #![cfg(unix)]
 
 mod common;
@@ -73,7 +74,7 @@ fn removes_checkout_and_branch_with_git() {
     std::fs::write(fx.repo().join(".git/info/exclude"), "*.log\n").unwrap();
     std::fs::write(w.path.join("build.log"), "x").unwrap();
 
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None).unwrap();
+    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None, None).unwrap();
     assert_eq!(plan.landed, Landed::Merged);
     assert!(plan.workspace.is_none());
     assert_eq!(plan.ignored, ["build.log"]);
@@ -101,7 +102,7 @@ fn squash_merged_branch_is_removed_too() {
     git(&repo, &["commit", "-qm", "squash"]);
 
     let w = view(&path, "squashed");
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None).unwrap();
+    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None, None).unwrap();
     assert_eq!(plan.landed, Landed::Applied);
     cleanup::run(&plan, None).unwrap();
     assert!(!path.exists());
@@ -115,7 +116,7 @@ fn refuses_when_something_changed_after_planning() {
     let w = merged_worktree(&fx, "ff-done");
 
     // Untracked file appears while the popup is open: nothing is removed.
-    let plan = cleanup::plan(&common, &w, "main", None, None).unwrap();
+    let plan = cleanup::plan(&common, &w, "main", None, None, None).unwrap();
     std::fs::write(w.path.join("new.txt"), "x").unwrap();
     let err = cleanup::run(&plan, None).unwrap_err().to_string();
     assert!(err.contains("untracked"), "{err}");
@@ -128,7 +129,7 @@ fn refuses_when_something_changed_after_planning() {
     git(&w.path, &["commit", "-qm", "more"]);
     let err = cleanup::run(&plan, None).unwrap_err().to_string();
     assert!(err.contains("HEAD moved"), "{err}");
-    let err = cleanup::plan(&common, &view(&w.path, "ff-done"), "main", None, None)
+    let err = cleanup::plan(&common, &view(&w.path, "ff-done"), "main", None, None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("isn't in main"), "{err}");
@@ -144,20 +145,25 @@ fn worktrees_without_commits_of_their_own_are_removed() {
     // A fresh branch at main: nothing committed to lose; its branch goes too.
     let fresh = fx.wt("fresh");
     git(&fx.repo(), &["worktree", "add", "-q", "-b", "fresh", &fresh.to_string_lossy(), "main"]);
-    let plan = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None).unwrap();
+    // Just made: an agent may be about to start there.
+    let err = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None, None).unwrap_err().to_string();
+    assert!(err.contains("an agent may be starting there"), "{err}");
+    fx.age(&fresh);
+    let plan = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None, None).unwrap();
     assert_eq!(plan.landed, Landed::Unused);
     cleanup::run(&plan, None).unwrap();
     assert!(!fresh.exists() && !branch_exists(&fx.repo(), "fresh"));
 
     // A detached checkout of an older main commit (the fixture's `detached`).
     let det = fx.wt("detached");
+    fx.age(&det);
     let w = WorktreeView {
         path: canopy::git::canonical(&det),
         name: "detached".into(),
         head: Some(git(&det, &["rev-parse", "HEAD"])),
         ..Default::default()
     };
-    let plan = cleanup::plan(&common, &w, "main", None, None).unwrap();
+    let plan = cleanup::plan(&common, &w, "main", None, None, None).unwrap();
     assert_eq!((plan.landed, plan.branch.as_deref()), (Landed::Unused, None));
     cleanup::run(&plan, None).unwrap();
     assert!(!det.exists());
@@ -168,7 +174,7 @@ fn worktrees_without_commits_of_their_own_are_removed() {
     std::fs::write(wip.join("wip.txt"), "x").unwrap();
     git(&wip, &["add", "."]);
     git(&wip, &["commit", "-qm", "wip"]);
-    let err = cleanup::plan(&common, &view(&wip, "wip"), "main", None, None).unwrap_err().to_string();
+    let err = cleanup::plan(&common, &view(&wip, "wip"), "main", None, None, None).unwrap_err().to_string();
     assert!(err.contains("isn't in main"), "{err}");
 }
 
@@ -236,7 +242,9 @@ fn herdr_workspace_is_removed_through_herdr() {
     let w = merged_worktree(&fx, "ff-done");
     let herdr = FakeHerdr::start(&w.path, &fx.repo(), "done");
 
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", Some(herdr.sock.clone()), Some("w1")).unwrap();
+    // herdr made the checkout (it is in herdr's worktree directory) and has its workspace.
+    let herdr_dir = w.path.parent().unwrap();
+    let plan = cleanup::plan(&common_dir(&fx), &w, "main", Some(herdr.sock.clone()), Some(herdr_dir), Some("w1")).unwrap();
     let ws = plan.workspace.as_ref().unwrap();
     assert_eq!((ws.id.as_str(), ws.label.as_str(), ws.panes), ("w9", "ff-done", 2));
     // The done agent is in that workspace: closed with it, not left behind.
@@ -256,16 +264,27 @@ fn herdr_refusals() {
     let w = merged_worktree(&fx, "ff-done");
 
     let busy = FakeHerdr::start(&w.path, &fx.repo(), "working");
-    let err = cleanup::plan(&common, &w, "main", Some(busy.sock.clone()), None)
+    let err = cleanup::plan(&common, &w, "main", Some(busy.sock.clone()), None, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("agent dev is working"), "{err}");
 
     let idle = FakeHerdr::start(&w.path, &fx.repo(), "idle");
-    let err = cleanup::plan(&common, &w, "main", Some(idle.sock.clone()), Some("w9"))
+    let err = cleanup::plan(&common, &w, "main", Some(idle.sock.clone()), None, Some("w9"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("canopy runs in its herdr workspace"), "{err}");
+
+    // herdr made the checkout, but no workspace this herdr has is backed by it (or herdr isn't
+    // reachable): another herdr, maybe on another machine, may have agents in it.
+    let herdr_dir = w.path.parent().unwrap();
+    let elsewhere = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
+    for sock in [Some(elsewhere.sock.clone()), None] {
+        let err = cleanup::plan(&common, &w, "main", sock, Some(herdr_dir), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no herdr workspace here has it"), "{err}");
+    }
     assert!(idle.calls.lock().unwrap().is_empty() && busy.calls.lock().unwrap().is_empty());
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
 }

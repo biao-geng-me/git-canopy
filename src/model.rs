@@ -39,6 +39,8 @@ pub struct WorktreeView {
     pub head_time: Option<i64>,
     /// Newest modification time (unix seconds) among the changed files: "last edited".
     pub changed_at: Option<i64>,
+    /// When git last did something in it (unix seconds, `git::worktree::last_used`).
+    pub git_used_at: Option<i64>,
     /// Its directories are watched for edits (otherwise only polled).
     pub watched: bool,
     /// What it changed since it forked from the base branch (`None` without a base branch).
@@ -62,6 +64,15 @@ pub enum Landed {
     /// it was created) or a detached checkout of a base commit. Nothing committed to lose.
     Unused,
 }
+
+/// A worktree without commits of its own that git used more recently than this (seconds) isn't
+/// offered for cleanup: an agent may have just started there and not changed anything yet.
+pub const FRESH_SECS: i64 = 3600;
+
+/// Why a checkout herdr made (under its worktree directory) isn't offered for cleanup when no
+/// reachable herdr server has a workspace for it.
+pub const HERDR_UNSEEN: &str =
+    "herdr made it, but no herdr workspace here has it: it may be in use from another herdr (another machine?)";
 
 /// Whether removing a worktree (and its branch) would lose nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +153,11 @@ impl WorktreeView {
             }
         } else if agent_busy {
             "an agent is busy in it".to_string()
+        } else if let Some(ago) = self.fresh_for() {
+            format!(
+                "no commits yet and git used it {} min ago: an agent may be starting there",
+                ago / 60
+            )
         } else {
             match &self.status {
                 None => "status not loaded yet".to_string(),
@@ -151,6 +167,23 @@ impl WorktreeView {
         };
         Some(reason)
     }
+
+    /// How long ago git used this worktree, while that's under [`FRESH_SECS`] and it has no
+    /// commits of its own.
+    pub fn fresh_for(&self) -> Option<i64> {
+        if self.landed != Some(Landed::Unused) {
+            return None;
+        }
+        let ago = now_secs() - self.git_used_at?;
+        (ago < FRESH_SECS).then_some(ago.max(0))
+    }
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// What a worktree changed since its merge base with the base branch: committed and
@@ -383,6 +416,23 @@ mod tests {
         );
         // No commits of its own: nothing committed to lose either.
         assert_eq!(with(&|w| w.landed = Some(Landed::Unused)), (Cleanup::Safe, None));
+        // ... unless git used it recently: an agent may be starting there.
+        let used = |ago: i64| {
+            with(&move |w| {
+                w.landed = Some(Landed::Unused);
+                w.git_used_at = Some(now_secs() - ago);
+            })
+        };
+        assert_eq!(used(FRESH_SECS + 60), (Cleanup::Safe, None));
+        assert_eq!(
+            used(600),
+            (
+                Cleanup::No,
+                Some("no commits yet and git used it 10 min ago: an agent may be starting there".into())
+            )
+        );
+        // Merged work isn't held back by recent use.
+        assert_eq!(with(&|w| w.git_used_at = Some(now_secs())), (Cleanup::Safe, None));
     }
 
     #[test]

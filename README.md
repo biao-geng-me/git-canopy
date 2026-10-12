@@ -164,7 +164,7 @@ The mouse works too: the line under the pointer is faintly highlighted; a click 
 | `⚠` | conflicts or an operation in progress (merge, rebase, cherry-pick, …) |
 | `⚠ name` (light red, after the counts) | overlaps: `name` changed some of the same files |
 | `⌫` (green) | safe to clean up: its work is in the base branch (`merged`), nothing uncommitted, no agent busy |
-| `⌫` (gray) | safe to clean up: no commits of its own (HEAD is in the base branch, e.g. a fresh or a detached test checkout), nothing uncommitted |
+| `⌫` (gray) | safe to clean up: no commits of its own (HEAD is in the base branch, e.g. a fresh or a detached test checkout), nothing uncommitted, and git hasn't used it for an hour |
 | `⌫` (yellow) | the same, but it has untracked files that cleaning up would lose |
 | `✗` | prunable: the worktree directory is gone |
 | `…` | status still loading |
@@ -179,6 +179,8 @@ own has nothing committed to lose either, so it can be cleaned up too (gray `⌫
 whether such a tree is finished or not started, only that removing it loses no commits. `⌫`
 additionally needs a clean tree, no agent other than idle/done in it, and a worktree that could be
 removed at all (not the main one, not on the base branch, not locked, not the one canopy runs in).
+
+Two more checks guard against agents canopy can't see, such as one in a herdr on another machine that shares the filesystem, or one that hasn't changed anything yet. A worktree without commits of its own isn't offered while git has used it in the last hour, since it may be an agent's tree that was just set up. And a checkout in herdr's worktree directory (`~/.herdr/worktrees` unless herdr's config says otherwise) is only cleaned up when the herdr canopy talks to has a workspace for it.
 
 ### Cleaning up
 

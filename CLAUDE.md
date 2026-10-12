@@ -177,6 +177,7 @@ Agents often work in several projects at once; one canopy should be able to watc
   **Rule until then:** new features compute their data in the worker into `Snapshot`/`WorktreeView`
   and never assume the UI has only one repo (key things by worktree path, which is unique across repos,
   or by common dir, never by index into one global list).
+- **Prepare for remote machines (0.5) in 0.4:** key worktrees and repos by `(host, path)` / `(host, common dir)`, with host = local for now (a path is not unique across machines: `/home/me/proj` exists on the laptop and the server). And the UI stops running git itself: diffs, copy (`y`), overlap docs and cleanup become requests to the Worker that owns the repo (a message API, local-only at first), which is the seam a remote Worker plugs into.
 - **Layout:** the worktree panel lists all repos, grouped under a header row per repo (repo name, base
   branch, worktree/dirty counts); the graph shows the repo of the selected worktree (or header). Moving
   the selection into another repo swaps the graph; per-repo graph cursor/expansion state is kept. Tabs
@@ -192,6 +193,17 @@ Agents often work in several projects at once; one canopy should be able to watc
   `MAX_WATCH_DIRS`/inotify budget is global; `--base` applies to every repo, else per-repo detection.
 - **Footer/details:** herdr summary across all repos; the details line names the repo when there are
   several.
+
+### Remote machines (planned for 0.5, not built)
+
+herdr does cross-machine development (saved SSH machines, each with its own herdr server; people pair it with a personal network such as Tailscale). canopy should show every tree in one view, even when the trees are in different forests (clones on different machines). Found on 2026-10-12: an agent orchestrating sub-agents in a herdr on an HPC compute node (gh-b-001) while canopy ran on the login node; the trees were on the shared filesystem, but canopy saw no agents in them (they live in gh-b-001's herdr, whose socket is node-local) and their edits came only with the 10-min fallback (inotify sees only this machine's changes).
+
+- **Shape: `canopy serve` over ssh stdio.** The local canopy runs `ssh <host> canopy serve <repos>`; the remote side runs the normal `watch::Worker`s there and streams snapshots back over stdin/stdout, and answers requests (diffs, copy text, cleanup plan/run). No listening ports: auth, encryption and NAT are ssh's job (Tailscale SSH covers the personal-network case); herdr chose the same model. Not inside herdr panes: canopy needs no terminal there.
+- **What that gives for free:** the remote serve talks to *its own machine's* herdr over the local socket (agent markers per machine with the existing client, no dependency on herdr's undocumented `remote-api-bridge`); git and inotify run where the edits happen (~150 ms latency instead of the fallback poll); cleanup is planned, re-verified and run on the owning host.
+- **Two separate concerns:** where git runs (one Worker per (host, common dir)) and where agents live (herdr servers). With separate clones they coincide. On a shared filesystem they don't: one repo, agents from several herdr servers, so a serve must be able to contribute *only agents* for a repo another host owns, and running two Workers on the same repo (double git load, trees shown twice) must be avoided. That needs a repo identity across hosts: canonical common-dir path plus a probe (same refs fingerprint, common dir inode), with a config override where that's unsure. Prefer watching from the host where the agent works (its inotify sees the edits).
+- **Layout:** the repo header row names the host (`three-ux @ gh-b-001`); clones of one origin on several hosts are separate forests grouped together, each with its own graph (merging graphs across clones would need their objects in one place).
+- **Practicalities:** a static musl binary per arch on the remote (installed by the user, or `canopy remote install <host>` copies it, like herdr's `machine add`); a version handshake as the first message; hand-written serialization (no serde) of `Snapshot`, requests and capped/paged diffs; `BatchMode=yes` ssh, never prompting, an unreachable host hidden with backoff like an unreachable herdr. Discovery: `canopy host:path` arguments, optionally herdr's saved machines (`herdr machine list`), and per host the repos its herdr's agents are in (`--herdr-repos`).
+- **Rejected:** reading other machines' agents through herdr's `remote-api-bridge` (`ssh <host> herdr --session default remote-api-bridge` pipes the normal JSON API, events included; verified with herdr 0.9.3): undocumented, and it fixes only agent markers, not the edit latency.
 
 ## Conventions
 
@@ -330,9 +342,10 @@ Agents often work in several projects at once; one canopy should be able to watc
   Merged worktrees show `merged` instead of `↑a ↓b`, no change size, and take no part in overlaps
   (their work being in base isn't a conflict). `WorktreeView::cleanup` adds the rest: not the main
   worktree, not on base, not locked or mid-operation, no staged/modified/unmerged files, no agent
-  other than idle/done (`App::cleanup`) → `⌫` green (`Safe`), yellow when only untracked files would
+  other than idle/done (`App::cleanup`), and the two guards below → `⌫` green (`Safe`), yellow when only untracked files would
   be lost (`Untracked`). Same glyph after `[name]` in the graph; the details line spells it out.
   `⌫`, not `✓`, which is herdr's "done". The `◌` row's "uncommitted" word is red.
+- **Cleanup guards against agents canopy can't see** (an agent in another herdr, e.g. on another machine sharing the filesystem, or one that hasn't changed anything yet). (1) `Unused` worktrees that git used in the last hour (`model::FRESH_SECS`; `WorktreeView::git_used_at` = newest mtime of the admin dir's `HEAD`, `index`, `commondir`, `git::worktree::last_used`) aren't offered: a fresh tree is indistinguishable from a just-started agent's, and holding back something with nothing to lose costs only waiting; merged work isn't held back. (2) A checkout in herdr's worktree directory (`[worktrees] directory` in herdr's `config.toml`, default `~/.herdr/worktrees`, `herdr::worktree_dir`) is only cleaned up through a workspace the reachable herdr has for it (`App::herdr_unseen`, `model::HERDR_UNSEEN`); herdr unreachable or `--no-herdr` → refused too. Both are checked again in `cleanup::plan`/`run`. Tests backdate the admin dir (`Fixture::age`).
 - **Cleanup (Backspace, `cleanup.rs`):** on a `⌫` worktree (its row, or its `[name]`/`◌` graph row;
   on a commit several worktrees share, the cleanable one). Anything else gets a footer reason
   (`WorktreeView::cleanup_blocker`, the same function behind `⌫`). `cleanup::plan` runs off the UI

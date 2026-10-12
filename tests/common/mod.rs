@@ -38,6 +38,19 @@ impl Fixture {
     pub fn wt(&self, name: &str) -> PathBuf {
         self.dir.join("wt").join(name)
     }
+
+    /// Make git's last use of the linked worktree at `path` two hours old, past the time a
+    /// worktree without commits of its own is held back from cleanup.
+    #[allow(dead_code)]
+    pub fn age(&self, path: &std::path::Path) {
+        let admin = canopy::git::worktree::admin_dir(path).expect("admin dir");
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        for f in ["HEAD", "index", "commondir"] {
+            if let Ok(file) = std::fs::File::options().append(true).open(admin.join(f)) {
+                file.set_modified(then).unwrap();
+            }
+        }
+    }
 }
 
 impl Drop for Fixture {

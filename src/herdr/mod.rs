@@ -247,6 +247,46 @@ pub fn socket_path() -> Option<PathBuf> {
     socket_path_from(|k| std::env::var(k).ok())
 }
 
+/// Where herdr creates worktrees: `[worktrees] directory` in its `config.toml`
+/// (`$XDG_CONFIG_HOME/herdr`, else `~/.config/herdr`), default `~/.herdr/worktrees`.
+pub fn worktree_dir_from(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let home = PathBuf::from(env("HOME").filter(|h| !h.is_empty())?);
+    let config = env("XDG_CONFIG_HOME")
+        .filter(|x| !x.is_empty())
+        .map_or_else(|| home.join(".config"), PathBuf::from)
+        .join("herdr/config.toml");
+    let text = std::fs::read_to_string(config).unwrap_or_default();
+    let dir = config_worktree_dir(&text).unwrap_or_else(|| "~/.herdr/worktrees".into());
+    let dir = match dir.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(dir),
+    };
+    Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+pub fn worktree_dir() -> Option<PathBuf> {
+    worktree_dir_from(|k| std::env::var(k).ok())
+}
+
+/// `directory` in the `[worktrees]` table of herdr's TOML config (only plain `key = "string"`
+/// lines are understood, which is how herdr writes it).
+fn config_worktree_dir(toml: &str) -> Option<String> {
+    let mut table = "";
+    for line in toml.lines().map(str::trim) {
+        if let Some(t) = line.strip_prefix('[') {
+            table = t.trim_end_matches(']').trim();
+        } else if table == "worktrees"
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == "directory"
+        {
+            let v = v.trim();
+            let v = v.split_once(" #").map_or(v, |(v, _)| v).trim();
+            return Some(v.trim_matches(|c| c == '"' || c == '\'').to_string());
+        }
+    }
+    None
+}
+
 /// `pane.split` params for a focused shell in `cwd`, in a new pane below `pane_id` (canopy's own).
 /// herdr starts the user's shell there; the pane closes when the shell exits.
 pub fn shell_split_params(pane_id: &str, cwd: &Path) -> String {
@@ -281,6 +321,18 @@ pub fn focus(_pane_id: String) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_dir_config() {
+        let toml = "[ui]\ndirectory = \"/nope\"\n\n[worktrees]\n# directory = \"~/old\"\ndirectory = \"~/trees\" # mine\n";
+        assert_eq!(config_worktree_dir(toml).as_deref(), Some("~/trees"));
+        assert_eq!(config_worktree_dir("[worktrees]\n"), None);
+        let env = |k: &str| match k {
+            "HOME" => Some("/nonexistent-home".to_string()),
+            _ => None,
+        };
+        assert_eq!(worktree_dir_from(env), Some(PathBuf::from("/nonexistent-home/.herdr/worktrees")));
+    }
 
     // Captured from herdr 0.9.3 (`agent.list` / `workspace.list`), trimmed and anonymized.
     const AGENT_LIST: &str = r#"{"id":"r1","result":{"type":"agent_list","agents":[

@@ -83,6 +83,18 @@ pub fn admin_dir(wt_path: &Path) -> Option<PathBuf> {
     Some(super::canonical(&wt_path.join(target)))
 }
 
+/// When git last did something in a linked worktree (unix seconds): the newest mtime of its admin
+/// dir's `HEAD`, `index` (written by checkouts, adds and index refreshes, e.g. an agent's `git
+/// status`) and `commondir` (written once, by `worktree add`).
+pub fn last_used(admin: &Path) -> Option<i64> {
+    ["HEAD", "index", "commondir"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(admin.join(f)).and_then(|m| m.modified()).ok())
+        .max()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
 /// An in-progress operation (merge, rebase, ...) detected from files in the admin dir.
 pub fn operation(admin: &Path) -> Option<&'static str> {
     const MARKERS: &[(&str, &str)] = &[

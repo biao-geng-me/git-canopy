@@ -574,6 +574,7 @@ impl Worker {
                     v.status_error = prev.status_error;
                     v.op = prev.op;
                     v.changed_at = prev.changed_at;
+                    v.git_used_at = prev.git_used_at;
                     v.admin_dir = prev.admin_dir;
                     v.changes = prev.changes;
                     v.overlaps = prev.overlaps;
@@ -675,7 +676,7 @@ impl Worker {
                     *due += period;
                 }
             }
-            let before = (w.status.clone(), w.changed_at, w.status_error.clone(), w.op);
+            let before = (w.status.clone(), w.changed_at, w.git_used_at, w.status_error.clone(), w.op);
             match res {
                 Ok(st) => {
                     w.changed_at = last_edited(&w.path, &st.paths);
@@ -685,7 +686,8 @@ impl Worker {
                 Err(e) => w.status_error = Some(format!("{e:#}")),
             }
             w.op = w.admin_dir.as_deref().and_then(git::worktree::operation);
-            changed |= before != (w.status.clone(), w.changed_at, w.status_error.clone(), w.op);
+            w.git_used_at = w.admin_dir.as_deref().filter(|_| !w.is_main).and_then(git::worktree::last_used);
+            changed |= before != (w.status.clone(), w.changed_at, w.git_used_at, w.status_error.clone(), w.op);
         }
         changed
     }

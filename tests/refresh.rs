@@ -318,6 +318,9 @@ fn merged_worktrees_are_marked_for_cleanup() {
     }
     git(&repo, &["merge", "-q", "--squash", "squashed"]);
     git(&repo, &["commit", "-qm", "squash of squashed"]);
+    // Worktrees without commits of their own that git used just now are held back.
+    fx.age(&fx.wt("detached"));
+    fx.age(&fx.wt("untracked-only"));
 
     let cfg = Config {
         interval: Duration::from_millis(300),

@@ -66,7 +66,7 @@ pub enum UiMsg {
     },
     /// The checks for removing a worktree finished: what removing it will do, for the confirm
     /// popup, or why it can't be removed.
-    CleanupPlan(Result<cleanup::Plan, String>),
+    CleanupPlan(Result<Box<cleanup::Plan>, String>),
     /// Removing a worktree finished: the footer notice.
     CleanupDone(Result<String, String>),
 }
@@ -247,6 +247,9 @@ pub struct App {
     clipboard: Vec<crate::clipboard::Method>,
     /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
+    /// Where herdr creates worktrees: checkouts there are only cleaned up through a herdr
+    /// workspace canopy can see.
+    herdr_dir: Option<PathBuf>,
     /// Git TUI for `t` (`--git-tui` / `CANOPY_GIT_TUI`); found on PATH when `None`.
     git_tui: Option<String>,
     next_id: u64,
@@ -288,6 +291,7 @@ impl App {
             cleaning: Cleaning::Idle,
             clipboard: crate::clipboard::methods(),
             with_herdr: true,
+            herdr_dir: None,
             git_tui: None,
             next_id: 0,
             tx,
@@ -647,11 +651,11 @@ impl App {
             }
             UiMsg::CleanupPlan(plan) => match plan {
                 Ok(plan) if matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. }) => {
-                    self.remove_worktree(plan);
+                    self.remove_worktree(*plan);
                 }
                 Ok(plan) => {
                     self.notice = None;
-                    self.confirm = Some(plan);
+                    self.confirm = Some(*plan);
                     self.cleaning = Cleaning::Confirming;
                 }
                 Err(e) => {
@@ -804,7 +808,28 @@ impl App {
     /// agent in it that isn't idle or done counts as busy.
     pub fn cleanup(&self, wi: usize) -> Cleanup {
         let Some(w) = self.snap.worktrees.get(wi) else { return Cleanup::No };
+        if self.herdr_unseen(wi) {
+            return Cleanup::No;
+        }
         w.cleanup(self.snap.base.as_deref(), self.agent_busy(wi))
+    }
+
+    /// Why worktree `wi` can't be cleaned up (untracked files aside).
+    fn cleanup_blocker(&self, wi: usize) -> Option<String> {
+        let w = self.snap.worktrees.get(wi)?;
+        w.cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(wi))
+            .or_else(|| self.herdr_unseen(wi).then(|| crate::model::HERDR_UNSEEN.to_string()))
+    }
+
+    /// Whether herdr made worktree `wi` but no herdr workspace canopy can see has it, so agents
+    /// in it (say, from a herdr on another machine sharing the filesystem) would go unnoticed.
+    fn herdr_unseen(&self, wi: usize) -> bool {
+        let Some(w) = self.snap.worktrees.get(wi) else { return false };
+        self.herdr_dir.as_deref().is_some_and(|d| w.path.starts_with(d))
+            && !self
+                .herdr
+                .as_ref()
+                .is_some_and(|v| v.workspaces.iter().any(|ws| ws.checkout.as_deref() == Some(&w.path)))
     }
 
     fn agent_busy(&self, wi: usize) -> bool {
@@ -1193,9 +1218,7 @@ impl App {
                 return;
             }
             Cleanup::No => {
-                let why = w
-                    .cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(wi))
-                    .unwrap_or_else(|| "it isn't safe to remove".into());
+                let why = self.cleanup_blocker(wi).unwrap_or_else(|| "it isn't safe to remove".into());
                 self.notice = Some(format!("can't remove {}: {why}", w.name));
                 return;
             }
@@ -1203,6 +1226,7 @@ impl App {
         let Some(base) = self.snap.base.clone() else { return };
         let common = self.snap.common_dir.clone();
         let sock = if self.with_herdr && self.herdr.is_some() { herdr::socket_path() } else { None };
+        let herdr_dir = self.herdr_dir.clone();
         let tx = self.tx.clone();
         self.cleaning = Cleaning::Checking {
             path: w.path.clone(),
@@ -1211,7 +1235,8 @@ impl App {
         self.notice = Some(format!("checking {}…", w.name));
         spawn_named("canopy-cleanup", move || {
             let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            let plan = cleanup::plan(&common, &w, &base, sock, own.as_deref())
+            let plan = cleanup::plan(&common, &w, &base, sock, herdr_dir.as_deref(), own.as_deref())
+                .map(Box::new)
                 .map_err(|e| format!("can't remove {}: {e:#}", w.name));
             let _ = tx.send(UiMsg::CleanupPlan(plan));
         });
@@ -1647,6 +1672,7 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, 
 
     let mut app = App::new(worker, tx, &cfg, layout);
     app.with_herdr = with_herdr;
+    app.herdr_dir = herdr::worktree_dir();
     app.git_tui = git_tui;
     let res = event_loop(&mut terminal, &mut app, &rx);
 

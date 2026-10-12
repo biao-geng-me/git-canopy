@@ -778,12 +778,7 @@ pub fn age(then: i64, now: i64) -> String {
     }
 }
 
-pub fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub use crate::model::now_secs;
 
 /// `[name]` in the worktree's lane color.
 fn worktree_label(name: &str, color: u8) -> Span<'static> {
