@@ -17,6 +17,8 @@ use crate::git::status::Status;
 pub enum Key {
     Commit(String),
     Worktree(PathBuf),
+    /// A repository's header row in the worktree list (by common dir); never expands.
+    Repo(PathBuf),
 }
 
 /// One inset line under base row `row`.

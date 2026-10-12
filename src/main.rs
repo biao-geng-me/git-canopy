@@ -9,11 +9,12 @@ const USAGE: &str = "\
 canopy - live view of every git worktree of a repo
 
 USAGE:
-    canopy [OPTIONS] [PATH]
-    git canopy [OPTIONS] [PATH]
+    canopy [OPTIONS] [PATH...]
+    git canopy [OPTIONS] [PATH...]
 
 ARGS:
-    PATH    any directory inside the repository (default: current directory)
+    PATH    any directory inside a repository (default: current directory); several watch
+            several repositories, listed in that order
 
 OPTIONS:
     -i, --interval <SECS>   poll interval in seconds for worktrees that can't be watched (default:
@@ -33,7 +34,7 @@ KEYS:
 ";
 
 struct Args {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     cfg: Config,
     layout: LayoutMode,
     herdr: bool,
@@ -41,7 +42,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut path: Option<PathBuf> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut cfg = Config::default();
     let mut layout = LayoutMode::default();
     let mut herdr = true;
@@ -89,17 +90,14 @@ fn parse_args() -> Result<Option<Args>, String> {
                 }
             }
             f if f.starts_with('-') && f.len() > 1 => return Err(format!("unknown option: {f}")),
-            _ => {
-                if path.is_some() {
-                    return Err("only one PATH may be given".into());
-                }
-                path = Some(PathBuf::from(arg));
-            }
+            _ => paths.push(PathBuf::from(arg)),
         }
     }
-    let path = path.unwrap_or_else(|| PathBuf::from("."));
+    if paths.is_empty() {
+        paths.push(PathBuf::from("."));
+    }
     Ok(Some(Args {
-        path,
+        paths,
         cfg,
         layout,
         herdr,
@@ -116,18 +114,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if !args.path.is_dir() {
-        eprintln!("canopy: not a directory: {}", args.path.display());
-        return ExitCode::FAILURE;
-    }
-    let paths = match canopy::git::discover(&args.path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("canopy: {e:#}");
+    // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
+    let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
+    for path in &args.paths {
+        if !path.is_dir() {
+            eprintln!("canopy: not a directory: {}", path.display());
             return ExitCode::FAILURE;
         }
-    };
-    match canopy::ui::run(paths, args.cfg, args.layout, args.herdr, args.git_tui) {
+        match canopy::git::discover(path) {
+            Ok(p) if repos.iter().any(|r| r.common_dir == p.common_dir) => {}
+            Ok(p) => repos.push(p),
+            Err(e) => {
+                eprintln!("canopy: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match canopy::ui::run(repos, args.cfg, args.layout, args.herdr, args.git_tui) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");

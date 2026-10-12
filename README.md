@@ -99,10 +99,11 @@ For a fully static Linux binary from a checkout: `cargo build --release --target
 ## Usage
 
 ```
-canopy [OPTIONS] [PATH]
-git canopy [OPTIONS] [PATH]
+canopy [OPTIONS] [PATH...]
+git canopy [OPTIONS] [PATH...]
 
-  PATH                    any directory inside the repository (default: current directory)
+  PATH                    any directory inside a repository (default: current directory);
+                          several watch several repositories
   -i, --interval <SECS>   poll interval for worktrees that can't be watched (default: 60);
                           watched worktrees are re-checked every 10 minutes regardless
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
@@ -114,6 +115,10 @@ git canopy [OPTIONS] [PATH]
       --git-tui <CMD>     git TUI that `t` opens (default: $CANOPY_GIT_TUI, else the first of
                           lazygit, gitui, tig on PATH)
 ```
+
+### Several repositories
+
+`canopy ~/a ~/b` watches both. The worktree list groups each repository's worktrees under a header row (name, base branch, worktree and dirty counts, blocked agents), and the graph shows the repository of the selected row: moving the selection into another repository switches the graph, which keeps its own cursor and expanded rows for each. Paths inside the same repository count once. With one repository there are no header rows.
 
 ### Keys
 

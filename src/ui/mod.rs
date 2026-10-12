@@ -39,7 +39,8 @@ use inset::{Entry, Expansion, Item, Key, Open, VLine};
 
 pub enum UiMsg {
     Input(Event),
-    Snapshot(Arc<Snapshot>),
+    /// A new snapshot of repository `.0`.
+    Snapshot(usize, Arc<Snapshot>),
     Diff {
         id: u64,
         result: Result<DiffDoc, String>,
@@ -221,8 +222,12 @@ pub struct App {
     pub docs: HashMap<Key, Entry>,
     /// herdr agent activity (`None`: herdr not reachable or disabled).
     pub herdr: Option<Arc<herdr::View>>,
-    /// herdr agents per worktree (indexes into `herdr.agents`), parallel to the snapshot's worktrees.
-    pub agents: Vec<Vec<usize>>,
+    /// Every watched repository; `snap` and `graph` are those of `repos[active]`.
+    pub repos: Vec<Repo>,
+    /// The repository the graph shows: always that of the selected worktree-list row.
+    pub active: usize,
+    /// What each base row of the worktree list is (its `VLine::Row` indexes this).
+    pub wt_rows: Vec<WtRef>,
     /// Pending "show this worktree in the graph" request, applied at render time (needs height).
     pub graph_jump: Option<PathBuf>,
     pub diff: Option<DiffView>,
@@ -231,7 +236,7 @@ pub struct App {
     pub areas: Areas,
     /// Graph width the open rows' text was wrapped for.
     pub wrap_width: usize,
-    /// Clickable fields of the visible worktree rows, by worktree index (from the last render).
+    /// Clickable fields of the visible worktree rows, by worktree-list row (from the last render).
     pub wt_fields: HashMap<usize, WtFields>,
     pub shell: Option<Shell>,
     /// Keys go to the inset shell (Ctrl-] leaves it).
@@ -259,13 +264,52 @@ pub struct App {
     pub hover: Option<(Focus, u16)>,
     /// Whether the last handled message changed anything on screen.
     redraw: bool,
+}
+
+/// One watched repository: its worker and latest snapshot.
+pub struct Repo {
+    pub snap: Arc<Snapshot>,
+    /// Shown in its header row until the first snapshot names it.
+    pub name: String,
+    worker: watch::Handle,
+    /// herdr agents per worktree (indexes into `App::herdr`'s agents), parallel to its worktrees.
+    pub agents: Vec<Vec<usize>>,
+    /// Its graph panel (cursor, expansion) while another repository is shown.
+    graph: Panel,
     /// Graph row count when "load more" was last requested, to ask only once per page.
     more_requested_at: usize,
-    worker: watch::Handle,
+}
+
+/// A base row of the worktree list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WtRef {
+    /// A repository's header (only when several repositories are shown).
+    Header(usize),
+    /// Worktree `wi` of repository `r`.
+    Tree(usize, usize),
+}
+
+impl WtRef {
+    pub fn repo(self) -> usize {
+        match self {
+            WtRef::Header(r) | WtRef::Tree(r, _) => r,
+        }
+    }
 }
 
 impl App {
-    fn new(worker: watch::Handle, tx: Sender<UiMsg>, cfg: &Config, layout: LayoutMode) -> Self {
+    fn new(workers: Vec<(String, watch::Handle)>, tx: Sender<UiMsg>, cfg: &Config, layout: LayoutMode) -> Self {
+        let repos = workers
+            .into_iter()
+            .map(|(name, worker)| Repo {
+                snap: Arc::new(Snapshot::default()),
+                name,
+                worker,
+                agents: Vec::new(),
+                graph: Panel::default(),
+                more_requested_at: 0,
+            })
+            .collect();
         App {
             snap: Arc::new(Snapshot::default()),
             interval_ms: cfg.interval.as_millis(),
@@ -275,7 +319,9 @@ impl App {
             graph: Panel::default(),
             docs: HashMap::new(),
             herdr: None,
-            agents: Vec::new(),
+            repos,
+            active: 0,
+            wt_rows: Vec::new(),
             graph_jump: None,
             diff: None,
             help: false,
@@ -298,8 +344,65 @@ impl App {
             last_click: None,
             hover: None,
             redraw: true,
-            more_requested_at: 0,
-            worker,
+        }
+    }
+
+    /// What base row `i` of the worktree list is.
+    pub fn wt_ref(&self, i: usize) -> Option<WtRef> {
+        self.wt_rows.get(i).copied()
+    }
+
+    /// The worktree behind worktree-list row `i` (none for a header).
+    pub fn wt_at(&self, i: usize) -> Option<(usize, &crate::model::WorktreeView)> {
+        match self.wt_ref(i)? {
+            WtRef::Tree(r, wi) => Some((r, self.repos[r].snap.worktrees.get(wi)?)),
+            WtRef::Header(_) => None,
+        }
+    }
+
+    /// Repository `r`'s name for its header and the graph title: its main worktree's directory
+    /// name, with the parent directory in front when another watched repository has the same
+    /// name (`alpha/repo`, `beta/repo`).
+    pub fn repo_label(&self, r: usize) -> String {
+        let name = |repo: &Repo| {
+            if repo.snap.repo_name.is_empty() { repo.name.clone() } else { repo.snap.repo_name.clone() }
+        };
+        let Some(repo) = self.repos.get(r) else { return String::new() };
+        let own = name(repo);
+        if self.repos.iter().filter(|x| name(x) == own).count() < 2 {
+            return own;
+        }
+        let main = repo.snap.worktrees.iter().find(|w| w.is_main).map(|w| w.path.as_path());
+        let dir = main.unwrap_or(&repo.snap.common_dir);
+        match dir.parent().and_then(Path::file_name) {
+            Some(parent) => format!("{}/{own}", parent.to_string_lossy()),
+            None => own,
+        }
+    }
+
+    /// The worktree at `path`, in whichever repository has it.
+    pub(super) fn find_worktree(&self, path: &Path) -> Option<&crate::model::WorktreeView> {
+        self.repos.iter().find_map(|r| r.snap.worktrees.iter().find(|w| w.path == path))
+    }
+
+    /// Show repository `r` in the graph: park the current graph panel, bring back `r`'s.
+    fn activate(&mut self, r: usize) {
+        if r == self.active || r >= self.repos.len() {
+            return;
+        }
+        let a = self.active;
+        std::mem::swap(&mut self.graph, &mut self.repos[a].graph);
+        std::mem::swap(&mut self.graph, &mut self.repos[r].graph);
+        self.active = r;
+        self.snap = self.repos[r].snap.clone();
+        self.rebuild();
+    }
+
+    /// Keep the invariant that the graph shows the selected worktree-list row's repository.
+    fn follow_wt_selection(&mut self) {
+        let r = self.wt.lines.get(self.wt.pos.sel).and_then(|l| self.wt_ref(l.row())).map(WtRef::repo);
+        if let Some(r) = r {
+            self.activate(r);
         }
     }
 
@@ -323,7 +426,10 @@ impl App {
     /// Identity of base row `r` of a panel.
     pub fn row_key(&self, f: Focus, r: usize) -> Option<Key> {
         match f {
-            Focus::Worktrees => self.snap.worktrees.get(r).map(|w| Key::Worktree(w.path.clone())),
+            Focus::Worktrees => match self.wt_ref(r)? {
+                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].snap.common_dir.clone())),
+                WtRef::Tree(..) => self.wt_at(r).map(|(_, w)| Key::Worktree(w.path.clone())),
+            },
             Focus::Graph => {
                 let g = &self.snap.graph;
                 Some(match g.rows.get(r)?.kind {
@@ -340,7 +446,7 @@ impl App {
         match f {
             Focus::Graph => self.row_key(f, r),
             Focus::Worktrees => {
-                let w = self.snap.worktrees.get(r)?;
+                let (_, w) = self.wt_at(r)?;
                 if !w.has_worktree() {
                     return None;
                 }
@@ -354,8 +460,11 @@ impl App {
 
     fn row_of(&self, f: Focus, key: &Key) -> Option<usize> {
         match (f, key) {
-            (Focus::Worktrees, Key::Worktree(p)) => self.snap.worktrees.iter().position(|w| &w.path == p),
-            (Focus::Worktrees, Key::Commit(_)) => None,
+            (Focus::Worktrees, Key::Worktree(p)) => (0..self.wt_rows.len()).find(|&i| self.wt_at(i).is_some_and(|(_, w)| &w.path == p)),
+            (Focus::Worktrees, Key::Repo(c)) => (0..self.wt_rows.len()).find(|&i| {
+                matches!(self.wt_rows[i], WtRef::Header(ri) if &self.repos[ri].snap.common_dir == c)
+            }),
+            (Focus::Worktrees, Key::Commit(_)) | (Focus::Graph, Key::Repo(_)) => None,
             (Focus::Graph, Key::Commit(id)) => self.snap.graph.commit_row.get(id).copied(),
             (Focus::Graph, Key::Worktree(p)) => {
                 let g = &self.snap.graph;
@@ -382,8 +491,16 @@ impl App {
     /// Rebuild both panels' visual lines, requesting docs for newly opened rows.
     /// Only the graph expands; the worktree panel is a plain list.
     fn rebuild(&mut self) {
+        let headers = self.repos.len() > 1;
+        self.wt_rows = Vec::new();
+        for (r, repo) in self.repos.iter().enumerate() {
+            if headers {
+                self.wt_rows.push(WtRef::Header(r));
+            }
+            self.wt_rows.extend((0..repo.snap.worktrees.len()).map(|wi| WtRef::Tree(r, wi)));
+        }
         let wt = &mut self.wt;
-        wt.lines = (0..self.snap.worktrees.len()).map(VLine::Row).collect();
+        wt.lines = (0..self.wt_rows.len()).map(VLine::Row).collect();
         wt.pos.clamp(wt.lines.len());
 
         let f = Focus::Graph;
@@ -519,7 +636,7 @@ impl App {
 
     fn worktree_stamp(&self, key: &Key) -> Option<(Option<crate::git::status::Status>, Option<i64>)> {
         let Key::Worktree(p) = key else { return None };
-        let w = self.snap.worktrees.iter().find(|w| &w.path == p)?;
+        let w = self.find_worktree(p)?;
         Some((w.status.clone(), w.changed_at))
     }
 
@@ -541,8 +658,9 @@ impl App {
                 dir: self.snap.common_dir.clone(),
                 id: id.clone(),
             },
+            Key::Repo(_) => return None,
             Key::Worktree(p) => {
-                let w = self.snap.worktrees.iter().find(|w| &w.path == p)?;
+                let w = self.find_worktree(p)?;
                 diff::Target::Worktree {
                     path: p.clone(),
                     has_head: w.head.is_some(),
@@ -614,10 +732,23 @@ impl App {
     // Messages
 
     fn handle(&mut self, msg: UiMsg) {
+        self.handle_msg(msg);
+        self.follow_wt_selection();
+    }
+
+    fn handle_msg(&mut self, msg: UiMsg) {
         match msg {
-            UiMsg::Snapshot(s) => {
+            UiMsg::Snapshot(r, s) => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
-                self.on_snapshot(s, ids);
+                if r == self.active {
+                    self.on_snapshot(s, ids);
+                } else if let Some(repo) = self.repos.get_mut(r) {
+                    repo.snap = s;
+                    self.map_agents();
+                    self.refresh_docs();
+                    self.rebuild();
+                    self.relocate(Focus::Worktrees, ids.0);
+                }
             }
             UiMsg::Inset { key, req, result } => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
@@ -666,7 +797,7 @@ impl App {
             UiMsg::CleanupDone(result) => {
                 self.cleaning = Cleaning::Idle;
                 self.notice = Some(result.unwrap_or_else(|e| e));
-                self.worker.request(Request::Refresh);
+                self.repos.iter().for_each(|r| r.worker.request(Request::Refresh));
             }
             UiMsg::Diff { id, result } => {
                 if let Some(d) = self.diff.as_mut().filter(|d| d.id == id) {
@@ -730,6 +861,7 @@ impl App {
         let first_graph = self.snap.graph.rows.is_empty();
         let graph_changed = !Arc::ptr_eq(&self.snap.graph, &snap.graph);
         let others_before = self.overlap_side_stamps();
+        self.repos[self.active].snap = snap.clone();
         self.snap = snap;
         let others_changed = others_before != self.overlap_side_stamps();
         self.map_agents();
@@ -738,7 +870,9 @@ impl App {
 
         if first_wts {
             // Start on the worktree canopy was launched from.
-            if let Some(i) = self.snap.worktrees.iter().position(|w| w.is_current)
+            let a = self.active;
+            if let Some(wi) = self.snap.worktrees.iter().position(|w| w.is_current)
+                && let Some(i) = self.wt_rows.iter().position(|&x| x == WtRef::Tree(a, wi))
                 && let Some(idx) = inset::index_of_row(&self.wt.lines, i)
             {
                 self.wt.pos.sel = idx;
@@ -767,10 +901,7 @@ impl App {
         // An overlaps view follows the worktree's overlaps (other worktrees changing).
         let overlaps_now = match self.diff.as_ref().map(|d| &d.target) {
             Some(diff::Target::Overlaps { path, overlaps, .. }) => self
-                .snap
-                .worktrees
-                .iter()
-                .find(|w| &w.path == path)
+                .find_worktree(path)
                 .map(|w| &w.overlaps)
                 .filter(|now| *now != overlaps)
                 .cloned(),
@@ -790,41 +921,54 @@ impl App {
 
     /// Match herdr agents to worktrees (after either side changed).
     fn map_agents(&mut self) {
-        self.agents = match &self.herdr {
-            Some(view) => {
-                let paths: Vec<PathBuf> = self.snap.worktrees.iter().map(|w| w.path.clone()).collect();
-                herdr::assign(view, &paths)
-            }
-            None => Vec::new(),
-        };
+        for repo in &mut self.repos {
+            repo.agents = match &self.herdr {
+                Some(view) => {
+                    let paths: Vec<PathBuf> = repo.snap.worktrees.iter().map(|w| w.path.clone()).collect();
+                    herdr::assign(view, &paths)
+                }
+                None => Vec::new(),
+            };
+        }
     }
 
-    /// The agents working in worktree `wi`, summarized.
+    /// The agents working in worktree `wi` of the shown repository, summarized.
     pub fn agent_activity(&self, wi: usize) -> Option<herdr::Activity> {
-        herdr::activity(self.herdr.as_ref()?, self.agents.get(wi)?)
+        self.agent_activity_in(self.active, wi)
     }
 
-    /// Whether worktree `wi` could be removed (with its branch) without losing anything. Any
-    /// agent in it that isn't idle or done counts as busy.
+    /// The agents working in worktree `wi` of repository `r`, summarized.
+    pub fn agent_activity_in(&self, r: usize, wi: usize) -> Option<herdr::Activity> {
+        herdr::activity(self.herdr.as_ref()?, self.repos.get(r)?.agents.get(wi)?)
+    }
+
+    /// Whether worktree `wi` of the shown repository could be removed (with its branch) without
+    /// losing anything.
     pub fn cleanup(&self, wi: usize) -> Cleanup {
-        let Some(w) = self.snap.worktrees.get(wi) else { return Cleanup::No };
-        if self.herdr_unseen(wi) {
+        self.cleanup_in(self.active, wi)
+    }
+
+    /// Whether worktree `wi` of repository `r` could be removed (with its branch) without losing
+    /// anything. Any agent in it that isn't idle or done counts as busy.
+    pub fn cleanup_in(&self, r: usize, wi: usize) -> Cleanup {
+        let Some(repo) = self.repos.get(r) else { return Cleanup::No };
+        let Some(w) = repo.snap.worktrees.get(wi) else { return Cleanup::No };
+        if self.herdr_unseen(w) {
             return Cleanup::No;
         }
-        w.cleanup(self.snap.base.as_deref(), self.agent_busy(wi))
+        w.cleanup(repo.snap.base.as_deref(), self.agent_busy(r, wi))
     }
 
-    /// Why worktree `wi` can't be cleaned up (untracked files aside).
+    /// Why worktree `wi` of the shown repository can't be cleaned up (untracked files aside).
     fn cleanup_blocker(&self, wi: usize) -> Option<String> {
         let w = self.snap.worktrees.get(wi)?;
-        w.cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(wi))
-            .or_else(|| self.herdr_unseen(wi).then(|| crate::model::HERDR_UNSEEN.to_string()))
+        w.cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(self.active, wi))
+            .or_else(|| self.herdr_unseen(w).then(|| crate::model::HERDR_UNSEEN.to_string()))
     }
 
-    /// Whether herdr made worktree `wi` but no herdr workspace canopy can see has it, so agents
+    /// Whether herdr made worktree `w` but no herdr workspace canopy can see has it, so agents
     /// in it (say, from a herdr on another machine sharing the filesystem) would go unnoticed.
-    fn herdr_unseen(&self, wi: usize) -> bool {
-        let Some(w) = self.snap.worktrees.get(wi) else { return false };
+    fn herdr_unseen(&self, w: &crate::model::WorktreeView) -> bool {
         self.herdr_dir.as_deref().is_some_and(|d| w.path.starts_with(d))
             && !self
                 .herdr
@@ -832,17 +976,17 @@ impl App {
                 .is_some_and(|v| v.workspaces.iter().any(|ws| ws.checkout.as_deref() == Some(&w.path)))
     }
 
-    fn agent_busy(&self, wi: usize) -> bool {
-        self.agent_activity(wi)
+    fn agent_busy(&self, r: usize, wi: usize) -> bool {
+        self.agent_activity_in(r, wi)
             .is_some_and(|a| !matches!(a.state, herdr::AgentState::Idle | herdr::AgentState::Done))
     }
 
-    /// How many of this repo's agents are in `state`.
+    /// How many agents in the watched repositories' worktrees are in `state`.
     pub fn agents_in_state(&self, state: herdr::AgentState) -> usize {
         let Some(view) = &self.herdr else { return 0 };
-        self.agents
+        self.repos
             .iter()
-            .flatten()
+            .flat_map(|r| r.agents.iter().flatten())
             .filter(|&&i| view.agents[i].state == state)
             .count()
     }
@@ -851,7 +995,10 @@ impl App {
     /// one the row belongs to.
     fn focused_wi(&self) -> Option<usize> {
         match self.focus {
-            Focus::Worktrees => self.wt.lines.get(self.wt.pos.sel).map(|l| l.row()),
+            Focus::Worktrees => match self.wt_ref(self.wt.lines.get(self.wt.pos.sel)?.row())? {
+                WtRef::Tree(r, wi) if r == self.active => Some(wi),
+                _ => None,
+            },
             Focus::Graph => self.graph_row_worktree(),
         }
     }
@@ -865,7 +1012,7 @@ impl App {
         let Some(view) = &self.herdr else { return };
         let wi = self.focused_wi();
         let agent = wi
-            .and_then(|wi| self.agents.get(wi))
+            .and_then(|wi| self.repos[self.active].agents.get(wi))
             .and_then(|ids| ids.iter().map(|&i| &view.agents[i]).max_by_key(|a| a.state));
         if let Some(a) = agent {
             herdr::focus(a.pane_id.clone());
@@ -891,7 +1038,7 @@ impl App {
     /// The worktree under the worktree panel's cursor.
     pub fn selected_worktree(&self) -> Option<&crate::model::WorktreeView> {
         let line = self.wt.lines.get(self.wt.pos.sel)?;
-        self.snap.worktrees.get(line.row())
+        self.wt_at(line.row()).map(|(_, w)| w)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -922,7 +1069,7 @@ impl App {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('r') => self.worker.request(Request::Refresh),
+            KeyCode::Char('r') => self.repos.iter().for_each(|r| r.worker.request(Request::Refresh)),
             KeyCode::Char('a') => self.focus_agent(),
             KeyCode::Char('s') => {
                 if let Some(w) = self.focused_worktree() {
@@ -1004,7 +1151,10 @@ impl App {
         p.pos.move_by(delta, p.lines.len());
         let after = p.lines.get(p.pos.sel).map(|l| l.row());
         match f {
-            Focus::Worktrees if before != after => self.jump_graph_to_selected(),
+            Focus::Worktrees if before != after => {
+                self.follow_wt_selection();
+                self.jump_graph_to_selected();
+            }
             Focus::Graph => self.maybe_load_more(),
             _ => {}
         }
@@ -1037,9 +1187,10 @@ impl App {
         let (len, page) = (self.graph.lines.len(), self.page());
         let pos = self.graph.pos;
         let near_end = pos.sel + 2 * page >= len || pos.offset + 2 * page >= len;
-        if self.snap.graph.truncated && near_end && self.more_requested_at != rows {
-            self.more_requested_at = rows;
-            self.worker.request(Request::LoadMore);
+        let repo = &mut self.repos[self.active];
+        if self.snap.graph.truncated && near_end && repo.more_requested_at != rows {
+            repo.more_requested_at = rows;
+            repo.worker.request(Request::LoadMore);
         }
     }
 
@@ -1147,13 +1298,14 @@ impl App {
         if f != Focus::Worktrees {
             return None;
         }
-        let wi = self.wt.lines.get(line)?.row();
-        let fields = self.wt_fields.get(&wi)?;
+        let i = self.wt.lines.get(line)?.row();
+        let WtRef::Tree(_, wi) = self.wt_ref(i)? else { return None };
+        let fields = self.wt_fields.get(&i)?;
         if fields.agent.as_ref().is_some_and(|r| r.contains(&col)) {
             return Some(WtField::Agent);
         }
         if fields.path.as_ref().is_some_and(|r| r.contains(&col)) {
-            return Some(WtField::Path(self.snap.worktrees.get(wi)?.path.clone()));
+            return Some(WtField::Path(self.wt_at(i)?.1.path.clone()));
         }
         if fields.overlap.as_ref().is_some_and(|r| r.contains(&col)) {
             return Some(WtField::Overlap(wi));
@@ -1431,6 +1583,7 @@ impl App {
                 let selected = was_focused && self.panel(f).pos.sel == idx;
                 self.set_cursor(f, idx);
                 if f == Focus::Worktrees {
+                    self.follow_wt_selection();
                     // Always, also when the graph cursor was moved away from this worktree.
                     self.jump_graph_to_selected();
                 }
@@ -1510,14 +1663,10 @@ impl App {
                 }
             }
             Key::Worktree(p) => {
-                let name = self
-                    .snap
-                    .worktrees
-                    .iter()
-                    .find(|w| &w.path == p)
-                    .map(|w| w.name.as_str());
+                let name = self.find_worktree(p).map(|w| w.name.as_str());
                 format!("[{}] uncommitted changes", name.unwrap_or("?"))
             }
+            Key::Repo(_) => return,
         };
         // Where to land: (file, scroll) within the doc.
         let focus = match l {
@@ -1642,12 +1791,23 @@ fn program_name(command: &str) -> String {
         .map_or_else(|| first.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// A repository's name before its first snapshot: the directory holding its common dir (`.git`),
+/// or the bare repository's own directory name.
+fn repo_name(common_dir: &Path) -> String {
+    let dir = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        common_dir.parent().unwrap_or(common_dir)
+    } else {
+        common_dir
+    };
+    dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new().name(name.into()).spawn(f).expect("spawn thread");
 }
 
-/// Run the TUI until the user quits.
-pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, git_tui: Option<String>) -> Result<()> {
+/// Run the TUI on `repos` (one or more, distinct common dirs) until the user quits.
+pub fn run(repos: Vec<RepoPaths>, cfg: Config, layout: LayoutMode, with_herdr: bool, git_tui: Option<String>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
     if with_herdr {
@@ -1656,10 +1816,18 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, 
             let _ = herdr_tx.send(UiMsg::Herdr(view));
         });
     }
-    let snap_tx = tx.clone();
-    let worker = watch::spawn(paths, cfg.clone(), move |s| {
-        let _ = snap_tx.send(UiMsg::Snapshot(s));
-    });
+    let workers = repos
+        .into_iter()
+        .enumerate()
+        .map(|(r, paths)| {
+            let name = repo_name(&paths.common_dir);
+            let snap_tx = tx.clone();
+            let worker = watch::spawn(paths, cfg.clone(), move |s| {
+                let _ = snap_tx.send(UiMsg::Snapshot(r, s));
+            });
+            (name, worker)
+        })
+        .collect();
 
     // Disable mouse capture on panic too; ratatui's own hook restores the rest.
     let prev = std::panic::take_hook();
@@ -1670,7 +1838,7 @@ pub fn run(paths: RepoPaths, cfg: Config, layout: LayoutMode, with_herdr: bool, 
     let mut terminal = ratatui::try_init()?;
     let _ = execute!(stdout(), EnableMouseCapture);
 
-    let mut app = App::new(worker, tx, &cfg, layout);
+    let mut app = App::new(workers, tx, &cfg, layout);
     app.with_herdr = with_herdr;
     app.herdr_dir = herdr::worktree_dir();
     app.git_tui = git_tui;
@@ -1713,4 +1881,15 @@ fn spawn_input(tx: Sender<UiMsg>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_names() {
+        assert_eq!(repo_name(Path::new("/w/canopy/.git")), "canopy");
+        assert_eq!(repo_name(Path::new("/srv/mirror.git")), "mirror.git");
+    }
 }

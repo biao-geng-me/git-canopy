@@ -10,11 +10,11 @@ use unicode_width::UnicodeWidthStr;
 use super::copy;
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
-use super::{App, Focus, InsetText, LayoutMode, WtFields};
+use super::{App, Focus, InsetText, LayoutMode, WtFields, WtRef};
 use crate::diff::FileDiff;
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::herdr::{self, AgentState};
-use crate::model::{Cleanup, Landed, WorktreeView};
+use crate::model::{Cleanup, Landed, Snapshot, WorktreeView};
 
 pub const C_STAGED: Color = Color::Green;
 pub const C_MODIFIED: Color = Color::Yellow;
@@ -206,8 +206,8 @@ pub fn cleanup_span(c: Cleanup, w: &WorktreeView) -> Option<Span<'static>> {
 
 /// Spaces after the worktree rows' marker column: two when a row shows `⌫`, which many fonts
 /// draw wider than its cell.
-fn marker_gap(rows: &[WtRow]) -> usize {
-    if rows.iter().any(|r| r.marker.content == CLEANUP_GLYPH) { 2 } else { 1 }
+fn marker_gap<'a>(mut markers: impl Iterator<Item = &'a Span<'static>>) -> usize {
+    if markers.any(|m| m.content == CLEANUP_GLYPH) { 2 } else { 1 }
 }
 
 /// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts.
@@ -353,32 +353,71 @@ pub fn agent_spans(act: herdr::Activity, wide: bool) -> Vec<Span<'static>> {
     spans
 }
 
-fn wt_rows(app: &App, wide: bool) -> Vec<WtRow> {
-    let base = app.snap.base.as_deref();
-    app.snap
-        .worktrees
+/// The worktree list's rows, parallel to `App::wt_rows` (`None` for repository headers).
+fn wt_rows(app: &App, wide: bool) -> Vec<Option<WtRow>> {
+    app.wt_rows
         .iter()
-        .enumerate()
-        .map(|(wi, w)| {
+        .map(|&wr| {
+            let WtRef::Tree(r, wi) = wr else { return None };
+            let snap = &app.repos[r].snap;
+            let w = snap.worktrees.get(wi)?;
+            let base = snap.base.as_deref();
             // Named in the same color as its lane in the graph.
-            let mut style = worktree_color(app, w).map_or(Style::new(), lane_style);
+            let mut style = worktree_color(snap, w).map_or(Style::new(), lane_style);
             if w.is_current {
                 style = style.add_modifier(Modifier::BOLD);
             }
             if w.prunable.is_some() || w.bare {
                 style = style.fg(C_DIM);
             }
-            WtRow {
-                marker: cleanup_span(app.cleanup(wi), w).unwrap_or_else(|| marker(w)),
+            Some(WtRow {
+                marker: cleanup_span(app.cleanup_in(r, wi), w).unwrap_or_else(|| marker(w)),
                 name: Span::styled(w.name.clone(), style),
-                agent: app.agent_activity(wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
+                agent: app.agent_activity_in(r, wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
                 counts: count_spans(w),
                 ab: ab_spans(w, base),
                 size: if wide { size_spans(w) } else { Vec::new() },
                 overlap: overlap_spans(w, wide),
-            }
+            })
         })
         .collect()
+}
+
+/// A repository's header row in the worktree list: `three-ux · base main · 4 worktrees ✎ 1`.
+fn repo_header(app: &App, r: usize) -> Line<'static> {
+    let repo = &app.repos[r];
+    let snap = &repo.snap;
+    let dim = Style::new().fg(C_DIM);
+    let mut spans = vec![Span::styled(app.repo_label(r), Style::new().add_modifier(Modifier::BOLD))];
+    if let Some(b) = &snap.base {
+        spans.push(Span::styled(format!(" · base {b}"), dim));
+    }
+    let n = snap.worktrees.len();
+    spans.push(Span::styled(
+        match n {
+            0 => " · loading…".to_string(),
+            1 => " · 1 worktree".to_string(),
+            n => format!(" · {n} worktrees"),
+        },
+        dim,
+    ));
+    let dirty = snap.worktrees.iter().filter(|w| w.is_dirty()).count();
+    if dirty > 0 {
+        spans.push(Span::styled(format!("  ✎ {dirty}"), Style::new().fg(C_MODIFIED)));
+    }
+    let blocked: usize = repo
+        .agents
+        .iter()
+        .flatten()
+        .filter(|&&i| app.herdr.as_ref().is_some_and(|v| v.agents[i].state == AgentState::Blocked))
+        .count();
+    if blocked > 0 {
+        spans.push(Span::styled(
+            format!("  ◆ {blocked} blocked"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 const NAME_MAX: usize = 28;
@@ -386,7 +425,7 @@ const NAME_MAX: usize = 28;
 const NARROW: u16 = 72;
 
 fn worktree_panel_width(app: &App, total: u16) -> u16 {
-    let rows = wt_rows(app, false);
+    let rows: Vec<WtRow> = wt_rows(app, false).into_iter().flatten().collect();
     let name = rows
         .iter()
         .map(|r| r.name.content.width())
@@ -400,7 +439,7 @@ fn worktree_panel_width(app: &App, total: u16) -> u16 {
     // side margins + marker + gaps
     let natural = 2
         + 1
-        + marker_gap(&rows)
+        + marker_gap(rows.iter().map(|r| &r.marker))
         + name
         + 1
         + if agent > 0 { agent + 1 } else { 0 }
@@ -626,9 +665,13 @@ fn inset_spans(app: &App, f: Focus, r: usize, item: Item) -> Vec<Span<'static>> 
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let focused = app.focus == Focus::Worktrees && !app.shell_focus;
-    let n = app.snap.worktrees.len();
-    let dirty = app.snap.worktrees.iter().filter(|w| w.is_dirty()).count();
+    let all = || app.repos.iter().flat_map(|r| r.snap.worktrees.iter());
+    let n = all().count();
+    let dirty = all().filter(|w| w.is_dirty()).count();
     let mut title = vec![Span::raw(" worktrees ")];
+    if app.repos.len() > 1 {
+        title.push(Span::styled(format!("{} repos · ", app.repos.len()), Style::new().fg(C_DIM)));
+    }
     if n > 0 {
         title.push(Span::styled(format!("{n} "), Style::new().fg(C_DIM)));
         if dirty > 0 {
@@ -644,14 +687,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     }
 
     let now = now_secs();
-    let rows = wt_rows(app, wide);
+    let mut rows = wt_rows(app, wide);
     let width = inner.width as usize;
-    let counts = rows.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
-    let ab = rows.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
-    let name_natural = rows.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
-    let size = rows.iter().map(|r| spans_width(&r.size)).max().unwrap_or(0);
-    let overlap = rows.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
-    let gap = marker_gap(&rows);
+    let present: Vec<&WtRow> = rows.iter().flatten().collect();
+    let rows_ref = &present;
+    let counts = rows_ref.iter().map(|r| spans_width(&r.counts)).max().unwrap_or(0);
+    let ab = rows_ref.iter().map(|r| spans_width(&r.ab)).max().unwrap_or(0);
+    let name_natural = rows_ref.iter().map(|r| r.name.content.width()).max().unwrap_or(0);
+    let size = rows_ref.iter().map(|r| spans_width(&r.size)).max().unwrap_or(0);
+    let overlap = rows_ref.iter().map(|r| spans_width(&r.overlap)).max().unwrap_or(0);
+    let gap = marker_gap(rows_ref.iter().map(|r| &r.marker));
     let fixed = 1
         + gap
         + 1
@@ -660,9 +705,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
         + if size > 0 { 2 + size } else { 0 }
         + if overlap > 0 { 2 + overlap } else { 0 };
     let activity = if wide {
-        app.snap
-            .worktrees
-            .iter()
+        all()
             .filter_map(|w| activity_text(w, now))
             .map(|s| s.width())
             .max()
@@ -670,8 +713,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     } else {
         0
     };
-    let base = common_parent(app.snap.worktrees.iter().map(|w| w.path.as_path()));
-    let shown_path = |w: &WorktreeView| match &base {
+    // Paths relative to the common parent of each repository's worktrees.
+    let parents: Vec<Option<std::path::PathBuf>> = app
+        .repos
+        .iter()
+        .map(|r| common_parent(r.snap.worktrees.iter().map(|w| w.path.as_path())))
+        .collect();
+    let shown_path = |r: usize, w: &WorktreeView| match &parents[r] {
         Some(b) => w
             .path
             .strip_prefix(b)
@@ -681,17 +729,18 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     };
     let path = if wide {
         let longest = app
-            .snap
-            .worktrees
+            .repos
             .iter()
-            .map(|w| shown_path(w).width())
+            .enumerate()
+            .flat_map(|(r, repo)| repo.snap.worktrees.iter().map(move |w| (r, w)))
+            .map(|(r, w)| shown_path(r, w).width())
             .max()
             .unwrap_or(0);
         longest.min(width / 4)
     } else {
         0
     };
-    let agent = rows.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
+    let agent = rows_ref.iter().map(|r| spans_width(&r.agent)).max().unwrap_or(0);
     let cols = WtCols {
         marker_gap: gap,
         name: name_natural
@@ -709,7 +758,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let height = inner.height as usize;
     app.wt.pos.clamp(app.wt.lines.len());
     app.wt.pos.scroll_into_view(height);
-    let mut rows: Vec<Option<WtRow>> = rows.into_iter().map(Some).collect();
     let visible: Vec<VLine> = app
         .wt
         .lines
@@ -722,14 +770,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let lines: Vec<Line> = visible
         .into_iter()
         .map(|l| match l {
-            VLine::Row(r) => match rows.get_mut(r).and_then(Option::take) {
-                Some(row) => {
-                    let w = &app.snap.worktrees[r];
-                    let (line, hit) = wt_line(row, w, &shown_path(w), &cols, wide, width, now);
-                    fields.insert(r, hit);
+            VLine::Row(i) => match (rows.get_mut(i).and_then(Option::take), app.wt_at(i)) {
+                (Some(row), Some((r, w))) => {
+                    let (line, hit) = wt_line(row, w, &shown_path(r, w), &cols, wide, width, now);
+                    fields.insert(i, hit);
                     line
                 }
-                None => Line::default(),
+                _ => match app.wt_ref(i) {
+                    Some(WtRef::Header(r)) => repo_header(app, r),
+                    _ => Line::default(),
+                },
             },
             VLine::Inset(r, item) => {
                 let mut spans = vec![Span::raw("    ")];
@@ -786,8 +836,8 @@ fn worktree_label(name: &str, color: u8) -> Span<'static> {
 }
 
 /// The lane color of a worktree in the graph (its uncommitted row or HEAD commit).
-pub fn worktree_color(app: &App, w: &WorktreeView) -> Option<u8> {
-    let g = &app.snap.graph;
+pub fn worktree_color(snap: &Snapshot, w: &WorktreeView) -> Option<u8> {
+    let g = &snap.graph;
     let r = *g.worktree_row.get(&w.path)?;
     Some(g.rows.get(r)?.color).filter(|&c| c != graph::NO_COLOR)
 }
@@ -949,6 +999,10 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
 fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Graph && !app.shell_focus;
     let mut title = vec![Span::raw(" graph ")];
+    if app.repos.len() > 1 {
+        let name = app.repo_label(app.active);
+        title.push(Span::styled(format!("{name} "), Style::new().add_modifier(Modifier::BOLD)));
+    }
     if let Some(b) = &app.snap.base {
         title.push(Span::styled(format!("· base {b} "), Style::new().fg(C_DIM)));
     }
@@ -1042,6 +1096,22 @@ pub fn tilde(p: &std::path::Path) -> String {
         Ok(home) if !home.is_empty() && s.starts_with(&home) => format!("~{}", &s[home.len()..]),
         _ => s,
     }
+}
+
+/// Footer details of a repository header: where it is, and what its worktrees are up to.
+fn repo_details(app: &App, r: usize) -> Line<'static> {
+    let snap = &app.repos[r].snap;
+    let dim = Style::new().fg(C_DIM);
+    let mut spans = vec![Span::raw(tilde(&snap.common_dir))];
+    if let Some(b) = &snap.base {
+        spans.push(Span::styled("  ·  ", dim));
+        spans.push(Span::raw(format!("base {b}")));
+    }
+    let watched = snap.worktrees.iter().filter(|w| w.watched).count();
+    let trees = snap.worktrees.iter().filter(|w| w.has_worktree()).count();
+    spans.push(Span::styled("  ·  ", dim));
+    spans.push(Span::styled(format!("{watched}/{trees} watched"), dim));
+    Line::from(spans)
 }
 
 fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
@@ -1163,8 +1233,12 @@ fn herdr_summary(app: &App) -> Vec<Span<'static>> {
         return Vec::new();
     }
     let dim = Style::new().fg(C_DIM);
-    let acts: Vec<herdr::Activity> = (0..app.snap.worktrees.len())
-        .filter_map(|i| app.agent_activity(i))
+    let acts: Vec<herdr::Activity> = app
+        .repos
+        .iter()
+        .enumerate()
+        .flat_map(|(r, repo)| (0..repo.snap.worktrees.len()).map(move |wi| (r, wi)))
+        .filter_map(|(r, wi)| app.agent_activity_in(r, wi))
         .collect();
     let total: usize = acts.iter().map(|a| a.count).sum();
     let blocked = app.agents_in_state(AgentState::Blocked);
@@ -1189,16 +1263,17 @@ fn herdr_summary(app: &App) -> Vec<Span<'static>> {
 
 /// Footer summary of how the view stays fresh: `watching 8/9 · poll 60s`, `no poll`, ….
 fn refresh_mode(app: &App) -> String {
-    let trees = app.snap.worktrees.iter().filter(|w| w.has_worktree()).count();
-    let watched = app.snap.worktrees.iter().filter(|w| w.watched).count();
-    let watch = if !app.snap.watching {
+    let all = || app.repos.iter().flat_map(|r| r.snap.worktrees.iter());
+    let trees = all().filter(|w| w.has_worktree()).count();
+    let watched = all().filter(|w| w.watched).count();
+    let watch = if !app.repos.iter().any(|r| r.snap.watching) {
         String::new()
     } else if watched > 0 {
         format!("watching {watched}/{trees} · ")
     } else {
         "watching git · ".into()
     };
-    let poll = if app.snap.polling {
+    let poll = if app.repos.iter().any(|r| r.snap.polling) {
         format!("poll {}", secs(app.interval_ms))
     } else {
         "no poll (r)".into()
@@ -1446,7 +1521,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .filter(|d| !matches!(d.target, crate::diff::Target::Overlaps { .. }))
         .and_then(|d| d.target.worktree())
-        .and_then(|p| app.snap.worktrees.iter().find(|w| w.path == p))
+        .and_then(|p| app.find_worktree(p))
         .map(|w| {
             let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
             for o in &w.overlaps {
@@ -1660,9 +1735,9 @@ fn draw_shell(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // `── shell · feat-auth ~/…/wt/feat-auth ──── hint`, the path shortened to fit.
     let name = app
-        .snap
-        .worktrees
+        .repos
         .iter()
+        .flat_map(|r| r.snap.worktrees.iter())
         .find(|w| w.path == shell.term.path)
         .map(|w| w.name.clone());
     let mut title = vec![Span::raw(format!(" {} ", shell.label))];
@@ -1755,11 +1830,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let line = match app.focus {
-        Focus::Worktrees => app
-            .wt
-            .lines
-            .get(app.wt.pos.sel)
-            .and_then(|l| worktree_details(app, l.row())),
+        Focus::Worktrees => app.wt.lines.get(app.wt.pos.sel).and_then(|l| match app.wt_ref(l.row())? {
+            WtRef::Tree(_, wi) => worktree_details(app, wi),
+            WtRef::Header(r) => Some(repo_details(app, r)),
+        }),
         Focus::Graph => graph_details(app),
     };
     if app.notice.is_some() {

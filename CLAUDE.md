@@ -168,9 +168,11 @@ in base, with no busy agent, after the user confirms.
   cursor.
 - Not planned: notifications (herdr already notifies on blocked agents).
 
-### Multi-repo (planned for 0.4, not built)
+### Multi-repo (0.4; step 1 built)
 
 Agents often work in several projects at once; one canopy should be able to watch all of them.
+
+Built (step 1): every `PATH` argument is a repository (deduplicated by common dir in `main.rs`), each with its own `watch::Worker`; `App::repos` holds per-repo state (`Repo`: snapshot, worker, herdr agent mapping, the parked graph `Panel`, load-more bookkeeping), and `App::snap`/`App::graph` are those of `App::active`. **Invariant: the active repo is the repo of the selected worktree-list row** (`App::follow_wt_selection`, run after every handled message and on moves/clicks), so everything that acts on "the focused worktree" or the graph keeps using `self.snap` and plain worktree indexes. The worktree list's base rows are `App::wt_rows` (`WtRef::Header(r)` / `WtRef::Tree(r, wi)`); only its rendering, per-row markers (`App::cleanup_in`, `agent_activity_in`), the herdr footer and refresh summary span all repos. Header rows (`Key::Repo(common dir)`, never expand) only with several repos; duplicate repo names get their parent directory (`App::repo_label`). Still to do: `--herdr-repos` discovery, the shared resources below, and the `(host, path)` keys + Worker request API from the remote prep bullet.
 
 - **Boundary:** everything per repository stays per repository. One `watch::Worker` (and one
   `Snapshot`) per common dir, unchanged; `App` holds a list of repos instead of one `snap` + `worker`.

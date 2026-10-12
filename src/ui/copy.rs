@@ -126,7 +126,11 @@ impl App {
         let r = line.row();
         let g = &self.snap.graph;
         let (wi, sha) = match f {
-            Focus::Worktrees => (Some(r), self.snap.worktrees.get(r).and_then(|w| w.head.clone())),
+            // The selected row's repository is the shown one (`App::active`).
+            Focus::Worktrees => match self.wt_ref(r) {
+                Some(super::WtRef::Tree(_, wi)) => (Some(wi), self.snap.worktrees.get(wi).and_then(|w| w.head.clone())),
+                _ => return CopyCtx::default(),
+            },
             Focus::Graph => match g.rows.get(r).map(|row| row.kind) {
                 Some(RowKind::Commit(ci)) => (self.graph_row_worktree(), Some(g.commits[ci].id.clone())),
                 Some(RowKind::Uncommitted(wi)) => (Some(wi), self.snap.worktrees.get(wi).and_then(|w| w.head.clone())),
