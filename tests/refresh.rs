@@ -391,3 +391,34 @@ fn moved_head_refreshes_status() {
     git(&fx.repo(), &["update-ref", "refs/heads/refactor-db", "refactor-db~1"]);
     wait_for(&rx, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
 }
+
+#[test]
+fn repositories_share_one_watcher() {
+    // Two repositories watched through one hub: an edit reaches the worker of its own
+    // repository (polling is effectively off, so only an event can explain the update).
+    let (a, b) = (common::Fixture::new(), common::Fixture::new());
+    let hub = watch::Hub::new();
+    let cfg = Config {
+        interval: Duration::from_secs(3600),
+        ..Config::default()
+    };
+    let start = |fx: &common::Fixture| {
+        let (tx, rx) = mpsc::channel();
+        let paths = canopy::git::discover(&fx.repo()).unwrap();
+        let h = watch::spawn_with(paths, cfg.clone(), hub.clone(), move |s| {
+            let _ = tx.send(s);
+        });
+        (h, rx)
+    };
+    let ((_ha, rxa), (_hb, rxb)) = (start(&a), start(&b));
+    let ready = |s: &Snapshot| s.statuses_loaded && s.worktrees.iter().any(|w| w.watched);
+    wait_for(&rxa, Duration::from_secs(10), ready);
+    wait_for(&rxb, Duration::from_secs(10), ready);
+
+    std::fs::write(b.wt("refactor-db").join("new.txt"), "x").unwrap();
+    wait_for(&rxb, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+    // a saw nothing of it.
+    assert!(rxa.try_iter().all(|s| !find(&s, "refactor-db").is_dirty()));
+    std::fs::write(a.wt("refactor-db").join("new.txt"), "x").unwrap();
+    wait_for(&rxa, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+}

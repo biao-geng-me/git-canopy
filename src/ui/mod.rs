@@ -1816,13 +1816,15 @@ pub fn run(repos: Vec<RepoPaths>, cfg: Config, layout: LayoutMode, with_herdr: b
             let _ = herdr_tx.send(UiMsg::Herdr(view));
         });
     }
+    // One watcher (and inotify budget) for all repositories.
+    let hub = watch::Hub::new();
     let workers = repos
         .into_iter()
         .enumerate()
         .map(|(r, paths)| {
             let name = repo_name(&paths.common_dir);
             let snap_tx = tx.clone();
-            let worker = watch::spawn(paths, cfg.clone(), move |s| {
+            let worker = watch::spawn_with(paths, cfg.clone(), hub.clone(), move |s| {
                 let _ = snap_tx.send(UiMsg::Snapshot(r, s));
             });
             (name, worker)

@@ -14,6 +14,7 @@
 //!
 //! Refs are fingerprinted so the log/graph is only recomputed when something actually moved.
 
+mod hub;
 mod trees;
 
 use std::collections::hash_map::DefaultHasher;
@@ -22,17 +23,20 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecursiveMode;
 
 use crate::fsinfo::{self, Events};
 use crate::git::{self, RepoPaths, changes::FileChange, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
 use crate::model::{self, Changes, Landed, Overlap, Snapshot, WorktreeView};
+use hub::Watches;
 use trees::TreeWatch;
+
+pub use hub::Hub;
 
 /// Coalesce bursts of fs events (git writes several files per operation).
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -43,8 +47,42 @@ pub const MIN_GAP: Duration = Duration::from_secs(2);
 pub const FALLBACK: Duration = Duration::from_secs(600);
 /// Worktrees with more directories than this are polled instead of watched.
 const MAX_WATCH_DIRS: usize = 10_000;
-/// Max concurrent git processes for startup and manual refreshes.
+/// Max concurrent git processes for startup and manual refreshes, per worker.
 const PARALLELISM: usize = 6;
+/// Max jobs (git processes, tree walks) running in parallel batches of all workers together, so
+/// watching several repositories doesn't multiply the load at startup.
+const GLOBAL_PARALLELISM: usize = 8;
+
+/// Slots for [`GLOBAL_PARALLELISM`], taken by every job [`par_map`] runs.
+static SLOTS: Slots = Slots {
+    free: Mutex::new(GLOBAL_PARALLELISM),
+    freed: Condvar::new(),
+};
+
+struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn take(&self) -> SlotGuard<'_> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap();
+        }
+        *free -= 1;
+        SlotGuard(self)
+    }
+}
+
+struct SlotGuard<'a>(&'a Slots);
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.freed.notify_one();
+    }
+}
 /// Default for [`Config::page`].
 pub const GRAPH_PAGE: usize = 1000;
 
@@ -97,8 +135,17 @@ impl Handle {
     }
 }
 
-/// Start the worker. `emit` is called from the worker thread with every new snapshot.
+/// Start the worker with a watcher of its own. `emit` is called from the worker thread with
+/// every new snapshot.
 pub fn spawn<F>(paths: RepoPaths, cfg: Config, emit: F) -> Handle
+where
+    F: Fn(Arc<Snapshot>) + Send + 'static,
+{
+    spawn_with(paths, cfg, Hub::new(), emit)
+}
+
+/// Start the worker, watching through `hub` (shared by every repository's worker).
+pub fn spawn_with<F>(paths: RepoPaths, cfg: Config, hub: Arc<Hub>, emit: F) -> Handle
 where
     F: Fn(Arc<Snapshot>) + Send + 'static,
 {
@@ -109,7 +156,7 @@ where
         .spawn(move || {
             let mut w = Worker::new(paths, cfg, Box::new(emit));
             if w.cfg.watch {
-                w.start_watcher(fs_tx);
+                w.start_watcher(&hub, fs_tx);
             }
             w.initial_load();
             w.run(rx);
@@ -122,7 +169,8 @@ struct Worker {
     paths: RepoPaths,
     cfg: Config,
     emit: Box<dyn Fn(Arc<Snapshot>) + Send>,
-    watcher: Option<RecommendedWatcher>,
+    /// Its watches in the shared hub (`None`: not watching, polling only).
+    watches: Option<Watches>,
     watched_worktrees_dir: bool,
     /// Watched worktrees, by path.
     trees: HashMap<PathBuf, TreeWatch>,
@@ -178,7 +226,7 @@ impl Worker {
             paths,
             cfg,
             emit,
-            watcher: None,
+            watches: None,
             watched_worktrees_dir: false,
             trees: HashMap::new(),
             unwatchable: HashSet::new(),
@@ -213,31 +261,23 @@ impl Worker {
         &self.paths.common_dir
     }
 
-    fn start_watcher(&mut self, tx: Sender<Msg>) {
+    fn start_watcher(&mut self, hub: &Arc<Hub>, tx: Sender<Msg>) {
         let common = self.paths.common_dir.clone();
         if fsinfo::events_at(&common) == Events::Unreliable {
             return; // e.g. WSL2 /mnt/c: watches "work" but never fire. Poll instead.
         }
-        let handler = move |res: notify::Result<notify::Event>| {
-            // Access events include our own `git status` opening files: never react to them.
-            if let Ok(ev) = res
-                && !ev.kind.is_access()
-                && !ev.paths.is_empty()
-            {
-                let _ = tx.send(Msg::Fs(ev.paths));
-            }
-        };
-        let Ok(mut watcher) = notify::recommended_watcher(handler) else {
+        if !hub.works() {
             return; // Polling still covers everything, just with more latency.
-        };
-        if watcher.watch(&common, RecursiveMode::NonRecursive).is_err() {
+        }
+        let watches = hub.register(tx);
+        if !watches.watch(&common, RecursiveMode::NonRecursive) {
             return;
         }
         let refs = common.join("refs");
         if refs.is_dir() {
-            let _ = watcher.watch(&refs, RecursiveMode::Recursive);
+            watches.watch(&refs, RecursiveMode::Recursive);
         }
-        self.watcher = Some(watcher);
+        self.watches = Some(watches);
         self.ensure_worktrees_watch();
     }
 
@@ -247,9 +287,9 @@ impl Worker {
             return;
         }
         let dir = self.paths.common_dir.join("worktrees");
-        if let Some(w) = self.watcher.as_mut()
+        if let Some(w) = &self.watches
             && dir.is_dir()
-            && w.watch(&dir, RecursiveMode::Recursive).is_ok()
+            && w.watch(&dir, RecursiveMode::Recursive)
         {
             self.watched_worktrees_dir = true;
         }
@@ -257,7 +297,7 @@ impl Worker {
 
     /// Start watching new worktrees' directories and stop watching removed ones.
     fn sync_tree_watches(&mut self) {
-        let Some(watcher) = self.watcher.as_mut() else { return };
+        let Some(watches) = &self.watches else { return };
         let current: HashSet<PathBuf> = self
             .worktrees
             .iter()
@@ -268,7 +308,7 @@ impl Worker {
             let keep = current.contains(path);
             if !keep {
                 for d in &tw.dirs {
-                    let _ = watcher.unwatch(d);
+                    watches.unwatch(d);
                 }
             }
             keep
@@ -278,9 +318,11 @@ impl Worker {
             .filter(|p| !self.trees.contains_key(p) && !self.unwatchable.contains(p))
             .collect();
         // Walking the trees is the slow part: do it in parallel, then add the watches.
-        let plans = par_map(&new, PARALLELISM, |p| plan_tree(p));
+        let plans = par_map(&new, PARALLELISM, |p| plan_tree(p, MAX_WATCH_DIRS));
         for (path, plan) in new.into_iter().zip(plans) {
-            match plan.and_then(|(ignored, dirs)| watch_dirs(watcher, ignored, dirs)) {
+            // Within the budget left across all repositories, else polled.
+            let plan = plan.filter(|(_, dirs)| dirs.len() <= watches.remaining());
+            match plan.and_then(|(ignored, dirs)| watch_dirs(watches, ignored, dirs)) {
                 Some(tw) => {
                     self.trees.insert(path, tw);
                 }
@@ -293,15 +335,15 @@ impl Worker {
 
     /// Watch a directory that appeared inside a watched worktree (unless it is ignored).
     fn watch_new_dir(&mut self, root: &Path, dir: &Path) {
-        let (Some(watcher), Some(tw)) = (self.watcher.as_mut(), self.trees.get_mut(root)) else {
+        let (Some(watches), Some(tw)) = (&self.watches, self.trees.get_mut(root)) else {
             return;
         };
         let ignored = trees::ignored_dirs(root, dir);
-        let budget = MAX_WATCH_DIRS.saturating_sub(tw.dirs.len());
+        let budget = MAX_WATCH_DIRS.saturating_sub(tw.dirs.len()).min(watches.remaining());
         let dirs = trees::dirs_to_watch(dir, &ignored, budget).unwrap_or_default();
         tw.ignored.extend(ignored);
         for d in dirs {
-            if !tw.dirs.contains(&d) && watcher.watch(&d, RecursiveMode::NonRecursive).is_ok() {
+            if !tw.dirs.contains(&d) && watches.watch(&d, RecursiveMode::NonRecursive) {
                 tw.dirs.insert(d);
             }
         }
@@ -1059,7 +1101,7 @@ impl Worker {
                 })
                 .collect(),
             graph: self.graph.clone(),
-            watching: self.watcher.is_some(),
+            watching: self.watches.is_some(),
             polling: self.cfg.poll,
             statuses_loaded: self.statuses_loaded,
             error: self.error.clone(),
@@ -1069,25 +1111,25 @@ impl Worker {
 
 /// The ignored dirs and the directories to watch for a worktree (see [`trees::dirs_to_watch`]);
 /// `None` if it is on a filesystem without working events or too big to watch.
-fn plan_tree(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn plan_tree(root: &Path, max: usize) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     if fsinfo::events_at(root) == Events::Unreliable {
         return None;
     }
     let ignored = trees::ignored_dirs(root, root);
-    let dirs = trees::dirs_to_watch(root, &ignored, MAX_WATCH_DIRS)?;
+    let dirs = trees::dirs_to_watch(root, &ignored, max)?;
     Some((ignored, dirs))
 }
 
 /// Watch `dirs`; `None` (and nothing left watched) if any watch fails, e.g. the inotify limit.
-fn watch_dirs(watcher: &mut RecommendedWatcher, ignored: Vec<PathBuf>, dirs: Vec<PathBuf>) -> Option<TreeWatch> {
+fn watch_dirs(watches: &Watches, ignored: Vec<PathBuf>, dirs: Vec<PathBuf>) -> Option<TreeWatch> {
     let mut tw = TreeWatch {
         dirs: HashSet::new(),
         ignored,
     };
     for d in dirs {
-        if watcher.watch(&d, RecursiveMode::NonRecursive).is_err() {
+        if !watches.watch(&d, RecursiveMode::NonRecursive) {
             for w in &tw.dirs {
-                let _ = watcher.unwatch(w);
+                watches.unwatch(w);
             }
             return None;
         }
@@ -1113,8 +1155,13 @@ fn last_edited(root: &Path, paths: &[String]) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-/// Map `f` over `items` with at most `max` threads, preserving order.
+/// Map `f` over `items` with at most `max` threads, preserving order. Every call of `f` holds one
+/// of the global [`SLOTS`] (never nest `par_map` inside `f`).
 fn par_map<T: Sync, R: Send>(items: &[T], max: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let f = |item: &T| {
+        let _slot = SLOTS.take();
+        f(item)
+    };
     let n = max.min(items.len());
     if n <= 1 {
         return items.iter().map(f).collect();
@@ -1143,6 +1190,26 @@ fn par_map<T: Sync, R: Send>(items: &[T], max: usize, f: impl Fn(&T) -> R + Sync
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn par_maps_share_the_global_slots() {
+        // Three workers' batches at once never run more than GLOBAL_PARALLELISM jobs together.
+        let (running, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let job = |_: &u32| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(5));
+            running.fetch_sub(1, Ordering::SeqCst);
+        };
+        let items: Vec<u32> = (0..30).collect();
+        thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| par_map(&items, PARALLELISM, job));
+            }
+        });
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= GLOBAL_PARALLELISM, "{peak}");
+    }
 
     #[test]
     fn par_map_preserves_order() {

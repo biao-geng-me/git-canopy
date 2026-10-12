@@ -168,11 +168,11 @@ in base, with no busy agent, after the user confirms.
   cursor.
 - Not planned: notifications (herdr already notifies on blocked agents).
 
-### Multi-repo (0.4; step 1 built)
+### Multi-repo (0.4; steps 1–2 built)
 
 Agents often work in several projects at once; one canopy should be able to watch all of them.
 
-Built (step 1): every `PATH` argument is a repository (deduplicated by common dir in `main.rs`), each with its own `watch::Worker`; `App::repos` holds per-repo state (`Repo`: snapshot, worker, herdr agent mapping, the parked graph `Panel`, load-more bookkeeping), and `App::snap`/`App::graph` are those of `App::active`. **Invariant: the active repo is the repo of the selected worktree-list row** (`App::follow_wt_selection`, run after every handled message and on moves/clicks), so everything that acts on "the focused worktree" or the graph keeps using `self.snap` and plain worktree indexes. The worktree list's base rows are `App::wt_rows` (`WtRef::Header(r)` / `WtRef::Tree(r, wi)`); only its rendering, per-row markers (`App::cleanup_in`, `agent_activity_in`), the herdr footer and refresh summary span all repos. Header rows (`Key::Repo(common dir)`, never expand) only with several repos; duplicate repo names get their parent directory (`App::repo_label`). Still to do: `--herdr-repos` discovery, the shared resources below, and the `(host, path)` keys + Worker request API from the remote prep bullet.
+Built (step 1): every `PATH` argument is a repository (deduplicated by common dir in `main.rs`), each with its own `watch::Worker`; `App::repos` holds per-repo state (`Repo`: snapshot, worker, herdr agent mapping, the parked graph `Panel`, load-more bookkeeping), and `App::snap`/`App::graph` are those of `App::active`. **Invariant: the active repo is the repo of the selected worktree-list row** (`App::follow_wt_selection`, run after every handled message and on moves/clicks), so everything that acts on "the focused worktree" or the graph keeps using `self.snap` and plain worktree indexes. The worktree list's base rows are `App::wt_rows` (`WtRef::Header(r)` / `WtRef::Tree(r, wi)`); only its rendering, per-row markers (`App::cleanup_in`, `agent_activity_in`), the herdr footer and refresh summary span all repos. Header rows (`Key::Repo(common dir)`, never expand) only with several repos; duplicate repo names get their parent directory (`App::repo_label`). Built (step 2, shared resources): one `watch::Hub` (`watch/hub.rs`) holds the only notify watcher; each worker registers (`Hub::register` → `Watches`, dropped = all its watches gone) and the hub routes each event to the owner of the nearest watched directory at or above its path, so a repo nested in another's checkout doesn't wake the outer one; watches are refcounted per directory; `Watches::remaining` is a global budget (`MAX_TOTAL_DIRS` 50k, at most half of `fs.inotify.max_user_watches`) on top of the per-tree `MAX_WATCH_DIRS`, and a tree that doesn't fit is polled. `watch::spawn` still makes its own hub (tests); the UI uses `spawn_with` with one hub. Every `par_map` job takes one of `GLOBAL_PARALLELISM` (8) process-wide slots (`SLOTS`), so N repos at startup don't run N×6 git processes; UI-side diff loads don't take slots (they stay responsive). Still to do: `--herdr-repos` discovery and the `(host, path)` keys + Worker request API from the remote prep bullet.
 
 - **Boundary:** everything per repository stays per repository. One `watch::Worker` (and one
   `Snapshot`) per common dir, unchanged; `App` holds a list of repos instead of one `snap` + `worker`.
@@ -189,10 +189,7 @@ Built (step 1): every `PATH` argument is a repository (deduplicated by common di
   a herdr agent's cwd or a workspace's `checkout_path` is in (discovered with `git rev-parse
   --git-common-dir`, deduplicated by common dir, added/removed as agents come and go). A single
   repo behaves exactly as today (no header row).
-- **Shared resources:** one herdr connection for all repos (agents are matched against every repo's
-  worktree paths; today agents outside the repo are dropped); a global cap on concurrent git processes
-  across workers (today `PARALLELISM` is per worker); one inotify watcher shared by all workers so the
-  `MAX_WATCH_DIRS`/inotify budget is global; `--base` applies to every repo, else per-repo detection.
+- **Shared resources (built):** one herdr connection for all repos (agents are matched against every repo's worktree paths); a global cap on concurrent git processes across workers; one inotify watcher shared by all workers with a global budget; `--base` applies to every repo, else per-repo detection.
 - **Footer/details:** herdr summary across all repos; the details line names the repo when there are
   several.
 
