@@ -100,6 +100,7 @@ git canopy [OPTIONS] [PATH]
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
 | `t` | open a git TUI (lazygit, gitui, tig) in that worktree, like a shell |
 | `Backspace` | clean up a `⌫` worktree: remove its checkout, its branch and its herdr workspace, after confirming (see below) |
+| `Backspace` twice | the same without the confirm popup (every check still runs) |
 | `y` + key | copy to the clipboard (see [Copying](#copying)) |
 | `r` | refresh now |
 | `?` | help |
@@ -146,7 +147,8 @@ branch, not locked, not the one canopy runs in).
 ### Cleaning up
 
 `Backspace` on a `⌫` worktree (its row, or its `[name]` or `◌` row in the graph) removes it, after a
-popup that says exactly what will happen and waits for `y` / `Enter` (`Esc` cancels):
+popup that says exactly what will happen and waits for `y`, `Enter` or `Backspace` (`Esc` cancels).
+A quick double tap of `Backspace` skips the popup:
 
 - if a herdr workspace is backed by that checkout, herdr's `worktree.remove` deletes the checkout and
   closes the workspace with its panes; otherwise `git worktree remove`;

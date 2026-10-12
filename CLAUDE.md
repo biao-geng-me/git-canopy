@@ -327,7 +327,9 @@ Agents often work in several projects at once; one canopy should be able to watc
   `cleanup::landed` recomputed against the base tip), reads herdr fresh (busy agent in the worktree →
   refuse; the workspace backed by the checkout is canopy's own `HERDR_WORKSPACE_ID` → refuse), and
   lists ignored files (`ls-files -o -i --directory`), which `git worktree remove` deletes silently.
-  The popup shows exactly that; `y`/Enter runs `cleanup::run`, which verifies everything again, then
+  The popup shows exactly that; `y`/Enter/Backspace runs `cleanup::run` (so a double Backspace is a
+  quick delete; a second Backspace while still checking, on the same worktree, queues the confirm
+  and skips the popup, `ui::Cleaning`), which verifies everything again, then
   removes the checkout: herdr's `worktree.remove {workspace_id, force:false}` when a workspace is
   backed by it, else `git worktree remove` (never `--force`); then `git branch -D` only if the branch
   still points at the verified sha (`-D` because squash-merged branches fail `-d`; safe because of

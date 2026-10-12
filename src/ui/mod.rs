@@ -104,6 +104,19 @@ pub struct WtFields {
     pub overlap: Option<Range<u16>>,
 }
 
+/// Progress of a worktree removal started with Backspace.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Cleaning {
+    #[default]
+    Idle,
+    /// Checking the worktree at `path` before the confirm popup. `confirmed`: Backspace was
+    /// pressed again meanwhile, so it is removed as soon as the checks pass, without the popup.
+    Checking { path: PathBuf, confirmed: bool },
+    /// The confirm popup is open (`App::confirm`).
+    Confirming,
+    Removing,
+}
+
 /// A shell (or a git TUI) in an inset below the graph.
 pub struct Shell {
     id: u64,
@@ -229,8 +242,8 @@ pub struct App {
     pub copy_pending: bool,
     /// Removing a worktree, waiting for the user to confirm.
     pub confirm: Option<cleanup::Plan>,
-    /// A removal is being checked or carried out (one at a time).
-    cleaning: bool,
+    /// Where a worktree removal is (one at a time).
+    cleaning: Cleaning,
     clipboard: Vec<crate::clipboard::Method>,
     /// herdr integration enabled (`--no-herdr` turns it off, the herdr shell pane included).
     with_herdr: bool,
@@ -268,7 +281,7 @@ impl App {
             notice: None,
             copy_pending: false,
             confirm: None,
-            cleaning: false,
+            cleaning: Cleaning::Idle,
             clipboard: crate::clipboard::methods(),
             with_herdr: true,
             git_tui: None,
@@ -627,17 +640,21 @@ impl App {
                 self.notice = Some(notice);
             }
             UiMsg::CleanupPlan(plan) => match plan {
+                Ok(plan) if matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. }) => {
+                    self.remove_worktree(plan);
+                }
                 Ok(plan) => {
                     self.notice = None;
                     self.confirm = Some(plan);
+                    self.cleaning = Cleaning::Confirming;
                 }
                 Err(e) => {
-                    self.cleaning = false;
+                    self.cleaning = Cleaning::Idle;
                     self.notice = Some(e);
                 }
             },
             UiMsg::CleanupDone(result) => {
-                self.cleaning = false;
+                self.cleaning = Cleaning::Idle;
                 self.notice = Some(result.unwrap_or_else(|e| e));
                 self.worker.request(Request::Refresh);
             }
@@ -1126,11 +1143,20 @@ impl App {
     /// confirms. Only for worktrees marked `⌫` (their work is in base, nothing would be lost);
     /// everything is checked again off the UI thread before the confirm popup opens.
     fn start_cleanup(&mut self) {
-        if self.cleaning {
-            self.notice = Some("a removal is already in progress".into());
-            return;
+        let target = self.cleanup_target();
+        match &mut self.cleaning {
+            Cleaning::Idle => {}
+            // A double tap: remove it right after the checks, without the popup.
+            Cleaning::Checking { path, confirmed } if target.map(|wi| &self.snap.worktrees[wi].path) == Some(path) => {
+                *confirmed = true;
+                return;
+            }
+            _ => {
+                self.notice = Some("a removal is already in progress".into());
+                return;
+            }
         }
-        let Some(wi) = self.cleanup_target() else { return };
+        let Some(wi) = target else { return };
         let w = self.snap.worktrees[wi].clone();
         match self.cleanup(wi) {
             Cleanup::Safe => {}
@@ -1155,7 +1181,10 @@ impl App {
         let common = self.snap.common_dir.clone();
         let sock = if self.with_herdr && self.herdr.is_some() { herdr::socket_path() } else { None };
         let tx = self.tx.clone();
-        self.cleaning = true;
+        self.cleaning = Cleaning::Checking {
+            path: w.path.clone(),
+            confirmed: false,
+        };
         self.notice = Some(format!("checking {}…", w.name));
         spawn_named("canopy-cleanup", move || {
             let own = std::env::var("HERDR_WORKSPACE_ID").ok();
@@ -1182,23 +1211,29 @@ impl App {
             .or(Some(focused))
     }
 
-    /// Keys while the confirm popup is open: `y`/Enter removes, Esc/`n`/`q` cancels.
+    /// Carry out a confirmed removal in the background (it checks everything once more).
+    fn remove_worktree(&mut self, plan: cleanup::Plan) {
+        self.cleaning = Cleaning::Removing;
+        self.notice = Some(format!("removing {}…", plan.name));
+        let tx = self.tx.clone();
+        spawn_named("canopy-cleanup", move || {
+            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
+            let res = cleanup::run(&plan, own.as_deref()).map_err(|e| format!("didn't remove {}: {e:#}", plan.name));
+            let _ = tx.send(UiMsg::CleanupDone(res));
+        });
+    }
+
+    /// Keys while the confirm popup is open: `y`/Enter/Backspace removes, Esc/`n`/`q` cancels.
     fn on_confirm_key(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                let Some(plan) = self.confirm.take() else { return };
-                self.notice = Some(format!("removing {}…", plan.name));
-                let tx = self.tx.clone();
-                spawn_named("canopy-cleanup", move || {
-                    let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-                    let res = cleanup::run(&plan, own.as_deref())
-                        .map_err(|e| format!("didn't remove {}: {e:#}", plan.name));
-                    let _ = tx.send(UiMsg::CleanupDone(res));
-                });
+            KeyCode::Char('y') | KeyCode::Enter | KeyCode::Backspace => {
+                if let Some(plan) = self.confirm.take() {
+                    self.remove_worktree(plan);
+                }
             }
             KeyCode::Esc | KeyCode::Char('n' | 'q') => {
                 self.confirm = None;
-                self.cleaning = false;
+                self.cleaning = Cleaning::Idle;
                 self.notice = None;
             }
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
