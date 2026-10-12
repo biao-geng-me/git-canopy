@@ -40,6 +40,8 @@ pub struct DiffView {
     /// Regions from the last render, for paging and mouse hit-testing.
     pub list_area: Rect,
     pub body_area: Rect,
+    /// The screen row of the file list entry under the mouse pointer (cleared by a key).
+    pub hover: Option<u16>,
     /// On reload: the entry to keep selected (path, or `None` for the overview) and its scroll.
     restore: Option<(Option<String>, usize)>,
 }
@@ -59,6 +61,7 @@ impl DiffView {
             pane: Pane::Files,
             list_area: Rect::default(),
             body_area: Rect::default(),
+            hover: None,
             restore: None,
         }
     }
@@ -219,8 +222,17 @@ impl DiffView {
         Action::None
     }
 
+    /// The screen row of the file list entry at `pos`, if any.
+    pub fn hover_at(&self, pos: Position) -> Option<u16> {
+        let a = super::render::content(self.list_area);
+        let first = a.y + self.header_rows() as u16;
+        let entries = self.entries().saturating_sub(self.list_offset) as u16;
+        (self.has_files() && a.contains(pos) && pos.y >= first && pos.y < first + entries).then_some(pos.y)
+    }
+
     pub fn on_mouse(&mut self, m: MouseEvent) -> Action {
         let pos = Position::new(m.column, m.row);
+        self.hover = self.hover_at(pos);
         let over_list = self.has_files() && self.list_area.contains(pos);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if over_list => {

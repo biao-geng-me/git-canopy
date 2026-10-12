@@ -283,7 +283,8 @@ Agents often work in several projects at once; one canopy should be able to watc
   selection; `App::hover` is a screen row, so it follows scrolling, and keys clear it). Motion
   events only redraw when the hovered row changes. Clicking a worktree always jumps the graph to it,
   even if it was already selected (the graph cursor may have been moved away); a second click on it
-  toggles its graph row, like Space in the list.
+  toggles its graph row, like Space in the list. The diff view's file list has the same hover
+  (`DiffView::hover`); its click already only selects, there is nothing to toggle.
 - **Selection highlight** is the same strength in both panels whatever has focus (focus is shown by
   the border color).
 - **Ahead/behind:** `↑a ↓b` vs the base branch (`--base`, else first existing of main/master/trunk/

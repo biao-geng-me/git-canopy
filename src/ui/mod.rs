@@ -671,6 +671,9 @@ impl App {
             }
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                 self.hover = None;
+                if let Some(d) = self.diff.as_mut() {
+                    d.hover = None;
+                }
                 if self.confirm.is_some() {
                     self.on_confirm_key(k);
                 } else if std::mem::take(&mut self.copy_pending) {
@@ -691,13 +694,17 @@ impl App {
                 self.rebuild();
             }
             UiMsg::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved => {
-                let hover = if self.diff.is_some() || self.confirm.is_some() || self.help {
-                    None
+                let pos = Position::new(m.column, m.row);
+                let blocked = self.confirm.is_some() || self.help;
+                if let Some(d) = self.diff.as_mut() {
+                    let hover = d.hover_at(pos).filter(|_| !blocked);
+                    self.redraw = hover != d.hover;
+                    d.hover = hover;
                 } else {
-                    self.hover_at(Position::new(m.column, m.row))
-                };
-                self.redraw = hover != self.hover;
-                self.hover = hover;
+                    let hover = self.hover_at(pos).filter(|_| !blocked);
+                    self.redraw = hover != self.hover;
+                    self.hover = hover;
+                }
             }
             UiMsg::Input(Event::Mouse(_)) if self.confirm.is_some() => {}
             UiMsg::Input(Event::Mouse(m)) => {

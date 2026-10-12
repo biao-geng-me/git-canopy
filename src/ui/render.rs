@@ -1554,7 +1554,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect();
         let sel = d.sel.checked_sub(d.list_offset);
-        paint_rows(f, inner, lines, sel, None, d.pane == Pane::Files);
+        paint_rows(f, inner, lines, sel, d.hover, d.pane == Pane::Files);
         body
     } else {
         d.list_area = Rect::default();
