@@ -272,7 +272,7 @@ scripts/mkfixture.sh [DIR]       # throwaway repo with worktrees in every intere
 scripts/mkbigrepo.sh [DIR]       # 20k commits, 15 worktrees, for performance checks
 cargo run --release --example startup -- DIR/repo   # time to first worktree list / statuses / graph
 cargo run --example herdr -- . 30                      # what canopy sees from herdr (read-only calls)
-scripts/install-dev.sh           # canopy/git-canopy on PATH -> target/release, rebuilt after each commit
+scripts/install-dev.sh           # canopy/git-canopy in ~/.local/bin (or $CANOPY_BIN_DIR) -> target/release, rebuilt after each commit
 scripts/release.sh               # static release tarball + sha256 in target/dist
 ```
 
