@@ -91,7 +91,12 @@ impl Hub {
 
     /// Watched directories left before the global budget is spent.
     fn remaining(&self) -> usize {
-        self.budget.saturating_sub(self.routes.lock().unwrap().owners.len())
+        self.budget.saturating_sub(self.watched())
+    }
+
+    /// How many directories are watched, across all repositories.
+    pub fn watched(&self) -> usize {
+        self.routes.lock().unwrap().owners.len()
     }
 
     fn watch(&self, id: usize, dir: &Path, mode: RecursiveMode) -> bool {

@@ -154,6 +154,19 @@ pub fn assign(view: &View, worktrees: &[PathBuf]) -> Vec<Vec<usize>> {
     out
 }
 
+/// Every directory herdr places work in: agents' cwds and workspaces' checkouts (for finding
+/// the repositories to watch).
+pub fn dirs(view: &View) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let all = view.agents.iter().filter_map(|a| a.cwd.as_ref());
+    for p in all.chain(view.workspaces.iter().filter_map(|w| w.checkout.as_ref())) {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 /// Summary of the agents in one worktree: the most urgent state and how many there are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Activity {

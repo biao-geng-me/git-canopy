@@ -663,6 +663,18 @@ fn inset_spans(app: &App, f: Focus, r: usize, item: Item) -> Vec<Span<'static>> 
     }
 }
 
+/// What to show while there is no repository at all (`--herdr-repos` before herdr names one).
+fn no_repo_msg(app: &App) -> Option<&'static str> {
+    if !app.repos.is_empty() {
+        return None;
+    }
+    Some(if app.herdr.is_some() {
+        " no repository yet: waiting for a herdr agent to work in one"
+    } else {
+        " no repository yet: herdr not reachable"
+    })
+}
+
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let focused = app.focus == Focus::Worktrees && !app.shell_focus;
     let all = || app.repos.iter().flat_map(|r| r.snap.worktrees.iter());
@@ -682,7 +694,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     if n == 0 {
-        f.render_widget(Paragraph::new(Span::styled(" loading…", Style::new().fg(C_DIM))), inner);
+        let msg = no_repo_msg(app).unwrap_or(" loading…");
+        f.render_widget(Paragraph::new(Span::styled(msg, Style::new().fg(C_DIM))), inner);
         return;
     }
 
@@ -1012,7 +1025,9 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let height = inner.height as usize;
     let g = app.snap.graph.clone();
     if g.rows.is_empty() {
-        let msg = if app.snap.statuses_loaded && g.commits.is_empty() && app.snap.error.is_none() {
+        let msg = if let Some(msg) = no_repo_msg(app) {
+            msg
+        } else if app.snap.statuses_loaded && g.commits.is_empty() && app.snap.error.is_none() {
             " no commits yet"
         } else {
             " loading…"

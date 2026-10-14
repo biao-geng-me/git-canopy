@@ -122,9 +122,13 @@ pub enum Request {
 enum Msg {
     Req(Request),
     Fs(Vec<PathBuf>),
+    /// The handle was dropped. (The hub holds a sender too, so the channel alone never closes
+    /// while the worker watches.)
+    Stop,
 }
 
-/// Handle to the worker thread; dropping it stops the worker.
+/// Handle to the worker thread; dropping it stops the worker (after the git command it may be
+/// running), which releases its watches.
 pub struct Handle {
     tx: Sender<Msg>,
 }
@@ -132,6 +136,12 @@ pub struct Handle {
 impl Handle {
     pub fn request(&self, req: Request) {
         let _ = self.tx.send(Msg::Req(req));
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Stop);
     }
 }
 
@@ -423,7 +433,7 @@ impl Worker {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             }
             let now = Instant::now();
             if debounce_until.is_some_and(|d| now >= d) {

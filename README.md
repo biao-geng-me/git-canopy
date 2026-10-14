@@ -112,6 +112,7 @@ git canopy [OPTIONS] [PATH...]
       --no-poll           never poll; update on file system events and `r` only
       --no-watch          disable file system notifications, poll only
       --no-herdr          don't show herdr agent activity
+      --herdr-repos       also watch every repository a herdr agent or workspace is in
       --git-tui <CMD>     git TUI that `t` opens (default: $CANOPY_GIT_TUI, else the first of
                           lazygit, gitui, tig on PATH)
 ```
@@ -119,6 +120,8 @@ git canopy [OPTIONS] [PATH...]
 ### Several repositories
 
 `canopy ~/a ~/b` watches both. The worktree list groups each repository's worktrees under a header row (name, base branch, worktree and dirty counts, blocked agents), and the graph shows the repository of the selected row: moving the selection into another repository switches the graph, which keeps its own cursor and expanded rows for each. Paths inside the same repository count once. With one repository there are no header rows.
+
+`canopy --herdr-repos` also watches every repository that a herdr agent works in or a herdr workspace is checked out in, so one canopy follows all your agents without listing their projects. Repositories appear as agents start in them and are dropped two minutes after their last agent and workspace are gone (repositories named on the command line always stay). Without a `PATH` it starts with the current directory's repository if there is one, else empty until herdr names one.
 
 ### Keys
 

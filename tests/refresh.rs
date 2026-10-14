@@ -421,4 +421,15 @@ fn repositories_share_one_watcher() {
     assert!(rxa.try_iter().all(|s| !find(&s, "refactor-db").is_dirty()));
     std::fs::write(a.wt("refactor-db").join("new.txt"), "x").unwrap();
     wait_for(&rxa, Duration::from_secs(5), |s| find(s, "refactor-db").is_dirty());
+
+    // Dropping a worker's handle stops it and releases its watches (repositories come and go
+    // with --herdr-repos); the other keeps its own.
+    let both = hub.watched();
+    drop(_hb);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hub.watched() == both && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = hub.watched();
+    assert!(left > 0 && left < both, "watched {both} → {left}");
 }

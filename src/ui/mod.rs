@@ -39,8 +39,11 @@ use inset::{Entry, Expansion, Item, Key, Open, VLine};
 
 pub enum UiMsg {
     Input(Event),
-    /// A new snapshot of repository `.0`.
-    Snapshot(usize, Arc<Snapshot>),
+    /// A new snapshot of the repository with id `.0` (`Repo::id`).
+    Snapshot(u64, Arc<Snapshot>),
+    /// Which repository each directory herdr reported is in (`None`: not in one), for
+    /// `--herdr-repos`.
+    Discovered(Vec<(PathBuf, Option<RepoPaths>)>),
     Diff {
         id: u64,
         result: Result<DiffDoc, String>,
@@ -257,6 +260,11 @@ pub struct App {
     herdr_dir: Option<PathBuf>,
     /// Git TUI for `t` (`--git-tui` / `CANOPY_GIT_TUI`); found on PATH when `None`.
     git_tui: Option<String>,
+    /// Also watch the repositories herdr's agents and workspaces are in (`--herdr-repos`).
+    pub discovery: Option<Discovery>,
+    /// The one watcher every repository's worker registers with.
+    hub: Arc<watch::Hub>,
+    cfg: Config,
     next_id: u64,
     tx: Sender<UiMsg>,
     last_click: Option<Click>,
@@ -268,6 +276,9 @@ pub struct App {
 
 /// One watched repository: its worker and latest snapshot.
 pub struct Repo {
+    /// Stable identity (indexes shift when repositories are removed).
+    id: u64,
+    pub common_dir: PathBuf,
     pub snap: Arc<Snapshot>,
     /// Shown in its header row until the first snapshot names it.
     pub name: String,
@@ -278,6 +289,25 @@ pub struct Repo {
     graph: Panel,
     /// Graph row count when "load more" was last requested, to ask only once per page.
     more_requested_at: usize,
+    /// Added because a herdr agent or workspace is in it (`--herdr-repos`), not from the
+    /// command line: removed again once none has been for [`HERDR_REPO_GRACE`].
+    pub from_herdr: bool,
+    /// Since when no herdr agent or workspace is in it.
+    unseen_since: Option<Instant>,
+}
+
+/// How long a repository found through herdr stays after its last agent and workspace are gone
+/// (an agent restarted in it, or the user still reviewing what it did).
+pub const HERDR_REPO_GRACE: Duration = Duration::from_secs(120);
+
+/// `--herdr-repos` bookkeeping: which repository each directory herdr reported is in.
+#[derive(Default)]
+pub struct Discovery {
+    /// Directory → its repository (`None`: not in one). Never forgotten: herdr reports the same
+    /// few directories over and over.
+    dirs: HashMap<PathBuf, Option<RepoPaths>>,
+    /// Directories being looked up.
+    asked: std::collections::HashSet<PathBuf>,
 }
 
 /// A base row of the worktree list.
@@ -298,18 +328,7 @@ impl WtRef {
 }
 
 impl App {
-    fn new(workers: Vec<(String, watch::Handle)>, tx: Sender<UiMsg>, cfg: &Config, layout: LayoutMode) -> Self {
-        let repos = workers
-            .into_iter()
-            .map(|(name, worker)| Repo {
-                snap: Arc::new(Snapshot::default()),
-                name,
-                worker,
-                agents: Vec::new(),
-                graph: Panel::default(),
-                more_requested_at: 0,
-            })
-            .collect();
+    fn new(tx: Sender<UiMsg>, cfg: &Config, layout: LayoutMode) -> Self {
         App {
             snap: Arc::new(Snapshot::default()),
             interval_ms: cfg.interval.as_millis(),
@@ -319,7 +338,7 @@ impl App {
             graph: Panel::default(),
             docs: HashMap::new(),
             herdr: None,
-            repos,
+            repos: Vec::new(),
             active: 0,
             wt_rows: Vec::new(),
             graph_jump: None,
@@ -339,6 +358,9 @@ impl App {
             with_herdr: true,
             herdr_dir: None,
             git_tui: None,
+            discovery: None,
+            hub: watch::Hub::new(),
+            cfg: cfg.clone(),
             next_id: 0,
             tx,
             last_click: None,
@@ -398,6 +420,134 @@ impl App {
         self.rebuild();
     }
 
+    /// Start watching the repository at `paths` (listed last).
+    fn add_repo(&mut self, paths: RepoPaths, from_herdr: bool) {
+        let line = self.line_id(Focus::Worktrees);
+        let id = self.next_id;
+        self.next_id += 1;
+        let name = repo_name(&paths.common_dir);
+        let common_dir = paths.common_dir.clone();
+        let tx = self.tx.clone();
+        let worker = watch::spawn_with(paths, self.cfg.clone(), self.hub.clone(), move |s| {
+            let _ = tx.send(UiMsg::Snapshot(id, s));
+        });
+        self.repos.push(Repo {
+            id,
+            common_dir,
+            snap: Arc::new(Snapshot::default()),
+            name,
+            worker,
+            agents: Vec::new(),
+            graph: Panel::default(),
+            more_requested_at: 0,
+            from_herdr,
+            unseen_since: None,
+        });
+        if self.repos.len() == 1 {
+            self.snap = self.repos[0].snap.clone();
+        }
+        self.map_agents();
+        self.rebuild();
+        // The second repository brings header rows: stay on the same row.
+        self.relocate(Focus::Worktrees, line);
+    }
+
+    /// Stop watching repository `r` (its worker stops when dropped). The selection stays on the
+    /// same row if it is elsewhere, else on whatever row now has its place.
+    fn remove_repo(&mut self, r: usize) {
+        if r >= self.repos.len() {
+            return;
+        }
+        let id = self.line_id(Focus::Worktrees);
+        if r == self.active {
+            self.repos.remove(r);
+            self.active = 0;
+            self.graph = self.repos.first_mut().map(|x| std::mem::take(&mut x.graph)).unwrap_or_default();
+            self.snap = self.repos.first().map_or_else(Default::default, |x| x.snap.clone());
+        } else {
+            self.repos.remove(r);
+            if r < self.active {
+                self.active -= 1;
+            }
+        }
+        self.map_agents();
+        self.rebuild();
+        self.relocate(Focus::Worktrees, id);
+    }
+
+    /// `--herdr-repos`: look up the repositories of directories herdr reports that aren't known
+    /// yet (off the UI thread), then add and remove repositories to match.
+    fn discover_repos(&mut self) {
+        let (Some(d), Some(view)) = (&mut self.discovery, &self.herdr) else { return };
+        let fresh: Vec<PathBuf> = herdr::dirs(view)
+            .into_iter()
+            .filter(|p| !d.dirs.contains_key(p) && !d.asked.contains(p))
+            .collect();
+        if !fresh.is_empty() {
+            d.asked.extend(fresh.iter().cloned());
+            let tx = self.tx.clone();
+            spawn_named("canopy-discover", move || {
+                let found = fresh
+                    .into_iter()
+                    .map(|p| {
+                        let repo = crate::git::discover(&p).ok();
+                        (p, repo)
+                    })
+                    .collect();
+                let _ = tx.send(UiMsg::Discovered(found));
+            });
+        }
+        self.reconcile_repos(Instant::now());
+    }
+
+    /// Add the repositories herdr's agents and workspaces are in, and remove those found
+    /// through herdr that have had none for [`HERDR_REPO_GRACE`]. Nothing is removed while
+    /// herdr isn't reachable (no news isn't "gone").
+    fn reconcile_repos(&mut self, now: Instant) {
+        let (Some(d), Some(view)) = (&self.discovery, &self.herdr) else { return };
+        let mut wanted: Vec<RepoPaths> = Vec::new();
+        for p in herdr::dirs(view) {
+            if let Some(Some(repo)) = d.dirs.get(&p)
+                && !wanted.iter().any(|w| w.common_dir == repo.common_dir)
+            {
+                wanted.push(repo.clone());
+            }
+        }
+        for repo in &mut self.repos {
+            let seen = wanted.iter().any(|w| w.common_dir == repo.common_dir);
+            repo.unseen_since = if seen { None } else { repo.unseen_since.or(Some(now)) };
+        }
+        for w in wanted {
+            if !self.repos.iter().any(|r| r.common_dir == w.common_dir) {
+                self.add_repo(w, true);
+            }
+        }
+        while let Some(r) = self
+            .repos
+            .iter()
+            .position(|x| x.from_herdr && x.unseen_since.is_some_and(|t| now >= t + HERDR_REPO_GRACE))
+        {
+            self.remove_repo(r);
+        }
+    }
+
+    /// When [`App::tick`] has something to do next (a repository's grace running out).
+    fn next_deadline(&self) -> Option<Instant> {
+        self.herdr.as_ref()?;
+        self.repos
+            .iter()
+            .filter(|r| r.from_herdr)
+            .filter_map(|r| r.unseen_since)
+            .min()
+            .map(|t| t + HERDR_REPO_GRACE)
+    }
+
+    /// Time passed without a message.
+    fn tick(&mut self) {
+        self.reconcile_repos(Instant::now());
+        self.follow_wt_selection();
+    }
+
     /// Keep the invariant that the graph shows the selected worktree-list row's repository.
     fn follow_wt_selection(&mut self) {
         let r = self.wt.lines.get(self.wt.pos.sel).and_then(|l| self.wt_ref(l.row())).map(WtRef::repo);
@@ -427,7 +577,7 @@ impl App {
     pub fn row_key(&self, f: Focus, r: usize) -> Option<Key> {
         match f {
             Focus::Worktrees => match self.wt_ref(r)? {
-                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].snap.common_dir.clone())),
+                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].common_dir.clone())),
                 WtRef::Tree(..) => self.wt_at(r).map(|(_, w)| Key::Worktree(w.path.clone())),
             },
             Focus::Graph => {
@@ -462,7 +612,7 @@ impl App {
         match (f, key) {
             (Focus::Worktrees, Key::Worktree(p)) => (0..self.wt_rows.len()).find(|&i| self.wt_at(i).is_some_and(|(_, w)| &w.path == p)),
             (Focus::Worktrees, Key::Repo(c)) => (0..self.wt_rows.len()).find(|&i| {
-                matches!(self.wt_rows[i], WtRef::Header(ri) if &self.repos[ri].snap.common_dir == c)
+                matches!(self.wt_rows[i], WtRef::Header(ri) if &self.repos[ri].common_dir == c)
             }),
             (Focus::Worktrees, Key::Commit(_)) | (Focus::Graph, Key::Repo(_)) => None,
             (Focus::Graph, Key::Commit(id)) => self.snap.graph.commit_row.get(id).copied(),
@@ -738,8 +888,9 @@ impl App {
 
     fn handle_msg(&mut self, msg: UiMsg) {
         match msg {
-            UiMsg::Snapshot(r, s) => {
+            UiMsg::Snapshot(id, s) => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
+                let Some(r) = self.repos.iter().position(|x| x.id == id) else { return };
                 if r == self.active {
                     self.on_snapshot(s, ids);
                 } else if let Some(repo) = self.repos.get_mut(r) {
@@ -762,6 +913,16 @@ impl App {
             UiMsg::Herdr(view) => {
                 self.herdr = view;
                 self.map_agents();
+                self.discover_repos();
+            }
+            UiMsg::Discovered(found) => {
+                if let Some(d) = &mut self.discovery {
+                    for (p, repo) in found {
+                        d.asked.remove(&p);
+                        d.dirs.insert(p, repo);
+                    }
+                }
+                self.reconcile_repos(Instant::now());
             }
             UiMsg::TermOutput => {}
             UiMsg::TermExited(id) => {
@@ -1012,7 +1173,7 @@ impl App {
         let Some(view) = &self.herdr else { return };
         let wi = self.focused_wi();
         let agent = wi
-            .and_then(|wi| self.repos[self.active].agents.get(wi))
+            .and_then(|wi| self.repos.get(self.active)?.agents.get(wi))
             .and_then(|ids| ids.iter().map(|&i| &view.agents[i]).max_by_key(|a| a.state));
         if let Some(a) = agent {
             herdr::focus(a.pane_id.clone());
@@ -1187,7 +1348,7 @@ impl App {
         let (len, page) = (self.graph.lines.len(), self.page());
         let pos = self.graph.pos;
         let near_end = pos.sel + 2 * page >= len || pos.offset + 2 * page >= len;
-        let repo = &mut self.repos[self.active];
+        let Some(repo) = self.repos.get_mut(self.active) else { return };
         if self.snap.graph.truncated && near_end && repo.more_requested_at != rows {
             repo.more_requested_at = rows;
             repo.worker.request(Request::LoadMore);
@@ -1806,8 +1967,20 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new().name(name.into()).spawn(f).expect("spawn thread");
 }
 
-/// Run the TUI on `repos` (one or more, distinct common dirs) until the user quits.
-pub fn run(repos: Vec<RepoPaths>, cfg: Config, layout: LayoutMode, with_herdr: bool, git_tui: Option<String>) -> Result<()> {
+/// How the UI starts.
+pub struct Options {
+    pub layout: LayoutMode,
+    /// herdr agent activity (`--no-herdr` turns it off).
+    pub herdr: bool,
+    /// Also watch the repositories herdr's agents and workspaces are in (`--herdr-repos`).
+    pub herdr_repos: bool,
+    pub git_tui: Option<String>,
+}
+
+/// Run the TUI on `repos` (distinct common dirs; none only with `herdr_repos`) until the user
+/// quits.
+pub fn run(repos: Vec<RepoPaths>, cfg: Config, opts: Options) -> Result<()> {
+    let with_herdr = opts.herdr;
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
     if with_herdr {
@@ -1816,20 +1989,16 @@ pub fn run(repos: Vec<RepoPaths>, cfg: Config, layout: LayoutMode, with_herdr: b
             let _ = herdr_tx.send(UiMsg::Herdr(view));
         });
     }
-    // One watcher (and inotify budget) for all repositories.
-    let hub = watch::Hub::new();
-    let workers = repos
-        .into_iter()
-        .enumerate()
-        .map(|(r, paths)| {
-            let name = repo_name(&paths.common_dir);
-            let snap_tx = tx.clone();
-            let worker = watch::spawn_with(paths, cfg.clone(), hub.clone(), move |s| {
-                let _ = snap_tx.send(UiMsg::Snapshot(r, s));
-            });
-            (name, worker)
-        })
-        .collect();
+    let mut app = App::new(tx, &cfg, opts.layout);
+    app.with_herdr = with_herdr;
+    app.herdr_dir = herdr::worktree_dir();
+    app.git_tui = opts.git_tui;
+    if with_herdr && opts.herdr_repos {
+        app.discovery = Some(Discovery::default());
+    }
+    for paths in repos {
+        app.add_repo(paths, false);
+    }
 
     // Disable mouse capture on panic too; ratatui's own hook restores the rest.
     let prev = std::panic::take_hook();
@@ -1840,10 +2009,6 @@ pub fn run(repos: Vec<RepoPaths>, cfg: Config, layout: LayoutMode, with_herdr: b
     let mut terminal = ratatui::try_init()?;
     let _ = execute!(stdout(), EnableMouseCapture);
 
-    let mut app = App::new(workers, tx, &cfg, layout);
-    app.with_herdr = with_herdr;
-    app.herdr_dir = herdr::worktree_dir();
-    app.git_tui = git_tui;
     let res = event_loop(&mut terminal, &mut app, &rx);
 
     let _ = execute!(stdout(), DisableMouseCapture);
@@ -1857,9 +2022,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &Recei
         if draw {
             terminal.draw(|f| render::draw(f, app))?;
         }
-        let Ok(msg) = rx.recv() else { return Ok(()) };
+        let msg = match app.next_deadline() {
+            Some(t) => match rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
+                Ok(msg) => Some(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            },
+            None => match rx.recv() {
+                Ok(msg) => Some(msg),
+                Err(_) => return Ok(()),
+            },
+        };
         app.redraw = true;
-        app.handle(msg);
+        match msg {
+            Some(msg) => app.handle(msg),
+            None => app.tick(),
+        }
         draw = app.redraw;
         // Coalesce whatever else is queued so bursts of input or snapshots cost one redraw.
         while !app.quit
@@ -1888,6 +2066,108 @@ fn spawn_input(tx: Sender<UiMsg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        let (tx, _rx) = mpsc::channel();
+        let cfg = Config {
+            watch: false,
+            poll: false,
+            ..Config::default()
+        };
+        App::new(tx, &cfg, LayoutMode::Stacked)
+    }
+
+    fn paths(dir: &str) -> RepoPaths {
+        RepoPaths {
+            common_dir: PathBuf::from(format!("/nonexistent/canopy-test/{dir}/.git")),
+            toplevel: None,
+        }
+    }
+
+    fn view(agents: &[&str], checkouts: &[&str]) -> Option<Arc<herdr::View>> {
+        let agents = agents
+            .iter()
+            .enumerate()
+            .map(|(i, cwd)| herdr::Agent {
+                pane_id: format!("p{i}"),
+                workspace_id: String::new(),
+                label: "claude".into(),
+                state: herdr::AgentState::Working,
+                cwd: Some(PathBuf::from(cwd)),
+            })
+            .collect();
+        let workspaces = checkouts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| herdr::Workspace {
+                id: format!("w{i}"),
+                label: String::new(),
+                panes: 1,
+                checkout: Some(PathBuf::from(c)),
+            })
+            .collect();
+        Some(Arc::new(herdr::View { agents, workspaces }))
+    }
+
+    #[test]
+    fn herdr_repos_come_and_go() {
+        let mut app = test_app();
+        let mut d = Discovery::default();
+        d.dirs.insert("/w/b/src".into(), Some(paths("b")));
+        d.dirs.insert("/w/b-wt".into(), Some(paths("b")));
+        d.dirs.insert("/w/c".into(), Some(paths("c")));
+        d.dirs.insert("/home".into(), None);
+        app.discovery = Some(d);
+        app.add_repo(paths("a"), false);
+        let names = |app: &App| app.repos.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        let t0 = Instant::now();
+
+        // An agent and a workspace in b, an agent outside any repository: b is added once.
+        app.herdr = view(&["/w/b/src", "/home"], &["/w/b-wt"]);
+        app.reconcile_repos(t0);
+        assert_eq!(names(&app), ["a", "b"]);
+        assert!(app.repos[1].from_herdr && !app.repos[0].from_herdr);
+        assert_eq!(app.wt_rows, [WtRef::Header(0), WtRef::Header(1)]);
+
+        // The agent left, the workspace stays: b stays.
+        app.herdr = view(&[], &["/w/b-wt"]);
+        app.reconcile_repos(t0);
+        assert_eq!(app.next_deadline(), None);
+
+        // Both gone, then an agent in c: b only after the grace; a (from the command line) never.
+        app.herdr = view(&["/w/c"], &[]);
+        app.reconcile_repos(t0);
+        assert_eq!(names(&app), ["a", "b", "c"]);
+        assert_eq!(app.next_deadline(), Some(t0 + HERDR_REPO_GRACE));
+        app.active = 1; // b shown in the graph when it goes
+        app.reconcile_repos(t0 + HERDR_REPO_GRACE / 2);
+        assert_eq!(names(&app), ["a", "b", "c"]);
+        app.herdr = view(&[], &[]);
+        app.reconcile_repos(t0 + HERDR_REPO_GRACE);
+        assert_eq!(names(&app), ["a", "c"], "c's grace only started now");
+        assert_eq!(app.active, 0);
+
+        // herdr unreachable: no news, nothing removed.
+        app.herdr = None;
+        app.reconcile_repos(t0 + 10 * HERDR_REPO_GRACE);
+        assert_eq!(names(&app), ["a", "c"]);
+        assert_eq!(app.next_deadline(), None);
+
+        // Coming back clears the grace.
+        app.herdr = view(&["/w/c"], &[]);
+        app.reconcile_repos(t0 + 10 * HERDR_REPO_GRACE);
+        assert_eq!(app.repos[1].unseen_since, None);
+
+        app.remove_repo(0);
+        app.remove_repo(0);
+        assert!(app.repos.is_empty() && app.wt_rows.is_empty() && app.snap.worktrees.is_empty());
+    }
+
+    #[test]
+    fn herdr_dirs_are_cwds_and_checkouts() {
+        let v = view(&["/w/a", "/w/b", "/w/a"], &["/w/b", "/w/c"]).unwrap();
+        assert_eq!(herdr::dirs(&v), [PathBuf::from("/w/a"), "/w/b".into(), "/w/c".into()]);
+    }
 
     #[test]
     fn repo_names() {

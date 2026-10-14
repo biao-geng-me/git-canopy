@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ OPTIONS:
         --layout <MODE>     stacked (graph above worktrees, default) or side (side by side)
         --no-watch          disable filesystem notifications, poll only
         --no-herdr          don't show herdr agent activity
+        --herdr-repos       also watch every repository a herdr agent or workspace is in, added
+                            and removed as they come and go (PATH is optional then)
         --git-tui <CMD>     git TUI that t opens in a worktree (default: $CANOPY_GIT_TUI, else
                             the first of lazygit, gitui, tig on PATH)
     -h, --help              print help
@@ -38,6 +40,7 @@ struct Args {
     cfg: Config,
     layout: LayoutMode,
     herdr: bool,
+    herdr_repos: bool,
     git_tui: Option<String>,
 }
 
@@ -46,6 +49,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut cfg = Config::default();
     let mut layout = LayoutMode::default();
     let mut herdr = true;
+    let mut herdr_repos = false;
     let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
@@ -81,6 +85,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-watch" => cfg.watch = false,
             "--no-poll" => cfg.poll = false,
             "--no-herdr" => herdr = false,
+            "--herdr-repos" => herdr_repos = true,
             "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
@@ -93,14 +98,15 @@ fn parse_args() -> Result<Option<Args>, String> {
             _ => paths.push(PathBuf::from(arg)),
         }
     }
-    if paths.is_empty() {
-        paths.push(PathBuf::from("."));
+    if herdr_repos && !herdr {
+        return Err("--herdr-repos needs herdr (drop --no-herdr)".to_string());
     }
     Ok(Some(Args {
         paths,
         cfg,
         layout,
         herdr,
+        herdr_repos,
         git_tui,
     }))
 }
@@ -116,6 +122,18 @@ fn main() -> ExitCode {
     };
     // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
     let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
+    if args.paths.is_empty() {
+        // The current directory, unless --herdr-repos finds the repositories (then it counts
+        // only if it is in one).
+        match canopy::git::discover(Path::new(".")) {
+            Ok(p) => repos.push(p),
+            Err(_) if args.herdr_repos => {}
+            Err(e) => {
+                eprintln!("canopy: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     for path in &args.paths {
         if !path.is_dir() {
             eprintln!("canopy: not a directory: {}", path.display());
@@ -130,7 +148,13 @@ fn main() -> ExitCode {
             }
         }
     }
-    match canopy::ui::run(repos, args.cfg, args.layout, args.herdr, args.git_tui) {
+    let opts = canopy::ui::Options {
+        layout: args.layout,
+        herdr: args.herdr,
+        herdr_repos: args.herdr_repos,
+        git_tui: args.git_tui,
+    };
+    match canopy::ui::run(repos, args.cfg, opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");
