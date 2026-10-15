@@ -76,7 +76,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_graph(f, app, graph_area);
     draw_shell(f, app, shell_area);
     draw_footer(f, app, footer);
-    if let Some(plan) = &app.confirm {
+    if let Some((_, plan)) = &app.confirm {
         draw_confirm(f, plan);
     }
     if app.help {
@@ -1536,7 +1536,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .filter(|d| !matches!(d.target, crate::diff::Target::Overlaps { .. }))
         .and_then(|d| d.target.worktree())
-        .and_then(|p| app.find_worktree(p))
+        .and_then(|p| app.diff_worktree(p))
         .map(|w| {
             let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
             for o in &w.overlaps {

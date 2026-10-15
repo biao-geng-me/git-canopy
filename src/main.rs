@@ -84,7 +84,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--base" => cfg.base = Some(value("--base")?),
             "--no-watch" => cfg.watch = false,
             "--no-poll" => cfg.poll = false,
-            "--no-herdr" => herdr = false,
+            "--no-herdr" => {
+                herdr = false;
+                cfg.herdr = false;
+            }
             "--herdr-repos" => herdr_repos = true,
             "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
             "--layout" => {

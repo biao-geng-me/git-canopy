@@ -32,7 +32,7 @@ use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
 use crate::graph::RowKind;
 use crate::herdr;
-use crate::model::{Cleanup, Snapshot};
+use crate::model::{Cleanup, Host, Snapshot};
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
 use inset::{Entry, Expansion, Item, Key, Open, VLine};
@@ -70,7 +70,7 @@ pub enum UiMsg {
     },
     /// The checks for removing a worktree finished: what removing it will do, for the confirm
     /// popup, or why it can't be removed.
-    CleanupPlan(Result<Box<cleanup::Plan>, String>),
+    CleanupPlan(u64, Result<Box<cleanup::Plan>, String>),
     /// Removing a worktree finished: the footer notice.
     CleanupDone(Result<String, String>),
 }
@@ -248,8 +248,8 @@ pub struct App {
     pub notice: Option<String>,
     /// `y` was pressed: the next key picks what to copy.
     pub copy_pending: bool,
-    /// Removing a worktree, waiting for the user to confirm.
-    pub confirm: Option<cleanup::Plan>,
+    /// Removing a worktree, waiting for the user to confirm (with the id of its repository).
+    pub confirm: Option<(u64, cleanup::Plan)>,
     /// Where a worktree removal is (one at a time).
     cleaning: Cleaning,
     clipboard: Vec<crate::clipboard::Method>,
@@ -278,6 +278,8 @@ pub struct App {
 pub struct Repo {
     /// Stable identity (indexes shift when repositories are removed).
     id: u64,
+    /// Identity across hosts: (host, common dir).
+    pub host: Host,
     pub common_dir: PathBuf,
     pub snap: Arc<Snapshot>,
     /// Shown in its header row until the first snapshot names it.
@@ -402,9 +404,44 @@ impl App {
         }
     }
 
-    /// The worktree at `path`, in whichever repository has it.
-    pub(super) fn find_worktree(&self, path: &Path) -> Option<&crate::model::WorktreeView> {
-        self.repos.iter().find_map(|r| r.snap.worktrees.iter().find(|w| w.path == path))
+    /// The repository on `host` that has a worktree at `path`, and that worktree.
+    fn find_worktree_in(&self, host: &Host, path: &Path) -> Option<(usize, &crate::model::WorktreeView)> {
+        self.repos
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| &r.host == host)
+            .find_map(|(i, r)| Some((i, r.snap.worktrees.iter().find(|w| w.path == path)?)))
+    }
+
+    /// The worktree at `path` on `host`, in whichever repository has it.
+    pub(super) fn find_worktree(&self, host: &Host, path: &Path) -> Option<&crate::model::WorktreeView> {
+        self.find_worktree_in(host, path).map(|(_, w)| w)
+    }
+
+    /// The host of the shown repository.
+    pub(super) fn host(&self) -> Host {
+        self.repos.get(self.active).map(|r| r.host.clone()).unwrap_or_default()
+    }
+
+    /// The key of the worktree at `path` in the shown repository.
+    pub(super) fn wt_key(&self, path: &Path) -> Key {
+        Key::Worktree(self.host(), path.to_path_buf())
+    }
+
+    /// Index of the repository with this id.
+    fn repo_index(&self, id: u64) -> Option<usize> {
+        self.repos.iter().position(|r| r.id == id)
+    }
+
+    /// The repository the open diff view reads from (`None`: none open, or it is gone).
+    pub(super) fn diff_repo(&self) -> Option<&Repo> {
+        let id = self.diff.as_ref()?.repo;
+        self.repos.iter().find(|r| r.id == id)
+    }
+
+    /// The worktree at `path` in the open diff view's repository.
+    pub(super) fn diff_worktree(&self, path: &Path) -> Option<&crate::model::WorktreeView> {
+        self.diff_repo()?.snap.worktrees.iter().find(|w| w.path == path)
     }
 
     /// Show repository `r` in the graph: park the current graph panel, bring back `r`'s.
@@ -433,6 +470,7 @@ impl App {
         });
         self.repos.push(Repo {
             id,
+            host: Host::Local,
             common_dir,
             snap: Arc::new(Snapshot::default()),
             name,
@@ -514,11 +552,11 @@ impl App {
             }
         }
         for repo in &mut self.repos {
-            let seen = wanted.iter().any(|w| w.common_dir == repo.common_dir);
+            let seen = repo.host == Host::Local && wanted.iter().any(|w| w.common_dir == repo.common_dir);
             repo.unseen_since = if seen { None } else { repo.unseen_since.or(Some(now)) };
         }
         for w in wanted {
-            if !self.repos.iter().any(|r| r.common_dir == w.common_dir) {
+            if !self.repos.iter().any(|r| r.host == Host::Local && r.common_dir == w.common_dir) {
                 self.add_repo(w, true);
             }
         }
@@ -577,14 +615,16 @@ impl App {
     pub fn row_key(&self, f: Focus, r: usize) -> Option<Key> {
         match f {
             Focus::Worktrees => match self.wt_ref(r)? {
-                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].common_dir.clone())),
-                WtRef::Tree(..) => self.wt_at(r).map(|(_, w)| Key::Worktree(w.path.clone())),
+                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].host.clone(), self.repos[ri].common_dir.clone())),
+                WtRef::Tree(ri, _) => self
+                    .wt_at(r)
+                    .map(|(_, w)| Key::Worktree(self.repos[ri].host.clone(), w.path.clone())),
             },
             Focus::Graph => {
                 let g = &self.snap.graph;
                 Some(match g.rows.get(r)?.kind {
                     RowKind::Commit(ci) => Key::Commit(g.commits[ci].id.clone()),
-                    RowKind::Uncommitted(wi) => Key::Worktree(self.snap.worktrees.get(wi)?.path.clone()),
+                    RowKind::Uncommitted(wi) => self.wt_key(&self.snap.worktrees.get(wi)?.path),
                 })
             }
         }
@@ -602,7 +642,7 @@ impl App {
                 }
                 match (&w.status, &w.head) {
                     (Some(st), Some(h)) if !st.is_dirty() => Some(Key::Commit(h.clone())),
-                    _ => Some(Key::Worktree(w.path.clone())),
+                    _ => Some(self.wt_key(&w.path)),
                 }
             }
         }
@@ -610,19 +650,21 @@ impl App {
 
     fn row_of(&self, f: Focus, key: &Key) -> Option<usize> {
         match (f, key) {
-            (Focus::Worktrees, Key::Worktree(p)) => (0..self.wt_rows.len()).find(|&i| self.wt_at(i).is_some_and(|(_, w)| &w.path == p)),
-            (Focus::Worktrees, Key::Repo(c)) => (0..self.wt_rows.len()).find(|&i| {
-                matches!(self.wt_rows[i], WtRef::Header(ri) if &self.repos[ri].common_dir == c)
+            (Focus::Worktrees, Key::Worktree(h, p)) => (0..self.wt_rows.len())
+                .find(|&i| self.wt_at(i).is_some_and(|(ri, w)| &self.repos[ri].host == h && &w.path == p)),
+            (Focus::Worktrees, Key::Repo(h, c)) => (0..self.wt_rows.len()).find(|&i| {
+                matches!(self.wt_rows[i], WtRef::Header(ri) if &self.repos[ri].host == h && &self.repos[ri].common_dir == c)
             }),
-            (Focus::Worktrees, Key::Commit(_)) | (Focus::Graph, Key::Repo(_)) => None,
+            (Focus::Worktrees, Key::Commit(_)) | (Focus::Graph, Key::Repo(..)) => None,
             (Focus::Graph, Key::Commit(id)) => self.snap.graph.commit_row.get(id).copied(),
-            (Focus::Graph, Key::Worktree(p)) => {
+            (Focus::Graph, Key::Worktree(h, p)) if *h == self.host() => {
                 let g = &self.snap.graph;
                 g.worktree_row
                     .get(p)
                     .copied()
                     .filter(|&r| matches!(g.rows[r].kind, RowKind::Uncommitted(_)))
             }
+            (Focus::Graph, Key::Worktree(..)) => None,
         }
     }
 
@@ -744,7 +786,7 @@ impl App {
         let Some(id) = id else { return };
         let Some(r) = self.row_of(f, &id.row).or_else(|| match (&id.row, f) {
             // A worktree that became clean: its uncommitted row is gone, use its HEAD.
-            (Key::Worktree(p), Focus::Graph) => self.snap.graph.worktree_row.get(p).copied(),
+            (Key::Worktree(h, p), Focus::Graph) if *h == self.host() => self.snap.graph.worktree_row.get(p).copied(),
             _ => None,
         }) else {
             return;
@@ -785,8 +827,8 @@ impl App {
     // Docs (diffs) for insets
 
     fn worktree_stamp(&self, key: &Key) -> Option<(Option<crate::git::status::Status>, Option<i64>)> {
-        let Key::Worktree(p) = key else { return None };
-        let w = self.find_worktree(p)?;
+        let Key::Worktree(h, p) = key else { return None };
+        let w = self.find_worktree(h, p)?;
         Some((w.status.clone(), w.changed_at))
     }
 
@@ -795,28 +837,50 @@ impl App {
         match self.diff.as_ref().map(|d| &d.target) {
             Some(diff::Target::Overlaps { overlaps, .. }) => overlaps
                 .iter()
-                .filter_map(|o| o.path.clone())
-                .map(|p| self.worktree_stamp(&Key::Worktree(p)))
+                .filter_map(|o| o.path.as_deref())
+                .map(|p| self.diff_worktree(p).map(|w| (w.status.clone(), w.changed_at)))
                 .collect(),
             _ => Vec::new(),
         }
     }
 
-    fn diff_target(&self, key: &Key) -> Option<diff::Target> {
+    /// What `key` diffs, and the repository that answers for it (by index): a commit from the
+    /// shown repository (only its graph has commit rows), a worktree from the one that has it.
+    fn diff_target_in(&self, key: &Key) -> Option<(usize, diff::Target)> {
         Some(match key {
-            Key::Commit(id) => diff::Target::Commit {
-                dir: self.snap.common_dir.clone(),
-                id: id.clone(),
-            },
-            Key::Repo(_) => return None,
-            Key::Worktree(p) => {
-                let w = self.find_worktree(p)?;
-                diff::Target::Worktree {
+            Key::Commit(id) => (
+                self.active.min(self.repos.len().checked_sub(1)?),
+                diff::Target::Commit {
+                    dir: self.snap.common_dir.clone(),
+                    id: id.clone(),
+                },
+            ),
+            Key::Repo(..) => return None,
+            Key::Worktree(h, p) => {
+                let (r, w) = self.find_worktree_in(h, p)?;
+                let target = diff::Target::Worktree {
                     path: p.clone(),
                     has_head: w.head.is_some(),
-                }
+                };
+                (r, target)
             }
         })
+    }
+
+    pub(super) fn diff_target(&self, key: &Key) -> Option<diff::Target> {
+        self.diff_target_in(key).map(|(_, t)| t)
+    }
+
+    /// Ask the repository that has `key` for its doc, as inset request `req`.
+    fn load_doc(&self, key: Key, req: u64) {
+        let Some((r, target)) = self.diff_target_in(&key) else { return };
+        let tx = self.tx.clone();
+        self.repos[r].worker.doc(
+            target,
+            Box::new(move |result| {
+                let _ = tx.send(UiMsg::Inset { key, req, result });
+            }),
+        );
     }
 
     /// Start loading `key` unless it is loaded (and fresh) or already loading.
@@ -824,7 +888,9 @@ impl App {
         if self.docs.contains_key(key) {
             return;
         }
-        let Some(target) = self.diff_target(key) else { return };
+        if self.diff_target(key).is_none() {
+            return;
+        }
         self.next_id += 1;
         let req = self.next_id;
         self.docs.insert(
@@ -835,11 +901,7 @@ impl App {
                 ..Default::default()
             },
         );
-        let (tx, key) = (self.tx.clone(), key.clone());
-        spawn_named("canopy-inset", move || {
-            let result = diff::load(&target).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(UiMsg::Inset { key, req, result });
-        });
+        self.load_doc(key.clone(), req);
     }
 
     /// Worktree docs whose status changed are reloaded if shown, dropped otherwise. Commit docs
@@ -848,7 +910,7 @@ impl App {
         let stale: Vec<Key> = self
             .docs
             .iter()
-            .filter(|(k, e)| matches!(k, Key::Worktree(_)) && e.doc.is_some() && self.worktree_stamp(k) != e.stamp)
+            .filter(|(k, e)| matches!(k, Key::Worktree(..)) && e.doc.is_some() && self.worktree_stamp(k) != e.stamp)
             .map(|(k, _)| k.clone())
             .collect();
         for key in stale {
@@ -858,7 +920,9 @@ impl App {
                 continue;
             }
             // Keep showing the old doc until the new one arrives.
-            let Some(target) = self.diff_target(&key) else { continue };
+            if self.diff_target(&key).is_none() {
+                continue;
+            }
             self.next_id += 1;
             let req = self.next_id;
             let stamp = self.worktree_stamp(&key);
@@ -866,11 +930,7 @@ impl App {
                 e.req = req;
                 e.stamp = stamp;
             }
-            let tx = self.tx.clone();
-            spawn_named("canopy-inset", move || {
-                let result = diff::load(&target).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(UiMsg::Inset { key, req, result });
-            });
+            self.load_doc(key, req);
         }
         if self.docs.len() > 256 {
             let open: Vec<Key> = self.wt.exp.keys().chain(self.graph.exp.keys()).cloned().collect();
@@ -890,7 +950,7 @@ impl App {
         match msg {
             UiMsg::Snapshot(id, s) => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
-                let Some(r) = self.repos.iter().position(|x| x.id == id) else { return };
+                let Some(r) = self.repo_index(id) else { return };
                 if r == self.active {
                     self.on_snapshot(s, ids);
                 } else if let Some(repo) = self.repos.get_mut(r) {
@@ -941,13 +1001,13 @@ impl App {
                 }
                 self.notice = Some(notice);
             }
-            UiMsg::CleanupPlan(plan) => match plan {
+            UiMsg::CleanupPlan(id, plan) => match plan {
                 Ok(plan) if matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. }) => {
-                    self.remove_worktree(*plan);
+                    self.remove_worktree(id, *plan);
                 }
                 Ok(plan) => {
                     self.notice = None;
-                    self.confirm = Some(*plan);
+                    self.confirm = Some((id, *plan));
                     self.cleaning = Cleaning::Confirming;
                 }
                 Err(e) => {
@@ -1052,7 +1112,7 @@ impl App {
         let stale = match &self.diff {
             Some(d @ DiffView { doc: Some(_), .. }) => match d.target.worktree() {
                 Some(path) => {
-                    let now = self.worktree_stamp(&Key::Worktree(path.to_path_buf()));
+                    let now = self.diff_worktree(path).map(|w| (w.status.clone(), w.changed_at));
                     now.is_some_and(|now| now.0.is_some() && Some(now) != d.stamp)
                 }
                 None => false,
@@ -1062,7 +1122,7 @@ impl App {
         // An overlaps view follows the worktree's overlaps (other worktrees changing).
         let overlaps_now = match self.diff.as_ref().map(|d| &d.target) {
             Some(diff::Target::Overlaps { path, overlaps, .. }) => self
-                .find_worktree(path)
+                .diff_worktree(path)
                 .map(|w| &w.overlaps)
                 .filter(|now| *now != overlaps)
                 .cloned(),
@@ -1537,22 +1597,21 @@ impl App {
             }
         }
         let Some(base) = self.snap.base.clone() else { return };
-        let common = self.snap.common_dir.clone();
-        let sock = if self.with_herdr && self.herdr.is_some() { herdr::socket_path() } else { None };
-        let herdr_dir = self.herdr_dir.clone();
-        let tx = self.tx.clone();
+        let Some(repo) = self.repos.get(self.active) else { return };
+        let (tx, id, name) = (self.tx.clone(), repo.id, w.name.clone());
         self.cleaning = Cleaning::Checking {
             path: w.path.clone(),
             confirmed: false,
         };
-        self.notice = Some(format!("checking {}…", w.name));
-        spawn_named("canopy-cleanup", move || {
-            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            let plan = cleanup::plan(&common, &w, &base, sock, herdr_dir.as_deref(), own.as_deref())
-                .map(Box::new)
-                .map_err(|e| format!("can't remove {}: {e:#}", w.name));
-            let _ = tx.send(UiMsg::CleanupPlan(plan));
-        });
+        self.notice = Some(format!("checking {name}…"));
+        repo.worker.cleanup_plan(
+            w,
+            base,
+            Box::new(move |plan| {
+                let plan = plan.map(Box::new).map_err(|e| format!("can't remove {name}: {e}"));
+                let _ = tx.send(UiMsg::CleanupPlan(id, plan));
+            }),
+        );
     }
 
     /// The worktree Backspace acts on. On a graph commit that several worktrees have checked out
@@ -1572,24 +1631,31 @@ impl App {
             .or(Some(focused))
     }
 
-    /// Carry out a confirmed removal in the background (it checks everything once more).
-    fn remove_worktree(&mut self, plan: cleanup::Plan) {
+    /// Carry out a confirmed removal in the background (repository `id` checks everything once
+    /// more).
+    fn remove_worktree(&mut self, id: u64, plan: cleanup::Plan) {
+        let Some(repo) = self.repos.iter().find(|r| r.id == id) else {
+            self.cleaning = Cleaning::Idle;
+            self.notice = Some(format!("didn't remove {}: its repository is no longer watched", plan.name));
+            return;
+        };
         self.cleaning = Cleaning::Removing;
         self.notice = Some(format!("removing {}…", plan.name));
-        let tx = self.tx.clone();
-        spawn_named("canopy-cleanup", move || {
-            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            let res = cleanup::run(&plan, own.as_deref()).map_err(|e| format!("didn't remove {}: {e:#}", plan.name));
-            let _ = tx.send(UiMsg::CleanupDone(res));
-        });
+        let (tx, name) = (self.tx.clone(), plan.name.clone());
+        repo.worker.cleanup_run(
+            plan,
+            Box::new(move |res| {
+                let _ = tx.send(UiMsg::CleanupDone(res.map_err(|e| format!("didn't remove {name}: {e}"))));
+            }),
+        );
     }
 
     /// Keys while the confirm popup is open: `y`/Enter/Backspace removes, Esc/`n`/`q` cancels.
     fn on_confirm_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('y') | KeyCode::Enter | KeyCode::Backspace => {
-                if let Some(plan) = self.confirm.take() {
-                    self.remove_worktree(plan);
+                if let Some((id, plan)) = self.confirm.take() {
+                    self.remove_worktree(id, plan);
                 }
             }
             KeyCode::Esc | KeyCode::Char('n' | 'q') => {
@@ -1631,9 +1697,8 @@ impl App {
             base,
         };
         self.next_id += 1;
-        let view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&Key::Worktree(path)));
-        self.diff = Some(view);
-        self.spawn_diff_load();
+        let view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&self.wt_key(&path)));
+        self.show_diff(view);
     }
 
     /// `o`: what worktree `wi` and the worktrees it overlaps with each did to their shared files.
@@ -1652,10 +1717,9 @@ impl App {
             name: w.name.clone(),
             overlaps: w.overlaps.clone(),
         };
-        let stamp = self.worktree_stamp(&Key::Worktree(w.path.clone()));
+        let stamp = self.worktree_stamp(&self.wt_key(&w.path));
         self.next_id += 1;
-        self.diff = Some(DiffView::new(self.next_id, title, target, stamp));
-        self.spawn_diff_load();
+        self.show_diff(DiffView::new(self.next_id, title, target, stamp));
     }
 
     fn open_shell_inset(&mut self, path: &Path, command: Option<String>) {
@@ -1809,7 +1873,7 @@ impl App {
         };
         let r = l.row();
         let Some(key) = self.target(f, r) else { return };
-        let Some(target) = self.diff_target(&key) else { return };
+        let Some((repo, target)) = self.diff_target_in(&key) else { return };
         let title = match &key {
             Key::Commit(id) => {
                 let short = &id[..id.len().min(7)];
@@ -1823,11 +1887,11 @@ impl App {
                     None => short.to_string(),
                 }
             }
-            Key::Worktree(p) => {
-                let name = self.find_worktree(p).map(|w| w.name.as_str());
+            Key::Worktree(h, p) => {
+                let name = self.find_worktree(h, p).map(|w| w.name.as_str());
                 format!("[{}] uncommitted changes", name.unwrap_or("?"))
             }
-            Key::Repo(_) => return,
+            Key::Repo(..) => return,
         };
         // Where to land: (file, scroll) within the doc.
         let focus = match l {
@@ -1844,6 +1908,7 @@ impl App {
 
         self.next_id += 1;
         let mut view = DiffView::new(self.next_id, title, target, self.worktree_stamp(&key));
+        view.repo = self.repos[repo].id;
         if let Some((file, scroll)) = focus {
             view.focus_on(file, scroll);
         }
@@ -1865,7 +1930,8 @@ impl App {
             Some(d) => d
                 .target
                 .worktree()
-                .and_then(|p| self.worktree_stamp(&Key::Worktree(p.to_path_buf()))),
+                .and_then(|p| self.diff_worktree(p))
+                .map(|w| (w.status.clone(), w.changed_at)),
             None => return,
         };
         self.next_id += 1;
@@ -1878,13 +1944,24 @@ impl App {
         self.spawn_diff_load();
     }
 
+    /// Open `view` on the shown repository's data and load it.
+    fn show_diff(&mut self, mut view: DiffView) {
+        view.repo = self.repos.get(self.active).map_or(u64::MAX, |r| r.id);
+        self.diff = Some(view);
+        self.spawn_diff_load();
+    }
+
+    /// Ask the open diff view's repository for its doc.
     fn spawn_diff_load(&self) {
         let Some(d) = &self.diff else { return };
-        let (id, target, tx) = (d.id, d.target.clone(), self.tx.clone());
-        spawn_named("canopy-diff", move || {
-            let result = diff::load(&target).map_err(|e| format!("{e:#}"));
+        let (id, tx) = (d.id, self.tx.clone());
+        let reply = Box::new(move |result| {
             let _ = tx.send(UiMsg::Diff { id, result });
         });
+        match self.diff_repo() {
+            Some(repo) => repo.worker.doc(d.target.clone(), reply),
+            None => reply(Err("its repository is no longer watched".into())),
+        }
     }
 
     fn diff_action(&mut self, action: Action) {

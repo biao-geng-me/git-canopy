@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use notify::RecursiveMode;
 
 use crate::fsinfo::{self, Events};
+use crate::{cleanup, diff};
 use crate::git::{self, RepoPaths, changes::FileChange, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
 use crate::model::{self, Changes, Landed, Overlap, Snapshot, WorktreeView};
@@ -98,6 +99,8 @@ pub struct Config {
     pub base: Option<String>,
     /// Commits loaded initially and per "load more" step.
     pub page: usize,
+    /// Consult this machine's herdr when cleaning up (its workspaces, busy agents).
+    pub herdr: bool,
 }
 
 impl Default for Config {
@@ -108,6 +111,7 @@ impl Default for Config {
             watch: true,
             base: None,
             page: GRAPH_PAGE,
+            herdr: true,
         }
     }
 }
@@ -129,14 +133,72 @@ enum Msg {
 
 /// Handle to the worker thread; dropping it stops the worker (after the git command it may be
 /// running), which releases its watches.
+///
+/// It is also the only way the UI gets anything else from the repository: diffs, text to copy,
+/// cleanup. Each answer goes to a `reply` callback (called on another thread), so the UI never
+/// runs git itself, and a repository on another machine (0.5, `canopy serve` over ssh) can
+/// answer the same requests through a remote handle.
 pub struct Handle {
     tx: Sender<Msg>,
+    common_dir: PathBuf,
+    herdr: bool,
 }
+
+/// Where an answer to a [`Handle`] request goes (errors as display text).
+pub type Reply<T> = Box<dyn FnOnce(Result<T, String>) + Send>;
 
 impl Handle {
     pub fn request(&self, req: Request) {
         let _ = self.tx.send(Msg::Req(req));
     }
+
+    /// A diff document (commit, worktree, branch or overlaps).
+    pub fn doc(&self, target: diff::Target, reply: Reply<diff::DiffDoc>) {
+        job("canopy-diff", reply, move || diff::load(&target));
+    }
+
+    /// `target`'s diff as a raw patch, or only `file`'s part of it.
+    pub fn patch(&self, target: diff::Target, file: Option<String>, reply: Reply<String>) {
+        job("canopy-copy", reply, move || diff::patch(&target, file.as_deref()));
+    }
+
+    /// Commit `sha`'s full message.
+    pub fn message(&self, sha: String, reply: Reply<String>) {
+        let dir = self.common_dir.clone();
+        job("canopy-copy", reply, move || {
+            let out = git::run(&dir, &["log", "-1", "--format=%B", &sha, "--"])?;
+            Ok(String::from_utf8_lossy(&out).trim_end().to_string())
+        });
+    }
+
+    /// Check worktree `w` again and work out what removing it involves (with this machine's
+    /// herdr, if enabled).
+    pub fn cleanup_plan(&self, w: WorktreeView, base: String, reply: Reply<cleanup::Plan>) {
+        let (dir, herdr) = (self.common_dir.clone(), self.herdr);
+        job("canopy-cleanup", reply, move || {
+            let sock = if herdr { crate::herdr::socket_path() } else { None };
+            let herdr_dir = crate::herdr::worktree_dir();
+            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
+            cleanup::plan(&dir, &w, &base, sock, herdr_dir.as_deref(), own.as_deref())
+        });
+    }
+
+    /// Carry out a confirmed `plan` (it checks everything once more). Answers the footer notice.
+    pub fn cleanup_run(&self, plan: cleanup::Plan, reply: Reply<String>) {
+        job("canopy-cleanup", reply, move || {
+            let own = std::env::var("HERDR_WORKSPACE_ID").ok();
+            cleanup::run(&plan, own.as_deref())
+        });
+    }
+}
+
+/// Run `f` on a thread of its own (not one of the worker's slots, so diffs stay responsive
+/// while the worker is busy) and hand its result to `reply`.
+fn job<T: 'static>(name: &str, reply: Reply<T>, f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) {
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || reply(f().map_err(|e| format!("{e:#}"))))
+        .expect("spawn thread");
 }
 
 impl Drop for Handle {
@@ -161,6 +223,7 @@ where
 {
     let (tx, rx) = mpsc::channel();
     let fs_tx = tx.clone();
+    let (common_dir, herdr) = (paths.common_dir.clone(), cfg.herdr);
     thread::Builder::new()
         .name("canopy-refresh".into())
         .spawn(move || {
@@ -172,7 +235,7 @@ where
             w.run(rx);
         })
         .expect("spawn refresh thread");
-    Handle { tx }
+    Handle { tx, common_dir, herdr }
 }
 
 struct Worker {

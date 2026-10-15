@@ -10,15 +10,17 @@ use std::sync::Arc;
 
 use crate::diff::{DiffDoc, FileDiff};
 use crate::git::status::Status;
+use crate::model::Host;
 
 /// Identity of something that can be expanded or diffed: a commit, or a worktree's uncommitted
 /// changes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Key {
     Commit(String),
-    Worktree(PathBuf),
+    /// A worktree, by its path on its host.
+    Worktree(Host, PathBuf),
     /// A repository's header row in the worktree list (by common dir); never expands.
-    Repo(PathBuf),
+    Repo(Host, PathBuf),
 }
 
 /// One inset line under base row `row`.

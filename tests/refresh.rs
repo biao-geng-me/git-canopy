@@ -433,3 +433,51 @@ fn repositories_share_one_watcher() {
     let left = hub.watched();
     assert!(left > 0 && left < both, "watched {both} → {left}");
 }
+
+#[test]
+fn handle_answers_requests() {
+    // Everything the UI needs beyond snapshots comes from the repository's handle.
+    let fx = common::Fixture::new();
+    let cfg = Config {
+        watch: false,
+        poll: false,
+        ..Config::default()
+    };
+    let (h, rx) = spawn(&fx, cfg);
+    let s = wait_for(&rx, Duration::from_secs(10), |s| s.statuses_loaded);
+    let w = find(&s, "feat-auth");
+    let ask = |f: &dyn Fn(mpsc::Sender<Result<String, String>>)| {
+        let (tx, rx) = mpsc::channel();
+        f(tx);
+        rx.recv_timeout(Duration::from_secs(10)).expect("no answer")
+    };
+
+    let head = w.head.clone().unwrap();
+    let msg = ask(&|tx| h.message(head.clone(), Box::new(move |r| tx.send(r).unwrap())));
+    assert!(!msg.unwrap().is_empty());
+
+    let target = canopy::diff::Target::Worktree {
+        path: w.path.clone(),
+        has_head: true,
+    };
+    let t = target.clone();
+    let doc = ask(&|tx| {
+        h.doc(
+            t.clone(),
+            Box::new(move |r| tx.send(r.map(|d| format!("{} files", d.files.len()))).unwrap()),
+        )
+    });
+    assert_ne!(doc.unwrap(), "0 files", "feat-auth is dirty");
+    let patch = ask(&|tx| h.patch(target.clone(), None, Box::new(move |r| tx.send(r).unwrap())));
+    assert!(patch.unwrap().contains("diff --git"));
+
+    // A dirty worktree: the plan is refused, with the reason as text.
+    let plan = ask(&|tx| {
+        h.cleanup_plan(
+            w.clone(),
+            "main".into(),
+            Box::new(move |r| tx.send(r.map(|p| p.name)).unwrap()),
+        )
+    });
+    assert!(plan.unwrap_err().contains("uncommitted"));
+}

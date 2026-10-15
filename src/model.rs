@@ -293,6 +293,15 @@ pub fn detect_base(explicit: Option<&str>, refs: &[RefEntry], worktrees: &[Workt
         .or_else(|| worktrees.first()?.branch_name().map(str::to_string))
 }
 
+/// The machine a repository is on: paths are only meaningful together with it (`/home/me/proj`
+/// can exist on two machines). Only this one for now; remote hosts (`canopy serve` over ssh)
+/// come in 0.5.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Host {
+    #[default]
+    Local,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     /// Display name of the repository (main worktree directory).

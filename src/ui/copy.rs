@@ -84,7 +84,7 @@ impl CopyCtx {
 /// How the copied text is obtained (git runs off the UI thread).
 enum Payload {
     Text(String),
-    Message(PathBuf, String),
+    Message(String),
     Patch(diff::Target, Option<String>),
 }
 
@@ -225,7 +225,7 @@ impl App {
             Field::Subject => ("subject".to_string(), Payload::Text(ctx.subject.unwrap_or_default())),
             Field::Message => (
                 "message".to_string(),
-                Payload::Message(self.snap.common_dir.clone(), sha),
+                Payload::Message(sha),
             ),
             Field::Path => {
                 let path = ctx.path.unwrap_or_default().to_string_lossy().into_owned();
@@ -242,33 +242,46 @@ impl App {
             }
         };
         let (tx, methods) = (self.tx.clone(), self.clipboard.clone());
-        spawn_named("canopy-copy", move || {
-            let text = match payload {
-                Payload::Text(t) => Ok(t),
-                Payload::Message(dir, sha) => crate::git::run(&dir, &["log", "-1", "--format=%B", &sha, "--"])
-                    .map(|out| String::from_utf8_lossy(&out).trim_end().to_string())
-                    .map_err(|e| format!("{e:#}")),
-                Payload::Patch(target, file) => diff::patch(&target, file.as_deref()).map_err(|e| format!("{e:#}")),
-            };
-            let msg = match text {
-                Err(e) => UiMsg::Copied {
-                    notice: format!("copy failed: {e}"),
-                    osc52: None,
-                },
-                Ok(t) if t.is_empty() => UiMsg::Copied {
-                    notice: format!("{what} is empty, nothing copied"),
-                    osc52: None,
-                },
-                Ok(t) => {
-                    let done = methods.iter().any(|m| clipboard::run(m, &t));
-                    UiMsg::Copied {
-                        notice: describe(&what, &t),
-                        osc52: (!done).then(|| clipboard::osc52(&t)),
-                    }
-                }
-            };
-            let _ = tx.send(msg);
-        });
+        // Hand the text to the clipboard off the UI thread (programs, tmux).
+        let deliver = move |text: Result<String, String>| {
+            spawn_named("canopy-copy", move || {
+                let _ = tx.send(delivered(&what, text, &methods));
+            })
+        };
+        // Text that needs git comes from the repository it is about: the open diff's, else the
+        // shown one.
+        let repo = match &self.diff {
+            Some(_) => self.diff_repo(),
+            None => self.repos.get(self.active),
+        };
+        match (payload, repo) {
+            (Payload::Text(t), _) => deliver(Ok(t)),
+            (Payload::Message(sha), Some(repo)) => repo.worker.message(sha, Box::new(deliver)),
+            (Payload::Patch(target, file), Some(repo)) => repo.worker.patch(target, file, Box::new(deliver)),
+            (_, None) => deliver(Err("its repository is no longer watched".into())),
+        }
+    }
+}
+
+/// Put `text` on the clipboard (or hand back the OSC 52 sequence for the UI to write); the
+/// message reporting it.
+fn delivered(what: &str, text: Result<String, String>, methods: &[clipboard::Method]) -> UiMsg {
+    match text {
+        Err(e) => UiMsg::Copied {
+            notice: format!("copy failed: {e}"),
+            osc52: None,
+        },
+        Ok(t) if t.is_empty() => UiMsg::Copied {
+            notice: format!("{what} is empty, nothing copied"),
+            osc52: None,
+        },
+        Ok(t) => {
+            let done = methods.iter().any(|m| clipboard::run(m, &t));
+            UiMsg::Copied {
+                notice: describe(what, &t),
+                osc52: (!done).then(|| clipboard::osc52(&t)),
+            }
+        }
     }
 }
 

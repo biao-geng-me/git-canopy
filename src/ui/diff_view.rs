@@ -27,6 +27,8 @@ pub struct DiffView {
     pub id: u64,
     pub title: String,
     pub target: diff::Target,
+    /// The id of the repository that answers for `target` (`ui::Repo::id`).
+    pub repo: u64,
     /// For worktree diffs: the (status, last edit) the diff was loaded for; reloaded when it changes.
     pub stamp: Option<(Option<Status>, Option<i64>)>,
     /// `None` while loading.
@@ -52,6 +54,7 @@ impl DiffView {
             id,
             title,
             target,
+            repo: 0,
             stamp,
             doc: None,
             sel: 0,
