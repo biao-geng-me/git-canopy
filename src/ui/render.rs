@@ -999,8 +999,10 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
                 }
                 spans.push(Span::raw(" "));
                 spans.extend(count_spans(w));
+                // Trailing space in the same style: the italic d's top overhangs into the next
+                // cell, which terminals clip or draw in that cell's style.
                 spans.push(Span::styled(
-                    " uncommitted",
+                    " uncommitted ",
                     Style::new().fg(Color::Red).add_modifier(Modifier::ITALIC),
                 ));
             }
