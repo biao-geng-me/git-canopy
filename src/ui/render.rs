@@ -190,6 +190,9 @@ pub fn marker(w: &WorktreeView) -> Span<'static> {
 const CLEANUP_GLYPH: &str = "⌫";
 /// `⌫` of a worktree without commits of its own: removable, but nothing says its work is done.
 const C_UNUSED: Color = Color::Gray;
+/// Nerd Font glyphs for untracked files and directories (`nf-fa-file`, `nf-fa-folder`).
+const NF_FILE: char = '\u{f15b}';
+const NF_FOLDER: char = '\u{f07b}';
 
 /// `⌫` when a worktree could be cleaned up: green when its work is merged, gray when it has no
 /// commits of its own, yellow when untracked files would be lost.
@@ -210,21 +213,30 @@ fn marker_gap<'a>(mut markers: impl Iterator<Item = &'a Span<'static>>) -> usize
     if markers.any(|m| m.content == CLEANUP_GLYPH) { 2 } else { 1 }
 }
 
-/// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts.
-pub fn count_spans(w: &WorktreeView) -> Vec<Span<'static>> {
+/// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts. New
+/// directories are counted apart from untracked files (`?2/`, git doesn't list their contents);
+/// with `icons` (`--nerd-font`) both get Nerd Font file/folder glyphs instead of `?`.
+pub fn count_spans(w: &WorktreeView, icons: bool) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     if let Some(st) = &w.status {
-        for (n, sym, color) in [
-            (st.staged, '+', C_STAGED),
-            (st.modified, '~', C_MODIFIED),
-            (st.untracked, '?', C_UNTRACKED),
-            (st.unmerged, '!', C_CONFLICT),
+        let files = st.untracked - st.untracked_dirs;
+        let (file, dir) = if icons {
+            (format!("{NF_FILE} {files}"), format!("{NF_FOLDER} {}", st.untracked_dirs))
+        } else {
+            (format!("?{files}"), format!("?{}/", st.untracked_dirs))
+        };
+        for (n, text, color) in [
+            (st.staged, format!("+{}", st.staged), C_STAGED),
+            (st.modified, format!("~{}", st.modified), C_MODIFIED),
+            (files, file, C_UNTRACKED),
+            (st.untracked_dirs, dir, C_UNTRACKED),
+            (st.unmerged, format!("!{}", st.unmerged), C_CONFLICT),
         ] {
             if n > 0 {
                 if !out.is_empty() {
                     out.push(Span::raw(" "));
                 }
-                out.push(Span::styled(format!("{sym}{n}"), Style::new().fg(color)));
+                out.push(Span::styled(text, Style::new().fg(color)));
             }
         }
     }
@@ -374,7 +386,7 @@ fn wt_rows(app: &App, wide: bool) -> Vec<Option<WtRow>> {
                 marker: cleanup_span(app.cleanup_in(r, wi), w).unwrap_or_else(|| marker(w)),
                 name: Span::styled(w.name.clone(), style),
                 agent: app.agent_activity_in(r, wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
-                counts: count_spans(w),
+                counts: count_spans(w, app.nerd_font),
                 ab: ab_spans(w, base),
                 size: if wide { size_spans(w) } else { Vec::new() },
                 overlap: overlap_spans(w, wide),
@@ -998,7 +1010,7 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
                     spans.extend([c, Span::raw(" ")]);
                 }
                 spans.push(Span::raw(" "));
-                spans.extend(count_spans(w));
+                spans.extend(count_spans(w, app.nerd_font));
                 // Trailing space in the same style: the italic d's top overhangs into the next
                 // cell, which terminals clip or draw in that cell's style.
                 spans.push(Span::styled(

@@ -260,6 +260,8 @@ pub struct App {
     herdr_dir: Option<PathBuf>,
     /// Git TUI for `t` (`--git-tui` / `CANOPY_GIT_TUI`); found on PATH when `None`.
     git_tui: Option<String>,
+    /// Nerd Font glyphs for untracked files and folders (`--nerd-font`).
+    pub nerd_font: bool,
     /// Also watch the repositories herdr's agents and workspaces are in (`--herdr-repos`).
     pub discovery: Option<Discovery>,
     /// The one watcher every repository's worker registers with.
@@ -360,6 +362,7 @@ impl App {
             with_herdr: true,
             herdr_dir: None,
             git_tui: None,
+            nerd_font: false,
             discovery: None,
             hub: watch::Hub::new(),
             cfg: cfg.clone(),
@@ -1582,11 +1585,17 @@ impl App {
         match self.cleanup(wi) {
             Cleanup::Safe => {}
             Cleanup::Untracked => {
-                let n = w.status.as_ref().map_or(0, |s| s.untracked);
+                let st = w.status.as_ref();
+                let (files, dirs) = st.map_or((0, 0), |s| (s.untracked - s.untracked_dirs, s.untracked_dirs));
+                let count = |n: u32, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                let what = match (files, dirs) {
+                    (f, 0) => count(f, "untracked file"),
+                    (0, d) => count(d, "new folder"),
+                    (f, d) => format!("{} and {}", count(f, "untracked file"), count(d, "new folder")),
+                };
                 self.notice = Some(format!(
-                    "can't remove {}: {n} untracked file{} would be lost; delete them first (s opens a shell there)",
-                    w.name,
-                    if n == 1 { "" } else { "s" }
+                    "can't remove {}: {what} would be lost; delete them first (s opens a shell there)",
+                    w.name
                 ));
                 return;
             }
@@ -2052,6 +2061,8 @@ pub struct Options {
     /// Also watch the repositories herdr's agents and workspaces are in (`--herdr-repos`).
     pub herdr_repos: bool,
     pub git_tui: Option<String>,
+    /// Nerd Font glyphs for untracked files and folders (`--nerd-font`).
+    pub nerd_font: bool,
 }
 
 /// Run the TUI on `repos` (distinct common dirs; none only with `herdr_repos`) until the user
@@ -2070,6 +2081,7 @@ pub fn run(repos: Vec<RepoPaths>, cfg: Config, opts: Options) -> Result<()> {
     app.with_herdr = with_herdr;
     app.herdr_dir = herdr::worktree_dir();
     app.git_tui = opts.git_tui;
+    app.nerd_font = opts.nerd_font;
     if with_herdr && opts.herdr_repos {
         app.discovery = Some(Discovery::default());
     }

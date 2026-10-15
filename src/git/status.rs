@@ -19,7 +19,11 @@ pub struct Status {
     pub staged: u32,
     /// Paths with changes in the working tree not yet staged.
     pub modified: u32,
+    /// Untracked entries: files, plus each new directory once (git lists a directory with no
+    /// tracked files as `dir/` rather than its contents).
     pub untracked: u32,
+    /// Of those, directories.
+    pub untracked_dirs: u32,
     pub unmerged: u32,
     /// Changed paths (first [`MAX_PATHS`]), relative to the worktree root.
     pub paths: Vec<String>,
@@ -83,7 +87,12 @@ fn count<'a>(st: &mut Status, kind: u8, rest: &[u8], recs: &mut impl Iterator<It
             }
         }
         b'u' => st.unmerged += 1,
-        b'?' => st.untracked += 1,
+        b'?' => {
+            st.untracked += 1;
+            if rest.ends_with(b"/") {
+                st.untracked_dirs += 1;
+            }
+        }
         _ => {}
     }
 }
@@ -128,6 +137,7 @@ u UU N... 100644 100644 100644 100644 a b c README.md\0\
         assert_eq!(st.upstream.as_deref(), Some("origin/feat-auth"));
         assert_eq!(st.upstream_ab, Some((2, 1)));
         assert_eq!((st.staged, st.modified, st.untracked, st.unmerged), (3, 2, 2, 1));
+        assert_eq!(st.untracked_dirs, 1);
         assert!(st.is_dirty());
         assert_eq!(
             st.paths,

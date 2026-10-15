@@ -37,7 +37,7 @@ tree doing, and which ones are dirty?" on one screen:
 ```
 
 - **Worktrees** (bottom): one row per worktree: state marker, branch (or directory name when detached),
-  staged `+`, modified `~`, untracked `?` and conflicted `!` counts, ahead/behind the base branch `↑↓`
+  staged `+`, modified `~`, untracked `?` (new folders apart, `?2/`: git doesn't list their files; `--nerd-font` shows file/folder icons instead) and conflicted `!` counts, ahead/behind the base branch `↑↓`
   and the upstream `⇡⇣`, in-progress operations (`MERGING`, `REBASING`, …), how much it changed since
   it forked from the base branch (`+412 -38`, commits and uncommitted changes together), overlap
   warnings (`⚠ feat-x`, see below), when its changed files were last edited, its HEAD commit (sha, age)
@@ -115,6 +115,8 @@ git canopy [OPTIONS] [PATH...]
       --herdr-repos       also watch every repository a herdr agent or workspace is in
       --git-tui <CMD>     git TUI that `t` opens (default: $CANOPY_GIT_TUI, else the first of
                           lazygit, gitui, tig on PATH)
+      --nerd-font         Nerd Font icons for untracked files and folders (default:
+                          $CANOPY_NERD_FONT=1)
 ```
 
 ### Several repositories

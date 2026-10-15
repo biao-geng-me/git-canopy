@@ -28,6 +28,8 @@ OPTIONS:
                             and removed as they come and go (PATH is optional then)
         --git-tui <CMD>     git TUI that t opens in a worktree (default: $CANOPY_GIT_TUI, else
                             the first of lazygit, gitui, tig on PATH)
+        --nerd-font         Nerd Font icons for untracked files and folders (default:
+                            $CANOPY_NERD_FONT=1)
     -h, --help              print help
     -V, --version           print version
 
@@ -42,6 +44,7 @@ struct Args {
     herdr: bool,
     herdr_repos: bool,
     git_tui: Option<String>,
+    nerd_font: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -51,6 +54,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut herdr = true;
     let mut herdr_repos = false;
     let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
+    let mut nerd_font = std::env::var("CANOPY_NERD_FONT").is_ok_and(|v| v == "1");
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         let s = arg.to_string_lossy().into_owned();
@@ -89,6 +93,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 cfg.herdr = false;
             }
             "--herdr-repos" => herdr_repos = true,
+            "--nerd-font" => nerd_font = true,
             "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
@@ -111,6 +116,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         herdr,
         herdr_repos,
         git_tui,
+        nerd_font,
     }))
 }
 
@@ -156,6 +162,7 @@ fn main() -> ExitCode {
         herdr: args.herdr,
         herdr_repos: args.herdr_repos,
         git_tui: args.git_tui,
+        nerd_font: args.nerd_font,
     };
     match canopy::ui::run(repos, args.cfg, opts) {
         Ok(()) => ExitCode::SUCCESS,
