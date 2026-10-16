@@ -227,7 +227,8 @@ inside herdr, and stays invisible when herdr isn't running (`--no-herdr` turns i
 
 An agent belongs to the worktree containing its working directory (deepest match), else to the worktree
 of its herdr workspace. canopy connects to herdr's socket (`HERDR_SOCKET_PATH`, `HERDR_SESSION`, or
-`~/.config/herdr/herdr.sock`), follows its event stream, and reconnects if herdr restarts.
+`herdr.sock` in `$XDG_CONFIG_HOME/herdr`, else `~/.config/herdr`), follows its event stream, and
+reconnects if herdr restarts.
 
 ## Shells
 
@@ -274,6 +275,7 @@ terminals support and which also works over SSH.
   directories (metadata only, normally served from the kernel's cache, no file contents), plus two
   cheap repo-wide commands.
 - The graph loads the newest 1000 commits first and loads more as you scroll toward the end.
+- `canopy serve PATH...` is the machine-side half of watching repositories on other machines (coming next): it watches the repositories where they are and talks to another canopy over stdin/stdout, which in practice will be an ssh connection. On its own it is only useful for testing.
 
 ## Development
 

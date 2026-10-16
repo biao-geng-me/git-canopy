@@ -11,10 +11,12 @@ pub mod json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use json::Json;
 
 /// An agent's lifecycle state, ordered by urgency (most urgent last).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AgentState {
     Unknown,
     Idle,
@@ -46,7 +48,7 @@ impl AgentState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub pane_id: String,
     pub workspace_id: String,
@@ -57,7 +59,7 @@ pub struct Agent {
     pub cwd: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub label: String,
@@ -67,7 +69,7 @@ pub struct Workspace {
 }
 
 /// What herdr currently reports.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct View {
     pub agents: Vec<Agent>,
     pub workspaces: Vec<Workspace>,
@@ -244,12 +246,18 @@ pub fn subscribe_request(id: &str, panes: &BTreeSet<String>) -> String {
 }
 
 /// The socket to use: `HERDR_SOCKET_PATH`, else the `HERDR_SESSION` session's socket, else the
-/// default session's (under `~/.config/herdr`).
+/// default session's, both under herdr's config dir (`$XDG_CONFIG_HOME/herdr`, else
+/// `~/.config/herdr`; a node-local `XDG_CONFIG_HOME` is how a shared home keeps one herdr per
+/// machine).
 pub fn socket_path_from(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if let Some(p) = env("HERDR_SOCKET_PATH").filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(p));
     }
-    let config = PathBuf::from(env("HOME").filter(|h| !h.is_empty())?).join(".config/herdr");
+    let config = match env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => PathBuf::from(env("HOME").filter(|h| !h.is_empty())?).join(".config"),
+    }
+    .join("herdr");
     match env("HERDR_SESSION").filter(|s| !s.is_empty()) {
         Some(name) => Some(config.join("sessions").join(name).join("herdr.sock")),
         None => Some(config.join("herdr.sock")),
@@ -502,6 +510,10 @@ mod tests {
         assert_eq!(
             socket_path_from(env(&[("HOME", "/h")])),
             Some(PathBuf::from("/h/.config/herdr/herdr.sock"))
+        );
+        assert_eq!(
+            socket_path_from(env(&[("XDG_CONFIG_HOME", "/tmp/me/xdg"), ("HOME", "/h")])),
+            Some(PathBuf::from("/tmp/me/xdg/herdr/herdr.sock"))
         );
         assert_eq!(socket_path_from(env(&[])), None);
     }

@@ -11,10 +11,15 @@ canopy - live view of every git worktree of a repo
 USAGE:
     canopy [OPTIONS] [PATH...]
     git canopy [OPTIONS] [PATH...]
+    canopy serve [OPTIONS] [PATH...]
 
 ARGS:
     PATH    any directory inside a repository (default: current directory); several watch
             several repositories, listed in that order
+
+    serve   watch the repositories for a canopy on another machine, which runs this over
+            ssh and talks to it on stdin/stdout (-i, --no-poll, --base, --no-watch and
+            --no-herdr apply)
 
 OPTIONS:
     -i, --interval <SECS>   poll interval in seconds for worktrees that can't be watched (default:
@@ -38,6 +43,8 @@ KEYS:
 ";
 
 struct Args {
+    /// `canopy serve`.
+    serve: bool,
     paths: Vec<PathBuf>,
     cfg: Config,
     layout: LayoutMode,
@@ -55,9 +62,14 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut herdr_repos = false;
     let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
     let mut nerd_font = std::env::var("CANOPY_NERD_FONT").is_ok_and(|v| v == "1");
-    let mut it = std::env::args_os().skip(1);
+    let mut it = std::env::args_os().skip(1).peekable();
+    let serve = it.next_if(|a| a == "serve").is_some();
     while let Some(arg) = it.next() {
         let s = arg.to_string_lossy().into_owned();
+        if s == "--" {
+            paths.extend(it.by_ref().map(PathBuf::from));
+            break;
+        }
         let (flag, inline) = match s.split_once('=') {
             Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
             _ => (s.clone(), None),
@@ -106,10 +118,14 @@ fn parse_args() -> Result<Option<Args>, String> {
             _ => paths.push(PathBuf::from(arg)),
         }
     }
+    if serve && herdr_repos {
+        return Err("serve doesn't take --herdr-repos (yet)".to_string());
+    }
     if herdr_repos && !herdr {
         return Err("--herdr-repos needs herdr (drop --no-herdr)".to_string());
     }
     Ok(Some(Args {
+        serve,
         paths,
         cfg,
         layout,
@@ -129,6 +145,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.serve {
+        let paths = if args.paths.is_empty() { vec![PathBuf::from(".")] } else { args.paths };
+        // Errors per path go to the client; this one means the protocol couldn't even start.
+        return match canopy::remote::serve::run(paths, args.cfg, args.herdr) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("canopy serve: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
     let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
     if args.paths.is_empty() {

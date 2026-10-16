@@ -5,10 +5,11 @@
 use std::path::Path;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::{lossy, split_nul};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,
     pub adds: u32,

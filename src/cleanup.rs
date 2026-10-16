@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::git::{self, changes};
 use crate::herdr::{self, AgentState};
@@ -19,7 +20,7 @@ use crate::model::{Landed, WorktreeView};
 const MAX_IGNORED: usize = 200;
 
 /// What removing one worktree will do, for the confirm popup and for [`run`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub common_dir: PathBuf,
     pub path: PathBuf,

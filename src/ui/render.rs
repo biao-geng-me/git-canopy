@@ -286,7 +286,7 @@ fn ab_spans(w: &WorktreeView, base: Option<&str>) -> Vec<Span<'static>> {
     }
     if let Some(op) = w.op {
         out.push(Span::styled(
-            op,
+            op.label(),
             Style::new().fg(C_CONFLICT).add_modifier(Modifier::BOLD),
         ));
     }

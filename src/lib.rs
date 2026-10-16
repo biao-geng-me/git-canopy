@@ -1,7 +1,8 @@
 //! canopy: a live view of every git worktree of a repo.
 //!
 //! Layers: `git` (shelling out + parsers), `model` (snapshot types), `graph` (lane layout),
-//! `watch` (background refresh), `ui` (ratatui front end, renders snapshots only).
+//! `watch` (background refresh), `remote` (`canopy serve` and its wire protocol), `ui` (ratatui front
+//! end, renders snapshots only).
 
 pub mod cleanup;
 pub mod clipboard;
@@ -11,5 +12,6 @@ pub mod git;
 pub mod graph;
 pub mod herdr;
 pub mod model;
+pub mod remote;
 pub mod ui;
 pub mod watch;

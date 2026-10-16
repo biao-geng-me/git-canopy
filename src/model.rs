@@ -6,13 +6,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::git::changes::FileChange;
 use crate::git::refs::{RefEntry, RefKind};
 use crate::git::status::Status;
-use crate::git::worktree::WorktreeEntry;
+use crate::git::worktree::{Operation, WorktreeEntry};
 use crate::graph::Graph;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WorktreeView {
     pub path: PathBuf,
     /// Branch name, or the directory name when detached.
@@ -32,7 +34,7 @@ pub struct WorktreeView {
     pub status: Option<Status>,
     pub status_error: Option<String>,
     /// In-progress operation such as `MERGING` or `REBASING`.
-    pub op: Option<&'static str>,
+    pub op: Option<Operation>,
     /// (ahead, behind) relative to the base branch.
     pub vs_base: Option<(u32, u32)>,
     /// HEAD commit time (unix seconds).
@@ -53,7 +55,7 @@ pub struct WorktreeView {
 }
 
 /// How a worktree's committed work relates to the base branch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Landed {
     /// HEAD is in the base branch (merged or fast-forwarded), after commits of its own.
     Merged,
@@ -188,7 +190,7 @@ pub fn now_secs() -> i64 {
 
 /// What a worktree changed since its merge base with the base branch: committed and
 /// uncommitted changes to tracked files (untracked files aren't counted).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changes {
     pub merge_base: String,
     /// Sorted by path.
@@ -233,7 +235,7 @@ impl Changes {
 
 /// Files a worktree and another worktree (or the base branch) both changed since their
 /// histories split: likely merge conflicts, or two agents doing the same work.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overlap {
     /// The other worktree's name, or the base branch.
     pub with: String,
@@ -302,13 +304,15 @@ pub enum Host {
     Local,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Display name of the repository (main worktree directory).
     pub repo_name: String,
     pub common_dir: PathBuf,
     pub base: Option<String>,
     pub worktrees: Vec<WorktreeView>,
+    /// Not serialized with the rest: the wire (`remote`) sends it only when it changed.
+    #[serde(skip)]
     pub graph: Arc<Graph>,
     /// Whether filesystem events are being watched (otherwise polling only).
     pub watching: bool,
@@ -414,7 +418,7 @@ mod tests {
         assert_eq!(blocked(&|w| w.is_main = true), "the main worktree can't be removed");
         assert_eq!(blocked(&|w| w.is_current = true), "canopy runs in this worktree");
         assert_eq!(blocked(&|w| w.locked = Some(String::new())), "it is locked");
-        assert_eq!(blocked(&|w| w.op = Some("REBASING")), "REBASING in progress");
+        assert_eq!(blocked(&|w| w.op = Some(Operation::Rebasing)), "REBASING in progress");
         assert_eq!(blocked(&|w| w.branch = Some("main".into())), "it has the base branch main checked out");
         assert_eq!(
             blocked(&|w| {

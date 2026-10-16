@@ -46,7 +46,7 @@ fn reads_fixture_state() {
     assert!(status::load(&by("gone").path).is_err());
 
     let admin = worktree::admin_dir(&by("conflict").path).unwrap();
-    assert_eq!(worktree::operation(&admin), Some("MERGING"));
+    assert_eq!(worktree::operation(&admin), Some(canopy::git::worktree::Operation::Merging));
     assert_eq!(worktree::operation(&worktree::admin_dir(&fx.repo()).unwrap()), None);
 
     let (rs, _) = refs::load(&fx.repo()).unwrap();

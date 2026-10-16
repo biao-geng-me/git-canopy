@@ -40,7 +40,7 @@ fn run(watch_fs: bool) {
     assert!(by(&s, "feat-auth").is_dirty());
     assert_eq!(by(&s, "feat-auth").vs_base, Some((2, 0)));
     assert_eq!(by(&s, "fix-parser").vs_base, Some((1, 1)));
-    assert_eq!(by(&s, "conflict").op, Some("MERGING"));
+    assert_eq!(by(&s, "conflict").op, Some(canopy::git::worktree::Operation::Merging));
     assert!(by(&s, "main").is_current);
     assert!(by(&s, "gone").status.is_none());
 

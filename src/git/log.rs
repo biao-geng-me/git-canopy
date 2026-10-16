@@ -3,10 +3,11 @@
 use std::path::Path;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::{lossy, split_nul};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub id: String,
     pub parents: Vec<String>,

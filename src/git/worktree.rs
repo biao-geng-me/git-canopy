@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::{lossy, non_null_oid, split_nul};
 
@@ -95,20 +96,48 @@ pub fn last_used(admin: &Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-/// An in-progress operation (merge, rebase, ...) detected from files in the admin dir.
-pub fn operation(admin: &Path) -> Option<&'static str> {
-    const MARKERS: &[(&str, &str)] = &[
-        ("rebase-merge", "REBASING"),
-        ("rebase-apply", "REBASING"),
-        ("MERGE_HEAD", "MERGING"),
-        ("CHERRY_PICK_HEAD", "PICKING"),
-        ("REVERT_HEAD", "REVERTING"),
-        ("BISECT_LOG", "BISECTING"),
+/// A merge, rebase, ... in progress, as `git status` would say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Operation {
+    Rebasing,
+    Merging,
+    Picking,
+    Reverting,
+    Bisecting,
+}
+
+impl Operation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Operation::Rebasing => "REBASING",
+            Operation::Merging => "MERGING",
+            Operation::Picking => "PICKING",
+            Operation::Reverting => "REVERTING",
+            Operation::Bisecting => "BISECTING",
+        }
+    }
+}
+
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// An in-progress operation detected from files in the admin dir.
+pub fn operation(admin: &Path) -> Option<Operation> {
+    const MARKERS: &[(&str, Operation)] = &[
+        ("rebase-merge", Operation::Rebasing),
+        ("rebase-apply", Operation::Rebasing),
+        ("MERGE_HEAD", Operation::Merging),
+        ("CHERRY_PICK_HEAD", Operation::Picking),
+        ("REVERT_HEAD", Operation::Reverting),
+        ("BISECT_LOG", Operation::Bisecting),
     ];
     MARKERS
         .iter()
         .find(|(file, _)| admin.join(file).exists())
-        .map(|&(_, label)| label)
+        .map(|&(_, op)| op)
 }
 
 #[cfg(test)]

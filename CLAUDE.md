@@ -103,8 +103,10 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 
 - **Transport:** talk to the herdr server directly over its Unix socket with newline-delimited JSON
   (one request per line, responses echo `id`). No shelling out to the `herdr` binary. Socket path:
-  `HERDR_SOCKET_PATH`, else `HERDR_SESSION=<name>` → `~/.config/herdr/sessions/<name>/herdr.sock`, else
-  `~/.config/herdr/herdr.sock`. No socket / connection refused → hidden, retried with backoff.
+  `HERDR_SOCKET_PATH`, else `HERDR_SESSION=<name>` → `<config>/sessions/<name>/herdr.sock`, else
+  `<config>/herdr.sock`, where `<config>` is `$XDG_CONFIG_HOME/herdr` or `~/.config/herdr` (herdr's own
+  rule; a node-local `XDG_CONFIG_HOME` is how a shared home runs one herdr per node, see Remote
+  machines). No socket / connection refused → hidden, retried with backoff.
 - **Reads (protocol 22 / herdr 0.9.3, shapes from `herdr api schema --json`):** `agent.list` →
   `result.agents[]` with `pane_id`, `workspace_id`, `agent`, `name`, `agent_status`
   (`idle|working|blocked|done|unknown`), `cwd`, `foreground_cwd`; `workspace.list` →
@@ -130,7 +132,7 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   since `pane.split` takes no command; Backspace cleanup sends `worktree.remove` for the workspace
   backed by the removed checkout (see Cleanup). canopy never prompts, sends keys to, starts or stops
   agents; the only input it sends goes to a pane it just created.
-- **JSON:** a small hand-written parser (`herdr/json.rs`) instead of serde, to keep dependencies lean.
+- **JSON:** a small hand-written parser (`herdr/json.rs`), written before serde came in for the remote wire; it could move to `serde_json` now.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
   every request opens a fresh connection; only the subscription connection stays open. Tests run the
   client against a fake server on a temporary socket (events, `events_lost`, focus, unreachable); the
@@ -193,7 +195,7 @@ Built (step 1): every `PATH` argument is a repository (deduplicated by common di
 - **Footer/details:** herdr summary across all repos; the details line names the repo when there are
   several.
 
-### Remote machines (planned for 0.5, not built)
+### Remote machines (0.5, step 1 built)
 
 herdr does cross-machine development (saved SSH machines, each with its own herdr server; people pair it with a personal network such as Tailscale). canopy should show every tree in one view, even when the trees are in different forests (clones on different machines). Found on 2026-10-12: an agent orchestrating sub-agents in a herdr on an HPC compute node (gh-b-001) while canopy ran on the login node; the trees were on the shared filesystem, but canopy saw no agents in them (they live in gh-b-001's herdr, whose socket is node-local) and their edits came only with the 10-min fallback (inotify sees only this machine's changes).
 
@@ -201,7 +203,11 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
 - **What that gives for free:** the remote serve talks to *its own machine's* herdr over the local socket (agent markers per machine with the existing client, no dependency on herdr's undocumented `remote-api-bridge`); git and inotify run where the edits happen (~150 ms latency instead of the fallback poll); cleanup is planned, re-verified and run on the owning host.
 - **Two separate concerns:** where git runs (one Worker per (host, common dir)) and where agents live (herdr servers). With separate clones they coincide. On a shared filesystem they don't: one repo, agents from several herdr servers, so a serve must be able to contribute *only agents* for a repo another host owns, and running two Workers on the same repo (double git load, trees shown twice) must be avoided. That needs a repo identity across hosts: canonical common-dir path plus a probe (same refs fingerprint, common dir inode), with a config override where that's unsure. Prefer watching from the host where the agent works (its inotify sees the edits).
 - **Layout:** the repo header row names the host (`three-ux @ gh-b-001`); clones of one origin on several hosts are separate forests grouped together, each with its own graph (merging graphs across clones would need their objects in one place).
-- **Practicalities:** a static musl binary per arch on the remote (installed by the user, or `canopy remote install <host>` copies it, like herdr's `machine add`); a version handshake as the first message; hand-written serialization (no serde) of `Snapshot`, requests and capped/paged diffs; `BatchMode=yes` ssh, never prompting, an unreachable host hidden with backoff like an unreachable herdr. Discovery: `canopy host:path` arguments, optionally herdr's saved machines (`herdr machine list`), and per host the repos its herdr's agents are in (`--herdr-repos`).
+- **Practicalities:** a static musl binary per arch on the remote (installed by the user, or `canopy remote install <host>` copies it, like herdr's `machine add`); a version handshake as the first message; serialization of `Snapshot`, requests and capped/paged diffs (serde, see below); `BatchMode=yes` ssh, never prompting, an unreachable host hidden with backoff like an unreachable herdr. Discovery: `canopy host:path` arguments, optionally herdr's saved machines (`herdr machine list`), and per host the repos its herdr's agents are in (`--herdr-repos`).
+- **Built (step 1, the wire and `canopy serve`):** `remote/` (`mod.rs` protocol, `serve.rs`, `client.rs`). `canopy serve [-i|--no-poll|--base|--no-watch|--no-herdr] [--] PATH...` runs one `watch::Worker` per repository (one `Hub`) and herdr's client, and speaks newline-delimited JSON on stdin/stdout: `ToClient::Hello {protocol, version, host}` first (`PROTOCOL` must match exactly, else the client reports both versions), `Repos` (each path argument → `RepoInfo {id, common_dir}` or its error, sent before any snapshot), then `Snapshot {repo, snap, graph}`, `Herdr(view)` and `Reply {id, result}`; the client sends `ToServer::Request {repo, Refresh|LoadMore}` and `Call {id, repo, Doc|Patch|Message|CleanupPlan|CleanupRun}`, answered by the server's own `watch::Handle`. Closing the client's end stops the server. The graph (`Snapshot::graph` is `#[serde(skip)]`) goes only when its `Arc` changed since the last one sent for that repo, ~365 bytes per commit, so up to ~365 KB on ref moves; graph cells are packed as (chars, colors). The serve moves its protocol fds away from 0/1 (fd 0 → `/dev/null`, fd 1 → stderr), so no child process or stray print can touch the stream. The client (`client::connect(Command, emit)` → `Conn`, `Conn::handle(repo)` → `RemoteHandle` with `watch::Handle`'s methods) skips up to 200 lines of login-script noise before the hello, keeps the last graph per repo, fails pending calls when the connection ends, and reports the end as `Event::Closed` with the server's last stderr lines. `client::ssh(host, args)` builds `ssh -T -o BatchMode=yes -o ServerAliveInterval=15 -- host <shell-quoted args>`, `client::serve_args` the remote command line from a `Config`. Tested with the real binary locally (`tests/remote.rs`: snapshots, calls, graph reuse, noise before hello, protocol mismatch, missing canopy) and live over ssh from tigris to gh-b-001: snapshots plus gh-b-001's herdr agents, which the login node can't see otherwise.
+- **serde (decided with step 1):** `serde` (derive, rc) + `serde_json` for the wire instead of hand-written serialization. syn/quote/proc-macro2 were already built for ratatui (derive_more, strum), so the derive costs little compile time; the release binary grew 1.71 → 1.91 MB. `WorktreeView::op` became `git::worktree::Operation` (a `&'static str` can't be deserialized). Paths must be UTF-8 to cross the wire.
+- **herdr on a shared home (found with step 1):** herdr's socket is `$XDG_CONFIG_HOME/herdr/herdr.sock`, and the user's `~/bin/herdr` wrapper sets `XDG_CONFIG_HOME=/tmp/$USER/xdg/<arch>` (node-local, one server per node). canopy used to ignore `XDG_CONFIG_HOME` (fixed: `herdr::socket_path_from`), but a non-interactive `ssh host canopy serve` still doesn't have it, so its serve sees no herdr: the remote command needs that environment (a per-host remote command or env in step 2, or the user's wrapper).
+- **Next (step 2, UI):** `host:path` arguments; `Host::Ssh(name)`; `Repo::worker` as local `watch::Handle` or `RemoteHandle` (same methods); one `Conn` per host carrying all its repos; per-host herdr views (each host's agents matched against that host's worktrees, the footer summing them); header rows `name @ host`; an unreachable or closed host shown on its header row and retried with backoff; per-host remote program/env. Then the shared-filesystem questions above (agents-only serves, repo identity) and `--herdr-repos` on a serve.
 - **Rejected:** reading other machines' agents through herdr's `remote-api-bridge` (`ssh <host> herdr --session default remote-api-bridge` pipes the normal JSON API, events included; verified with herdr 0.9.3): undocumented, and it fixes only agent markers, not the edit latency.
 
 ## Conventions
@@ -419,7 +425,7 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
 - **Worktree rows show HEAD sha + age, not the subject** (the graph has it). HEAD commit times come
   from one `git log --no-walk=unsorted` over the HEAD shas, cached by sha.
 - **Arg parsing is hand-rolled** (no clap) to keep dependencies to ratatui, notify, anyhow, unicode-width
-  (plus libc and vt100 for the inset shell).
+  (plus libc and vt100 for the inset shell, serde and serde_json for the remote wire).
   ratatui is used with default features off (`crossterm`, `layout-cache`) and its crossterm re-export.
 - **Static binary:** the default glibc build links libc dynamically; `--target x86_64-unknown-linux-musl`
   gives a fully static ~1.2 MB binary (no C deps, works out of the box with rustup's musl target).

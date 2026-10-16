@@ -3,10 +3,11 @@
 use std::path::Path;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::{lossy, non_null_oid, split_nul};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Status {
     /// HEAD commit, `None` on an unborn branch.
     pub oid: Option<String>,

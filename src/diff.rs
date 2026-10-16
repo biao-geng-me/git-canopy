@@ -9,11 +9,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::model::Overlap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     /// A commit, shown from the repository at `dir`.
     Commit { dir: PathBuf, id: String },
@@ -41,7 +42,7 @@ impl Target {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiff {
     pub path: String,
     /// `M`odified, `A`dded, `D`eleted, `R`enamed, `C`opied, `U`nmerged (combined diff), `?` untracked.
@@ -55,7 +56,7 @@ pub struct FileDiff {
     pub cells: Vec<Option<(usize, usize)>>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffDoc {
     /// Everything before the first file: commit header and message, diffstat, untracked list.
     pub overview: Vec<String>,

@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::git::log::Commit;
 use crate::git::refs::{RefEntry, RefKind};
 use crate::model::WorktreeView;
@@ -32,7 +34,7 @@ pub struct Cell {
     pub color: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RowKind {
     /// Index into [`Graph::commits`].
     Commit(usize),
@@ -40,18 +42,42 @@ pub enum RowKind {
     Uncommitted(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub kind: RowKind,
+    #[serde(with = "packed_cells")]
     pub cells: Vec<Cell>,
     /// The lanes continuing below this row (`│` per open lane), for drawing content that is
     /// inserted between this row and the next.
+    #[serde(with = "packed_cells")]
     pub below: Vec<Cell>,
     /// Lane color of the row's node (its labels use it too).
     pub color: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Cells as their characters and their colors, `("│ ●", [0, 255, 1])`: a third of the size of
+/// one object per cell, which matters for a graph of a thousand rows sent over ssh.
+mod packed_cells {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Cell;
+
+    pub fn serialize<S: Serializer>(cells: &[Cell], s: S) -> Result<S::Ok, S::Error> {
+        let chars: String = cells.iter().map(|c| c.ch).collect();
+        let colors: Vec<u8> = cells.iter().map(|c| c.color).collect();
+        (chars, colors).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Cell>, D::Error> {
+        let (chars, colors) = <(String, Vec<u8>)>::deserialize(d)?;
+        if chars.chars().count() != colors.len() {
+            return Err(serde::de::Error::custom("graph cells: characters and colors differ in length"));
+        }
+        Ok(chars.chars().zip(colors).map(|(ch, color)| Cell { ch, color }).collect())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LabelKind {
     /// A worktree's HEAD; text is the worktree name (its branch, or directory when detached).
     Worktree,
@@ -60,13 +86,13 @@ pub enum LabelKind {
     Tag,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Label {
     pub kind: LabelKind,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Graph {
     pub commits: Arc<Vec<Commit>>,
     pub rows: Vec<Row>,

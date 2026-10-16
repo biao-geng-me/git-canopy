@@ -117,7 +117,7 @@ impl Default for Config {
 }
 
 /// Requests from the UI.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Request {
     Refresh,
     LoadMore,
