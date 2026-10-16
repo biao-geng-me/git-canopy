@@ -3,7 +3,8 @@
 # target/release/canopy, and a post-commit hook rebuilds it in the background after every commit,
 # so the installed canopy always runs the latest commit. Re-running is harmless.
 # CANOPY_BIN_DIR overrides ~/.local/bin (e.g. a per-arch bin dir when $HOME is shared by
-# machines of different architectures).
+# machines of different architectures). Where sbatch and ~/sw/x86_64/cargo exist (RIT RC), the
+# hook also submits scripts/build-x86.sh for the x86_64 cluster.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -23,6 +24,10 @@ mkdir -p target
   # Hooks may run without cargo on PATH: use the one found at install time.
   "\$(command -v cargo || echo '$CARGO')" build --release >target/post-commit-build.log 2>&1
 ) 9>target/.post-commit-build.lock </dev/null >/dev/null 2>&1 &
+# RIT RC: \$HOME is shared with the x86_64 sporc cluster; rebuild its binary there too.
+if command -v sbatch >/dev/null && [ -d "\$HOME/sw/x86_64/cargo" ]; then
+  scripts/build-x86.sh </dev/null >/dev/null 2>&1 &
+fi
 HOOK
 chmod +x "$HOOK"
 "$CARGO" build --release
