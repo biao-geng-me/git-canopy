@@ -252,6 +252,13 @@ pub struct App {
     pub active: usize,
     /// What each base row of the worktree list is (its `VLine::Row` indexes this).
     pub wt_rows: Vec<WtRef>,
+    /// Repositories whose worktrees are folded into their header row (by `Key::Repo`).
+    pub folded: std::collections::HashSet<Key>,
+    /// Repositories whose initial fold was decided (see [`App::decide_fold`]); from then on only
+    /// the user folds and unfolds, so rows never move under the cursor by themselves.
+    fold_decided: std::collections::HashSet<Key>,
+    /// `f`: only worktrees with something going on (see [`App::is_active`]).
+    pub active_only: bool,
     /// Pending "show this worktree in the graph" request, applied at render time (needs height).
     pub graph_jump: Option<PathBuf>,
     pub diff: Option<DiffView>,
@@ -504,6 +511,9 @@ impl App {
             ssh: std::env::var_os("CANOPY_SSH").unwrap_or_else(|| "ssh".into()),
             active: 0,
             wt_rows: Vec::new(),
+            folded: Default::default(),
+            fold_decided: Default::default(),
+            active_only: false,
             graph_jump: None,
             diff: None,
             help: false,
@@ -784,8 +794,11 @@ impl App {
             remote::Event::Herdr(view) => {
                 let host = Host::Ssh(host);
                 rm.herdr = view.map(|v| Arc::new(Arc::unwrap_or_clone(v).on(&host)));
+                let line = self.line_id(Focus::Worktrees);
                 self.map_agents();
                 self.discover_remote(ri);
+                self.rebuild();
+                self.relocate(Focus::Worktrees, line);
             }
             remote::Event::Touched(id, paths) => {
                 // A mirror's file events: the repository's own worker acts on them.
@@ -1141,6 +1154,129 @@ impl App {
         self.remotes.iter().find(|x| x.host == h)
     }
 
+    /// Repository `r`'s identity as a worktree-list row.
+    fn repo_key(&self, r: usize) -> Option<Key> {
+        let repo = self.repos.get(r)?;
+        Some(Key::Repo(repo.host.clone(), repo.common_dir.clone()))
+    }
+
+    /// Whether repository `r`'s worktrees are folded into its header (only with headers).
+    pub fn is_folded(&self, r: usize) -> bool {
+        self.headers() && self.repo_key(r).is_some_and(|k| self.folded.contains(&k))
+    }
+
+    /// Whether something is going on in worktree `wi` of repository `r`: uncommitted changes,
+    /// an operation in progress, an agent working, blocked or done (its work to review), or no
+    /// status yet.
+    pub fn is_active(&self, r: usize, wi: usize) -> bool {
+        let Some(w) = self.repos.get(r).and_then(|x| x.snap.worktrees.get(wi)) else { return false };
+        let agent = self
+            .agent_activity_in(r, wi)
+            .is_some_and(|a| matches!(a.state, herdr::AgentState::Working | herdr::AgentState::Blocked | herdr::AgentState::Done));
+        (w.has_worktree() && w.status.is_none()) || w.is_dirty() || w.op.is_some() || agent
+    }
+
+    /// Fold or unfold repository `r`, keeping the cursor on its header when its rows go.
+    fn set_folded(&mut self, r: usize, fold: bool) {
+        let Some(key) = self.repo_key(r) else { return };
+        self.fold_decided.insert(key.clone());
+        if fold == self.folded.contains(&key) {
+            return;
+        }
+        let inside = self
+            .wt
+            .lines
+            .get(self.wt.pos.sel)
+            .and_then(|l| self.wt_ref(l.row()))
+            .is_some_and(|x| x.repo() == r);
+        let line = self.line_id(Focus::Worktrees);
+        if fold {
+            self.folded.insert(key.clone());
+        } else {
+            self.folded.remove(&key);
+        }
+        self.rebuild();
+        if fold && inside {
+            if let Some(i) = self.wt_rows.iter().position(|&x| x == WtRef::Header(r))
+                && let Some(idx) = inset::index_of_row(&self.wt.lines, i)
+            {
+                self.set_cursor(Focus::Worktrees, idx);
+            }
+        } else {
+            self.relocate(Focus::Worktrees, line);
+        }
+    }
+
+    /// A repository's first fold, once its statuses and its herdr agents are in: folded when
+    /// nothing is busy there (uncommitted changes, an operation, an agent working or blocked;
+    /// finished agents show in the header), unless the cursor is on one of its worktrees.
+    /// Decided once per repository. Without a reachable herdr it stays open.
+    fn decide_fold(&mut self, r: usize) {
+        let Some(key) = self.repo_key(r) else { return };
+        let repo = &self.repos[r];
+        let agents_in = !self.with_herdr || repo.view.is_some();
+        if !self.headers() || !repo.snap.statuses_loaded || !agents_in || self.fold_decided.contains(&key) {
+            return;
+        }
+        self.fold_decided.insert(key.clone());
+        let on_its_tree = self
+            .wt
+            .lines
+            .get(self.wt.pos.sel)
+            .and_then(|l| self.wt_ref(l.row()))
+            .is_some_and(|x| matches!(x, WtRef::Tree(xr, _) if xr == r));
+        let busy = (0..repo.snap.worktrees.len()).any(|wi| {
+            let w = &repo.snap.worktrees[wi];
+            let agent = self
+                .agent_activity_in(r, wi)
+                .is_some_and(|a| matches!(a.state, herdr::AgentState::Working | herdr::AgentState::Blocked));
+            (w.has_worktree() && w.status.is_none()) || w.is_dirty() || w.op.is_some() || agent
+        });
+        if !busy && !on_its_tree {
+            self.folded.insert(key);
+        }
+    }
+
+    /// `n`: the next worktree (after the selection, wrapping) whose agent needs the user:
+    /// blocked, else done. Unfolds its repository and shows it in the graph.
+    fn next_attention(&mut self) {
+        let all: Vec<(usize, usize)> = (0..self.repos.len())
+            .flat_map(|r| (0..self.repos[r].snap.worktrees.len()).map(move |wi| (r, wi)))
+            .collect();
+        let here = self.wt.lines.get(self.wt.pos.sel).and_then(|l| self.wt_ref(l.row()));
+        let start = match here {
+            Some(WtRef::Tree(r, wi)) => all.iter().position(|&x| x == (r, wi)).map_or(0, |i| i + 1),
+            Some(WtRef::Header(r)) => all.iter().position(|&(x, _)| x == r).unwrap_or(0),
+            None => 0,
+        };
+        let order = all[start..].iter().chain(&all[..start]).copied();
+        let state = |&(r, wi): &(usize, usize)| self.agent_activity_in(r, wi).map(|a| a.state);
+        let found = [herdr::AgentState::Blocked, herdr::AgentState::Done]
+            .into_iter()
+            .find_map(|want| order.clone().find(|x| state(x) == Some(want)));
+        let Some((r, wi)) = found else {
+            self.notice = Some("no agent is blocked or done".into());
+            return;
+        };
+        self.set_folded(r, false);
+        if let Some(i) = self.wt_rows.iter().position(|&x| x == WtRef::Tree(r, wi))
+            && let Some(idx) = inset::index_of_row(&self.wt.lines, i)
+        {
+            self.focus = Focus::Worktrees;
+            self.set_cursor(Focus::Worktrees, idx);
+            self.follow_wt_selection();
+            self.jump_graph_to_selected();
+        }
+    }
+
+    /// The repository whose header is the selected worktree-list line, if it is one.
+    fn selected_header(&self) -> Option<usize> {
+        match self.wt_ref(self.wt.lines.get(self.wt.pos.sel)?.row())? {
+            WtRef::Header(r) => Some(r),
+            WtRef::Tree(..) => None,
+        }
+    }
+
     /// Whether the worktree list has a header row per repository: with several, or with any on
     /// another machine (its header says which, and whether it is connected).
     pub fn headers(&self) -> bool {
@@ -1376,13 +1512,25 @@ impl App {
     /// Only the graph expands; the worktree panel is a plain list.
     fn rebuild(&mut self) {
         let headers = self.headers();
-        self.wt_rows = Vec::new();
+        let mut rows = Vec::new();
         for (r, repo) in self.repos.iter().enumerate() {
-            if headers {
-                self.wt_rows.push(WtRef::Header(r));
+            let trees: Vec<usize> = (0..repo.snap.worktrees.len())
+                .filter(|&wi| !self.active_only || self.is_active(r, wi))
+                .collect();
+            if !headers {
+                rows.extend(trees.into_iter().map(|wi| WtRef::Tree(r, wi)));
+                continue;
             }
-            self.wt_rows.extend((0..repo.snap.worktrees.len()).map(|wi| WtRef::Tree(r, wi)));
+            // The filter hides a repository with nothing going on (once it has loaded).
+            if self.active_only && trees.is_empty() && !repo.snap.worktrees.is_empty() {
+                continue;
+            }
+            rows.push(WtRef::Header(r));
+            if !self.is_folded(r) {
+                rows.extend(trees.into_iter().map(|wi| WtRef::Tree(r, wi)));
+            }
         }
+        self.wt_rows = rows;
         let wt = &mut self.wt;
         wt.lines = (0..self.wt_rows.len()).map(VLine::Row).collect();
         wt.pos.clamp(wt.lines.len());
@@ -1668,9 +1816,13 @@ impl App {
                 self.relocate(Focus::Graph, ids.1);
             }
             UiMsg::Herdr(view) => {
+                let line = self.line_id(Focus::Worktrees);
                 self.herdr = view;
                 self.map_agents();
                 self.discover_repos();
+                // Folds and the active-only filter depend on agents.
+                self.rebuild();
+                self.relocate(Focus::Worktrees, line);
             }
             UiMsg::Discovered(found) => {
                 if let Some(d) = &mut self.discovery {
@@ -1782,6 +1934,7 @@ impl App {
         } else if let Some(repo) = self.repos.get_mut(r) {
             repo.snap = s;
             self.map_agents();
+            self.decide_fold(r);
             self.refresh_docs();
             self.rebuild();
             self.relocate(Focus::Worktrees, ids.0);
@@ -1797,6 +1950,7 @@ impl App {
         self.snap = snap;
         let others_changed = others_before != self.overlap_side_stamps();
         self.map_agents();
+        self.decide_fold(self.active);
         self.refresh_docs();
         self.rebuild();
 
@@ -1855,6 +2009,13 @@ impl App {
     /// Each repository's view is its host's herdr plus its mirrors' hosts' (a shared filesystem:
     /// agents of several machines in the same trees).
     fn map_agents(&mut self) {
+        self.map_agents_only();
+        for r in 0..self.repos.len() {
+            self.decide_fold(r);
+        }
+    }
+
+    fn map_agents_only(&mut self) {
         let views: Vec<Option<Arc<herdr::View>>> = self
             .repos
             .iter()
@@ -2045,6 +2206,27 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('r') => self.repos.iter().for_each(|r| r.worker.request(Request::Refresh)),
             KeyCode::Char('a') => self.focus_agent(),
+            KeyCode::Char('n') => self.next_attention(),
+            KeyCode::Char('f') => {
+                let line = self.line_id(Focus::Worktrees);
+                self.active_only = !self.active_only;
+                self.rebuild();
+                self.relocate(Focus::Worktrees, line);
+                self.follow_wt_selection();
+            }
+            // On a repository header: fold and unfold its worktrees.
+            KeyCode::Char(' ') | KeyCode::Enter if f == Focus::Worktrees && self.selected_header().is_some() => {
+                if let Some(r) = self.selected_header() {
+                    self.set_folded(r, !self.is_folded(r));
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Left | KeyCode::Char('h')
+                if f == Focus::Worktrees && self.selected_header().is_some() =>
+            {
+                if let Some(r) = self.selected_header() {
+                    self.set_folded(r, matches!(k.code, KeyCode::Left | KeyCode::Char('h')));
+                }
+            }
             KeyCode::Char('s') => {
                 if let Some(w) = self.focused_worktree() {
                     self.open_shell_here(w.path.clone(), None);
@@ -2172,6 +2354,12 @@ impl App {
     /// anything changed.
     fn toggle_at(&mut self, f: Focus, line: usize) -> bool {
         if f == Focus::Worktrees {
+            // Only repository headers toggle (folding); worktree rows act on the graph.
+            let header = self.wt.lines.get(line).and_then(|l| self.wt_ref(l.row()));
+            if let Some(WtRef::Header(r)) = header {
+                self.set_folded(r, !self.is_folded(r));
+                return true;
+            }
             return false;
         }
         let Some(&l) = self.panel(f).lines.get(line) else {
@@ -2626,6 +2814,8 @@ impl App {
                 } else {
                     let toggled = if !selected {
                         None
+                    } else if f == Focus::Worktrees && self.selected_header().is_some() {
+                        self.toggle_at(f, idx).then_some((f, idx))
                     } else if f == Focus::Worktrees {
                         // Like Space in the list: act on the worktree's row in the graph.
                         let on_row = self.graph_cursor_to_selected_worktree();
@@ -3303,6 +3493,62 @@ mod tests {
         assert!(log.contains(r#"{"Unwatch":{"repo":0}}"#), "{log}");
         drop(app);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folding_filter_and_next_blocked() {
+        let mut app = test_app();
+        // No herdr to wait for before the first fold.
+        app.with_herdr = false;
+        app.add_repo(paths("a"), false);
+        app.add_repo(paths("b"), false);
+        let wt = |path: &str, dirty: bool| crate::model::WorktreeView {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            status: Some(crate::git::status::Status {
+                modified: dirty as u32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snap = |worktrees| {
+            Arc::new(Snapshot {
+                statuses_loaded: true,
+                worktrees,
+                ..Default::default()
+            })
+        };
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // a is busy (changes) and stays open; b, quiet, starts folded.
+        app.on_repo_snapshot(0, snap(vec![wt("/w/a", true), wt("/w/a-x", false)]));
+        app.on_repo_snapshot(1, snap(vec![wt("/w/b", false)]));
+        assert_eq!(app.wt_rows, [WtRef::Header(0), WtRef::Tree(0, 0), WtRef::Tree(0, 1), WtRef::Header(1)]);
+        // Space on a header folds it; the cursor stays on the header.
+        app.set_cursor(Focus::Worktrees, 0);
+        app.on_key(key(' '));
+        assert_eq!(app.wt_rows, [WtRef::Header(0), WtRef::Header(1)]);
+        assert_eq!(app.selected_header(), Some(0));
+        // Later activity doesn't unfold anything by itself.
+        app.on_repo_snapshot(1, snap(vec![wt("/w/b", true)]));
+        assert!(app.is_folded(1));
+
+        // An agent blocked in b: `n` unfolds b and selects that worktree.
+        let mut v = Arc::unwrap_or_clone(view(&["/w/b"], &[]).unwrap());
+        v.agents[0].state = herdr::AgentState::Blocked;
+        app.herdr = Some(Arc::new(v));
+        app.map_agents();
+        app.on_key(key('n'));
+        assert!(!app.is_folded(1));
+        assert_eq!(app.selected_worktree().map(|w| w.path.clone()), Some(PathBuf::from("/w/b")));
+        assert_eq!(app.active, 1);
+
+        // `f`: only active worktrees (a's dirty one stays, folded inside its header).
+        app.on_repo_snapshot(0, snap(vec![wt("/w/a", false), wt("/w/a-x", false)]));
+        app.on_key(key('f'));
+        assert_eq!(app.wt_rows, [WtRef::Header(1), WtRef::Tree(1, 0)], "a has nothing active: gone");
+        assert_eq!(app.selected_worktree().map(|w| w.path.clone()), Some(PathBuf::from("/w/b")));
+        app.on_key(key('f'));
+        assert_eq!(app.wt_rows.len(), 3, "a folded, b open again");
     }
 
     #[test]

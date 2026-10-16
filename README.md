@@ -129,6 +129,8 @@ canopy remote install HOST [--dir DIR] [--binary FILE]
 
 `canopy ~/a ~/b` watches both. The worktree list groups each repository's worktrees under a header row (name, base branch, worktree and dirty counts, blocked agents), and the graph shows the repository of the selected row: moving the selection into another repository switches the graph, which keeps its own cursor and expanded rows for each. Paths inside the same repository count once. With one repository there are no header rows.
 
+With several repositories the list folds: each header row (`▸ three-ux · base main · 13 worktrees  ◆1 ▶2 ✓8  ✎ 1  ⌫ 3`) sums up its agents by state, its dirty and its cleanable worktrees, so a folded repository still says what is going on. `Space`, `Enter` or a click on a selected header folds and unfolds it, `←`/`→` fold/unfold. A repository starts folded when nothing is busy in it (no uncommitted changes, no agent working or blocked); after that only you fold and unfold, so rows never move under the cursor by themselves. `n` jumps to the next worktree whose agent is blocked (else one that is done), unfolding its repository, and `f` shows only active worktrees (changes, an agent working, blocked or done), hiding repositories with none.
+
 `canopy --herdr-repos` also watches every repository that a herdr agent works in or a herdr workspace is checked out in, so one canopy follows all your agents without listing their projects. Repositories appear as agents start in them and are dropped two minutes after their last agent and workspace are gone (repositories named on the command line always stay). Without a `PATH` it starts with the current directory's repository if there is one, else empty until herdr names one.
 
 ### Other machines
@@ -156,6 +158,9 @@ On a shared filesystem (an HPC cluster's home, NFS) the same repository can be n
 | `Tab` | switch between the graph, the worktree list and the shell (when one is open) |
 | `v` | stacked / side-by-side layout |
 | `a`, double-click an agent marker | herdr: jump to the worktree's agent pane |
+| `n` | next worktree whose agent is blocked (else done); unfolds its repository |
+| `f` | only active worktrees: uncommitted changes, an agent working, blocked or done |
+| `Space`/`Enter`/`←`/`→` on a repository header | fold / unfold its worktrees |
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
 | `t` | open a git TUI (lazygit, gitui, tig) in that worktree, like a shell |
 | `Backspace` | clean up a `⌫` worktree: remove its checkout, its branch and its herdr workspace, after confirming (see below) |

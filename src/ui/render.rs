@@ -395,12 +395,17 @@ fn wt_rows(app: &App, wide: bool) -> Vec<Option<WtRow>> {
         .collect()
 }
 
-/// A repository's header row in the worktree list: `three-ux · base main · 4 worktrees ✎ 1`.
+/// A repository's header row in the worktree list:
+/// `▸ three-ux · base main · 4 worktrees  ◆1 ▶2 ✓1  ✎ 1  ⌫ 2`, enough to read while folded.
 fn repo_header(app: &App, r: usize) -> Line<'static> {
     let repo = &app.repos[r];
     let snap = &repo.snap;
     let dim = Style::new().fg(C_DIM);
-    let mut spans = vec![Span::styled(app.repo_label(r), Style::new().add_modifier(Modifier::BOLD))];
+    let fold = if app.is_folded(r) { "▸ " } else { "▾ " };
+    let mut spans = vec![
+        Span::styled(fold, dim),
+        Span::styled(app.repo_label(r), Style::new().add_modifier(Modifier::BOLD)),
+    ];
     if let Some(b) = &snap.base {
         spans.push(Span::styled(format!(" · base {b}"), dim));
     }
@@ -433,16 +438,26 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
             dim,
         ));
     }
+    // Agents by state, most urgent first, in the worktree rows' glyphs and colors.
+    let mut agents: Vec<Span<'static>> = Vec::new();
+    for state in [AgentState::Blocked, AgentState::Working, AgentState::Done, AgentState::Idle] {
+        let n = app.repo_agents_in_state(r, state);
+        if n > 0 {
+            let act = herdr::Activity { state, count: 1 };
+            let glyph = agent_spans(act, false).remove(0);
+            let sep = if agents.is_empty() { "  " } else { " " };
+            agents.push(Span::raw(sep));
+            agents.push(Span::styled(format!("{}{n}", glyph.content), glyph.style));
+        }
+    }
+    spans.extend(agents);
     let dirty = snap.worktrees.iter().filter(|w| w.is_dirty()).count();
     if dirty > 0 {
         spans.push(Span::styled(format!("  ✎ {dirty}"), Style::new().fg(C_MODIFIED)));
     }
-    let blocked = app.repo_agents_in_state(r, AgentState::Blocked);
-    if blocked > 0 {
-        spans.push(Span::styled(
-            format!("  ◆ {blocked} blocked"),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
+    let cleanable = (0..snap.worktrees.len()).filter(|&wi| app.cleanup_in(r, wi) != Cleanup::No).count();
+    if cleanable > 0 {
+        spans.push(Span::styled(format!("  {CLEANUP_GLYPH} {cleanable}"), Style::new().fg(Color::Green)));
     }
     Line::from(spans)
 }
@@ -714,6 +729,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let mut title = vec![Span::raw(" worktrees ")];
     if app.repos.len() > 1 {
         title.push(Span::styled(format!("{} repos · ", app.repos.len()), Style::new().fg(C_DIM)));
+    }
+    if app.active_only {
+        title.push(Span::styled("active only (f) · ", Style::new().fg(Color::Cyan)));
     }
     if n > 0 {
         title.push(Span::styled(format!("{n} "), Style::new().fg(C_DIM)));
@@ -1948,11 +1966,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         .focused_wi()
         .and_then(|wi| app.snap.worktrees.get(wi))
         .is_some_and(|w| !w.overlaps.is_empty());
-    let o_hint = if overlaps {
+    let mut o_hint = if overlaps {
         vec![key("o"), text(" overlaps  ")]
     } else {
         Vec::new()
     };
+    // `n` only while an agent waits for the user.
+    if app.agents_in_state(AgentState::Blocked) > 0 {
+        o_hint.extend([key("n"), text(" next blocked  ")]);
+    }
     let left = Line::from(
         vec![
             Span::raw(" "),
@@ -2022,6 +2044,9 @@ const HELP: &[(&str, &str)] = &[
     ("Tab", "switch panel"),
     ("v", "stacked / side-by-side layout"),
     ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
+    ("n", "next worktree whose agent is blocked (else done)"),
+    ("f", "only active worktrees (changes, busy or done agents)"),
+    ("Space → ←  on a repo", "fold / unfold its worktrees (quiet repos start folded)"),
     ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
     ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
     ("b", "diff vs base: all changes since the fork"),
