@@ -152,7 +152,7 @@ fn read_loop(stdout: impl Read, pending: &PendingMap, emit: &dyn Fn(Event)) -> S
                 if protocol != PROTOCOL {
                     return format!(
                         "canopy {version} on {host} speaks protocol {protocol}, this canopy {PROTOCOL}: \
-                         install the same version on both"
+                         install this one there with `canopy remote install <host>`"
                     );
                 }
                 emit(Event::Hello {
@@ -220,18 +220,37 @@ impl Conn {
     /// Send `call` for repository `repo`; `reply` gets the answer, or the reason there won't be
     /// one.
     fn call(&self, repo: u64, call: Call, reply: Pending) {
+        self.ask(|id| ToServer::Call { id, repo, call }, reply);
+    }
+
+    /// Send the request `msg(id)` makes; `reply` gets the answer carrying that id.
+    fn ask(&self, msg: impl FnOnce(u64) -> ToServer, reply: Pending) {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         match self.0.pending.lock().unwrap().as_mut() {
             Some(p) => p.insert(id, reply),
             None => return reply(Err("the connection is closed".into())),
         };
-        let sent = send(&mut *self.0.stdin.lock().unwrap(), &ToServer::Call { id, repo, call });
+        let sent = send(&mut *self.0.stdin.lock().unwrap(), &msg(id));
         if let Err(e) = sent {
             let reply = self.0.pending.lock().unwrap().as_mut().and_then(|p| p.remove(&id));
             if let Some(reply) = reply {
                 reply(Err(format!("sending to the server: {e}")));
             }
         }
+    }
+
+    /// Which repositories `dirs` are in there (`--herdr-repos`); found ones get ids.
+    pub fn discover(&self, dirs: Vec<PathBuf>, reply: Reply<Vec<(PathBuf, Option<RepoInfo>)>>) {
+        let found = |a: Answer| match a {
+            Answer::Found(f) => Some(f),
+            _ => None,
+        };
+        self.ask(|id| ToServer::Discover { id, dirs }, expect(reply, found));
+    }
+
+    /// Stop watching repository `repo` there.
+    pub fn unwatch(&self, repo: u64) {
+        let _ = send(&mut *self.0.stdin.lock().unwrap(), &ToServer::Unwatch { repo });
     }
 
     /// Requests for repository `repo` of this server, as a `watch::Handle` takes them.

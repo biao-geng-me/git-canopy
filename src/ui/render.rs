@@ -1340,6 +1340,24 @@ fn herdr_summary(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
+/// `⚠ gh-b-001 down · ` for remote hosts that aren't connected (their header rows say why; a
+/// host with nothing found yet has none).
+fn hosts_down(app: &App) -> Vec<Span<'static>> {
+    let down: Vec<&str> = app
+        .remotes
+        .iter()
+        .filter(|x| matches!(x.state, RemoteState::Down { .. }))
+        .map(|x| x.host.as_str())
+        .collect();
+    if down.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(format!("⚠ {} down", down.join(", ")), Style::new().fg(C_CONFLICT)),
+        Span::styled(" · ", Style::new().fg(C_DIM)),
+    ]
+}
+
 /// Footer summary of how the view stays fresh: `watching 8/9 · poll 60s`, `no poll`, ….
 fn refresh_mode(app: &App) -> String {
     let all = || app.repos.iter().flat_map(|r| r.snap.worktrees.iter());
@@ -1967,7 +1985,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     );
     let left_width = left.width();
     f.render_widget(Paragraph::new(left), hints);
-    let mut right = herdr_summary(app);
+    let mut right = hosts_down(app);
+    right.extend(herdr_summary(app));
     right.push(Span::styled(refresh_mode(app), Style::new().fg(C_DIM)));
     if left_width + spans_width(&right) < hints.width as usize {
         f.render_widget(Paragraph::new(Line::from(right).right_aligned()), hints);

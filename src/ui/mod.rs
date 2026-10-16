@@ -42,6 +42,13 @@ pub enum UiMsg {
     Input(Event),
     /// A new snapshot of the repository with id `.0` (`Repo::id`).
     Snapshot(u64, Arc<Snapshot>),
+    /// Remote host `host` (connection attempt `attempt`) said which repositories the directories
+    /// its herdr reported are in.
+    RemoteFound {
+        host: String,
+        attempt: u64,
+        found: Result<Vec<(PathBuf, Option<crate::remote::RepoInfo>)>, String>,
+    },
     /// News from the server of remote host `host`, connection attempt number `attempt`.
     Remote {
         host: String,
@@ -396,17 +403,23 @@ impl Worker {
 /// `Repo::mirrors`): watched there with `Mode::Events`.
 pub struct Mirror {
     pub host: String,
-    /// Index into its host's `Remote::paths`.
-    arg: usize,
+    /// Index into its host's `Remote::paths`; `None` when its herdr's agents named it.
+    arg: Option<usize>,
     /// The server's id for it, and its calls (`None` while disconnected).
     id: Option<u64>,
     handle: Option<RemoteHandle>,
+    common_dir: PathBuf,
+    identity: Option<String>,
+    /// Found through its host's herdr (`--herdr-repos`): dropped after [`HERDR_REPO_GRACE`]
+    /// without agents or workspaces there.
+    from_herdr: bool,
+    unseen_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RemoteSlot {
-    /// Index into its host's `Remote::paths`.
-    arg: usize,
+    /// Index into its host's `Remote::paths`; `None` when its herdr's agents named it.
+    arg: Option<usize>,
     /// The server's id for the repository, once it answered.
     id: Option<u64>,
 }
@@ -425,6 +438,10 @@ pub struct Remote {
     /// Where its herdr creates worktrees.
     herdr_dir: Option<PathBuf>,
     backoff: Duration,
+    /// `--herdr-repos` there: which repository each directory its herdr reported is in, by
+    /// the server's ids (so forgotten on reconnecting), and the directories being looked up.
+    found: HashMap<PathBuf, Option<crate::remote::RepoInfo>>,
+    asked: std::collections::HashSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -663,7 +680,7 @@ impl App {
                 snap: Arc::new(Snapshot::default()),
                 name,
                 worker: Worker::Remote(None),
-                remote: Some(RemoteSlot { arg, id: None }),
+                remote: Some(RemoteSlot { arg: Some(arg), id: None }),
                 error: None,
                 identity: None,
                 mirrors: Vec::new(),
@@ -684,6 +701,8 @@ impl App {
             herdr: None,
             herdr_dir: None,
             backoff: RETRY_MIN,
+            found: HashMap::new(),
+            asked: Default::default(),
         });
         self.connect(self.remotes.len() - 1);
     }
@@ -717,14 +736,24 @@ impl App {
             retry: Instant::now() + rm.backoff,
         };
         rm.backoff = (rm.backoff * 2).min(RETRY_MAX);
+        // The server's ids die with the connection; herdr-found repositories get new ones
+        // when its herdr names them again (command-line ones with the next `Repos`).
+        rm.found.clear();
+        rm.asked.clear();
         let name = rm.host.clone();
         let host = Host::Ssh(name.clone());
         for repo in &mut self.repos {
             if repo.host == host {
                 repo.worker = Worker::Remote(None);
+                if let Some(slot) = repo.remote.as_mut().filter(|s| s.arg.is_none()) {
+                    slot.id = None;
+                }
             }
             for m in repo.mirrors.iter_mut().filter(|m| m.host == name) {
                 m.handle = None;
+                if m.arg.is_none() {
+                    m.id = None;
+                }
             }
         }
         self.map_agents();
@@ -756,6 +785,7 @@ impl App {
                 let host = Host::Ssh(host);
                 rm.herdr = view.map(|v| Arc::new(Arc::unwrap_or_clone(v).on(&host)));
                 self.map_agents();
+                self.discover_remote(ri);
             }
             remote::Event::Touched(id, paths) => {
                 // A mirror's file events: the repository's own worker acts on them.
@@ -793,8 +823,8 @@ impl App {
 
         // Mirrors stay mirrors (reconnecting).
         for repo in &mut self.repos {
-            for m in repo.mirrors.iter_mut().filter(|m| m.host == name) {
-                match answers.get(m.arg) {
+            for m in repo.mirrors.iter_mut().filter(|m| m.host == name && m.arg.is_some()) {
+                match m.arg.and_then(|a| answers.get(a)) {
                     Some(Ok(info)) if !seen.contains(&info.id) => {
                         seen.push(info.id);
                         m.id = Some(info.id);
@@ -813,7 +843,7 @@ impl App {
         let mut mirrored: Vec<(u64, usize, Mirror)> = Vec::new();
         for (r, repo) in self.repos.iter().enumerate() {
             let Some(slot) = repo.remote.filter(|_| repo.host == host) else { continue };
-            let Some(Ok(info)) = answers.get(slot.arg) else { continue };
+            let Some(Ok(info)) = slot.arg.and_then(|a| answers.get(a)) else { continue };
             if seen.contains(&info.id) {
                 drop.push(repo.id);
                 continue;
@@ -830,6 +860,10 @@ impl App {
                     arg: slot.arg,
                     id: Some(info.id),
                     handle: handle(info.id),
+                    common_dir: info.common_dir.clone(),
+                    identity: info.identity.clone(),
+                    from_herdr: false,
+                    unseen_since: None,
                 };
                 mirrored.push((repo.id, owner, m));
             }
@@ -847,7 +881,7 @@ impl App {
             if drop.contains(&repo.id) {
                 continue;
             }
-            match answers.get(slot.arg) {
+            match slot.arg.and_then(|a| answers.get(a)) {
                 Some(Ok(info)) => {
                     slot.id = Some(info.id);
                     if repo.common_dir != info.common_dir {
@@ -880,7 +914,6 @@ impl App {
     /// grace) takes its place: a repository of its own again, watched in full on its host.
     fn promote(&mut self, m: Mirror) {
         let Some(rm) = self.remotes.iter().find(|x| x.host == m.host) else { return };
-        let path = rm.paths.get(m.arg).cloned().unwrap_or_default();
         if let (Some(id), Some(conn)) = (m.id, &rm.conn) {
             conn.watch(id, crate::remote::Mode::Full);
         }
@@ -888,20 +921,20 @@ impl App {
         self.push_repo(Repo {
             id,
             host: Host::Ssh(m.host),
-            common_dir: PathBuf::from(&path),
+            name: repo_name(&m.common_dir),
+            common_dir: m.common_dir,
             snap: Arc::new(Snapshot::default()),
-            name: repo_name(Path::new(&path)),
             worker: Worker::Remote(m.handle),
             remote: Some(RemoteSlot { arg: m.arg, id: m.id }),
             error: None,
-            identity: None,
+            identity: m.identity,
             mirrors: Vec::new(),
             view: None,
             agents: Vec::new(),
             graph: Panel::default(),
             more_requested_at: 0,
-            from_herdr: false,
-            unseen_since: None,
+            from_herdr: m.from_herdr,
+            unseen_since: m.unseen_since,
         });
     }
 
@@ -912,6 +945,173 @@ impl App {
         let h = host.remote().filter(|_| *host != repo.host)?;
         let m = repo.mirrors.iter().find(|m| m.host == h)?;
         Some(Worker::Remote(m.handle.clone()))
+    }
+
+    /// `--herdr-repos` on remote host `ri`: ask its server which repositories the directories its
+    /// herdr reports are in (those not known yet), then add and remove repositories to match.
+    fn discover_remote(&mut self, ri: usize) {
+        if self.discovery.is_none() {
+            return;
+        }
+        let rm = &mut self.remotes[ri];
+        let (Some(view), Some(conn)) = (&rm.herdr, &rm.conn) else { return };
+        let fresh: Vec<PathBuf> = herdr::dirs(view)
+            .into_iter()
+            .filter(|p| !rm.found.contains_key(p) && !rm.asked.contains(p))
+            .collect();
+        if !fresh.is_empty() {
+            rm.asked.extend(fresh.iter().cloned());
+            let (tx, host, attempt) = (self.tx.clone(), rm.host.clone(), rm.attempt);
+            conn.discover(
+                fresh,
+                Box::new(move |found| {
+                    let _ = tx.send(UiMsg::RemoteFound { host, attempt, found });
+                }),
+            );
+        }
+        self.reconcile_remote(ri, Instant::now());
+    }
+
+    /// Like [`App::reconcile_repos`], for the repositories remote host `ri`'s herdr names: add
+    /// (as a repository, or as a mirror of one already shown), re-link after a reconnect, and
+    /// drop those without agents or workspaces there for [`HERDR_REPO_GRACE`]. Nothing is
+    /// dropped while its herdr isn't reachable.
+    fn reconcile_remote(&mut self, ri: usize, now: Instant) {
+        use crate::remote::Mode;
+        if self.discovery.is_none() {
+            return;
+        }
+        let rm = &self.remotes[ri];
+        let Some(view) = rm.herdr.clone() else { return };
+        let (name, conn) = (rm.host.clone(), rm.conn.clone());
+        let host = Host::Ssh(name.clone());
+        let mut wanted: Vec<crate::remote::RepoInfo> = Vec::new();
+        for p in herdr::dirs(&view) {
+            if let Some(Some(info)) = rm.found.get(&p)
+                && !wanted.iter().any(|w| w.id == info.id)
+            {
+                wanted.push(info.clone());
+            }
+        }
+        let handle = |id: u64| conn.as_ref().map(|c| c.handle(id));
+        let watch = |id: u64, mode: Mode| {
+            if let Some(c) = &conn {
+                c.watch(id, mode);
+            }
+        };
+
+        let seen_at = |seen: bool, since: Option<Instant>| if seen { None } else { since.or(Some(now)) };
+        for repo in &mut self.repos {
+            if repo.host == host && repo.from_herdr {
+                let seen = wanted.iter().any(|w| w.common_dir == repo.common_dir);
+                repo.unseen_since = seen_at(seen, repo.unseen_since);
+            }
+            for m in repo.mirrors.iter_mut().filter(|m| m.host == name && m.from_herdr) {
+                let seen = wanted.iter().any(|w| w.common_dir == m.common_dir);
+                m.unseen_since = seen_at(seen, m.unseen_since);
+            }
+        }
+
+        let mut changed = false;
+        for info in wanted {
+            // Known on this host already, as a repository or a mirror: re-link (new ids after
+            // a reconnect).
+            if let Some(repo) = self.repos.iter_mut().find(|r| r.host == host && r.common_dir == info.common_dir) {
+                if let Some(slot) = repo.remote.as_mut().filter(|s| s.arg.is_none() && s.id != Some(info.id)) {
+                    slot.id = Some(info.id);
+                    repo.worker = Worker::Remote(handle(info.id));
+                    watch(info.id, Mode::Full);
+                }
+                continue;
+            }
+            let known = self
+                .repos
+                .iter_mut()
+                .flat_map(|r| r.mirrors.iter_mut())
+                .find(|m| m.host == name && m.common_dir == info.common_dir);
+            if let Some(m) = known {
+                if m.arg.is_none() && m.id != Some(info.id) {
+                    m.id = Some(info.id);
+                    m.handle = handle(info.id);
+                    watch(info.id, Mode::Events);
+                }
+                continue;
+            }
+            changed = true;
+            let owner = info.identity.as_ref().and_then(|ident| {
+                self.repos.iter().position(|x| x.identity.as_ref() == Some(ident))
+            });
+            match owner {
+                Some(o) => {
+                    watch(info.id, Mode::Events);
+                    self.repos[o].mirrors.push(Mirror {
+                        host: name.clone(),
+                        arg: None,
+                        id: Some(info.id),
+                        handle: handle(info.id),
+                        common_dir: info.common_dir.clone(),
+                        identity: info.identity.clone(),
+                        from_herdr: true,
+                        unseen_since: None,
+                    });
+                }
+                None => {
+                    watch(info.id, Mode::Full);
+                    let line = self.line_id(Focus::Worktrees);
+                    let id = self.next_id;
+                    self.push_repo(Repo {
+                        id,
+                        host: host.clone(),
+                        name: repo_name(&info.common_dir),
+                        common_dir: info.common_dir.clone(),
+                        snap: Arc::new(Snapshot::default()),
+                        worker: Worker::Remote(handle(info.id)),
+                        remote: Some(RemoteSlot { arg: None, id: Some(info.id) }),
+                        error: None,
+                        identity: info.identity.clone(),
+                        mirrors: Vec::new(),
+                        view: None,
+                        agents: Vec::new(),
+                        graph: Panel::default(),
+                        more_requested_at: 0,
+                        from_herdr: true,
+                        unseen_since: None,
+                    });
+                    self.relocate(Focus::Worktrees, line);
+                }
+            }
+        }
+
+        let expired = |since: Option<Instant>| since.is_some_and(|t| now >= t + HERDR_REPO_GRACE);
+        let unwatch = |id: Option<u64>| {
+            if let (Some(id), Some(c)) = (id, &conn) {
+                c.unwatch(id);
+            }
+        };
+        for repo in &mut self.repos {
+            let before = repo.mirrors.len();
+            repo.mirrors.retain(|m| {
+                let gone = m.host == name && m.from_herdr && expired(m.unseen_since);
+                if gone {
+                    unwatch(m.id);
+                }
+                !gone
+            });
+            changed |= repo.mirrors.len() != before;
+        }
+        while let Some(r) = self
+            .repos
+            .iter()
+            .position(|x| x.host == host && x.from_herdr && expired(x.unseen_since))
+        {
+            unwatch(self.repos[r].remote.and_then(|s| s.id));
+            self.remove_repo(r);
+            changed = true;
+        }
+        if changed {
+            self.map_agents();
+            self.rebuild();
+        }
     }
 
     /// The herdr view for repositories on `host`: this machine's, or what its serve reports.
@@ -1017,8 +1217,10 @@ impl App {
                 wanted.push(repo.clone());
             }
         }
-        for repo in &mut self.repos {
-            let seen = repo.host == Host::Local && wanted.iter().any(|w| w.common_dir == repo.common_dir);
+        // This machine's herdr speaks for this machine's repositories only (remote hosts' in
+        // `reconcile_remote`).
+        for repo in self.repos.iter_mut().filter(|r| r.host == Host::Local) {
+            let seen = wanted.iter().any(|w| w.common_dir == repo.common_dir);
             repo.unseen_since = if seen { None } else { repo.unseen_since.or(Some(now)) };
         }
         for w in wanted {
@@ -1029,7 +1231,7 @@ impl App {
         while let Some(r) = self
             .repos
             .iter()
-            .position(|x| x.from_herdr && x.unseen_since.is_some_and(|t| now >= t + HERDR_REPO_GRACE))
+            .position(|x| x.host == Host::Local && x.from_herdr && x.unseen_since.is_some_and(|t| now >= t + HERDR_REPO_GRACE))
         {
             self.remove_repo(r);
         }
@@ -1038,14 +1240,21 @@ impl App {
     /// When [`App::tick`] has something to do next (a repository's grace running out, a remote
     /// host to reconnect to).
     fn next_deadline(&self) -> Option<Instant> {
-        let grace = self.herdr.as_ref().and_then(|_| {
-            self.repos
-                .iter()
-                .filter(|r| r.from_herdr)
-                .filter_map(|r| r.unseen_since)
-                .min()
-                .map(|t| t + HERDR_REPO_GRACE)
-        });
+        // Only where that host's herdr is reachable: otherwise nothing is dropped, and a
+        // deadline that never clears would spin.
+        let reachable = |h: &Host| self.herdr_of(h).is_some();
+        let repos = self
+            .repos
+            .iter()
+            .filter(|r| r.from_herdr && reachable(&r.host))
+            .filter_map(|r| r.unseen_since);
+        let mirrors = self
+            .repos
+            .iter()
+            .flat_map(|r| r.mirrors.iter())
+            .filter(|m| m.from_herdr && reachable(&Host::Ssh(m.host.clone())))
+            .filter_map(|m| m.unseen_since);
+        let grace = repos.chain(mirrors).min().map(|t| t + HERDR_REPO_GRACE);
         let retry = self.remotes.iter().filter_map(|x| match x.state {
             RemoteState::Down { retry, .. } => Some(retry),
             _ => None,
@@ -1057,6 +1266,9 @@ impl App {
     fn tick(&mut self) {
         let now = Instant::now();
         self.reconcile_repos(now);
+        for ri in 0..self.remotes.len() {
+            self.reconcile_remote(ri, now);
+        }
         let due: Vec<usize> = (0..self.remotes.len())
             .filter(|&ri| matches!(self.remotes[ri].state, RemoteState::Down { retry, .. } if retry <= now))
             .collect();
@@ -1434,6 +1646,18 @@ impl App {
                 }
             }
             UiMsg::Remote { host, attempt, event } => self.on_remote(host, attempt, event),
+            UiMsg::RemoteFound { host, attempt, found } => {
+                let Some(ri) = self.remotes.iter().position(|x| x.host == host && x.attempt == attempt) else {
+                    return;
+                };
+                let rm = &mut self.remotes[ri];
+                // A failed lookup is retried with the next view.
+                rm.asked.clear();
+                for (dir, info) in found.unwrap_or_default() {
+                    rm.found.insert(dir, info);
+                }
+                self.reconcile_remote(ri, Instant::now());
+            }
             UiMsg::Inset { key, req, result } => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
                 if let Some(e) = self.docs.get_mut(&key).filter(|e| e.req == req) {
@@ -2978,6 +3202,106 @@ mod tests {
             matches!(msg, crate::remote::ToServer::Watch { repo: 0, mode: crate::remote::Mode::Events }),
             "{sent}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn herdr_repos_on_a_remote_host() {
+        use crate::remote::{Answer, PROTOCOL, RepoInfo, ToClient};
+        let dir = fake_ssh("herdr-remote");
+        let agent_view = |cwds: &[&str]| herdr::View {
+            agents: cwds
+                .iter()
+                .map(|c| herdr::Agent {
+                    pane_id: "p1".into(),
+                    workspace_id: "w1".into(),
+                    label: "claude".into(),
+                    state: herdr::AgentState::Working,
+                    cwd: Some(PathBuf::from(c)),
+                    host: Host::Local,
+                })
+                .collect(),
+            workspaces: Vec::new(),
+        };
+        let write = |name: &str, msgs: &[ToClient]| {
+            let mut out = Vec::new();
+            for m in msgs {
+                crate::remote::send(&mut out, m).unwrap();
+            }
+            std::fs::write(dir.join(name), out).unwrap();
+        };
+        write(
+            "start.jsonl",
+            &[
+                ToClient::Hello {
+                    protocol: PROTOCOL,
+                    version: "test".into(),
+                    host: "node".into(),
+                    herdr_dir: None,
+                },
+                ToClient::Repos(Vec::new()),
+                ToClient::Herdr(Some(Arc::new(agent_view(&["/r/b/src"])))),
+            ],
+        );
+        let found = ToClient::Reply {
+            id: 999_999,
+            result: Ok(Answer::Found(vec![(
+                "/r/b/src".into(),
+                Some(RepoInfo {
+                    id: 0,
+                    common_dir: "/r/b/.git".into(),
+                    identity: None,
+                }),
+            )])),
+        };
+        let mut reply = Vec::new();
+        crate::remote::send(&mut reply, &found).unwrap();
+        std::fs::write(dir.join("found"), String::from_utf8(reply).unwrap().replace("999999", "__ID__")).unwrap();
+        let sent = dir.join("sent");
+        let d = dir.display();
+
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx, &Config::default(), LayoutMode::Stacked);
+        app.ssh = dir.join("ssh").into();
+        app.discovery = Some(Discovery::default());
+        // A server that answers Discover and keeps everything the client sends.
+        app.remote_cmd = format!(
+            "cat '{d}/start.jsonl'; while IFS= read -r l; do printf '%s\\n' \"$l\" >> '{d}/sent'; \
+             case \"$l\" in *Discover*) id=$(printf '%s' \"$l\" | sed 's/.*\"id\":\\([0-9]*\\).*/\\1/'); \
+             sed \"s/__ID__/$id/\" '{d}/found';; esac; done #"
+        );
+        app.add_remote("node".into(), Vec::new());
+        assert!(app.repos.is_empty(), "no paths, nothing yet");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.repos.iter().any(|r| r.from_herdr) {
+            let msg = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the host's agent's repository");
+            app.handle(msg);
+        }
+        let r = &app.repos[0];
+        assert_eq!((r.host.clone(), r.common_dir.clone()), (Host::Ssh("node".into()), PathBuf::from("/r/b/.git")));
+        assert_eq!(app.repo_label(0), "b @ node");
+
+        // The agent left: the repository stays for the grace, then goes, unwatched there.
+        let attempt = app.remotes[0].attempt;
+        let event = remote::Event::Herdr(Some(Arc::new(agent_view(&[]))));
+        app.handle(UiMsg::Remote { host: "node".into(), attempt, event });
+        assert_eq!(app.repos.len(), 1);
+        assert!(app.next_deadline().is_some());
+        app.reconcile_remote(0, Instant::now() + HERDR_REPO_GRACE + Duration::from_secs(1));
+        assert!(app.repos.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let log = loop {
+            let log = std::fs::read_to_string(&sent).unwrap_or_default();
+            if log.contains("Unwatch") || Instant::now() > deadline {
+                break log;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(log.contains("Discover") && log.contains(r#"{"Watch":{"repo":0,"mode":"Full"}}"#), "{log}");
+        assert!(log.contains(r#"{"Unwatch":{"repo":0}}"#), "{log}");
+        drop(app);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

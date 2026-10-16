@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter};
 use std::os::fd::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -41,37 +41,15 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
     })));
 
     // Resolve every path first, so the client knows the ids before the first snapshot.
-    let mut repos: Vec<RepoPaths> = Vec::new();
+    // Nothing is watched until the client's `Watch`, which knows whether another machine
+    // watches it already.
+    let hub = Hub::new();
+    let mut served: Vec<Served> = Vec::new();
     let answers: Vec<Result<RepoInfo, String>> = paths
         .iter()
-        .map(|p| {
-            let found = git::discover(p).map_err(|e| format!("{}: {e:#}", p.display()))?;
-            let id = match repos.iter().position(|r| r.common_dir == found.common_dir) {
-                Some(i) => i,
-                None => {
-                    repos.push(found.clone());
-                    repos.len() - 1
-                }
-            } as u64;
-            Ok(RepoInfo {
-                id,
-                identity: git::identity(&found.common_dir),
-                common_dir: found.common_dir,
-            })
-        })
+        .map(|p| resolve(&mut served, p, &cfg).map_err(|e| format!("{}: {e:#}", p.display())))
         .collect();
     let _ = tx.send(Out::Msg(Box::new(ToClient::Repos(answers))));
-
-    // Started by the client's `Watch`, which knows whether another machine watches it already.
-    let hub = Hub::new();
-    let mut served: Vec<Served> = repos
-        .into_iter()
-        .map(|paths| Served {
-            calls: Calls::new(paths.common_dir.clone(), cfg.herdr),
-            paths,
-            worker: None,
-        })
-        .collect();
     if with_herdr {
         let tx = tx.clone();
         herdr::spawn(move |view| {
@@ -93,6 +71,22 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
             }
         };
         match msg {
+            ToServer::Discover { id, dirs } => {
+                let found = dirs
+                    .into_iter()
+                    .map(|d| {
+                        let info = resolve(&mut served, &d, &cfg).ok();
+                        (d, info)
+                    })
+                    .collect();
+                let result = Ok(Answer::Found(found));
+                let _ = tx.send(Out::Msg(Box::new(ToClient::Reply { id, result })));
+            }
+            ToServer::Unwatch { repo } => {
+                if let Some(s) = served.get_mut(repo as usize) {
+                    s.worker = None;
+                }
+            }
             ToServer::Watch { repo, mode } => {
                 let Some(s) = served.get_mut(repo as usize) else {
                     continue;
@@ -129,6 +123,27 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
     }
     // The client is gone: dropping the handles stops the workers.
     Ok(())
+}
+
+/// The repository containing `path`, by its id (a new one listed last, unwatched).
+fn resolve(served: &mut Vec<Served>, path: &Path, cfg: &Config) -> Result<RepoInfo> {
+    let found = git::discover(path)?;
+    let id = match served.iter().position(|s| s.paths.common_dir == found.common_dir) {
+        Some(i) => i,
+        None => {
+            served.push(Served {
+                calls: Calls::new(found.common_dir.clone(), cfg.herdr),
+                paths: found.clone(),
+                worker: None,
+            });
+            served.len() - 1
+        }
+    } as u64;
+    Ok(RepoInfo {
+        id,
+        identity: git::identity(&found.common_dir),
+        common_dir: found.common_dir,
+    })
 }
 
 /// One repository being served.

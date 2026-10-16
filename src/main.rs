@@ -12,6 +12,7 @@ USAGE:
     canopy [OPTIONS] [PATH | HOST:PATH...]
     git canopy [OPTIONS] [PATH | HOST:PATH...]
     canopy serve [OPTIONS] [PATH...]
+    canopy remote install HOST [--dir DIR] [--binary FILE]
 
 ARGS:
     PATH    any directory inside a repository (default: current directory); several watch
@@ -24,6 +25,11 @@ ARGS:
             ssh and talks to it on stdin/stdout (-i, --no-poll, --base, --no-watch and
             --no-herdr apply)
 
+    remote install HOST
+            copy this canopy (or --binary FILE, for another architecture) to HOST over ssh,
+            into --dir DIR there (default: ~/.local/bin); refuses a directory shared with this
+            machine when the architectures differ, and a symlink
+
 OPTIONS:
     -i, --interval <SECS>   poll interval in seconds for worktrees that can't be watched (default:
                             60); watched worktrees are re-checked every 10 minutes regardless
@@ -33,7 +39,9 @@ OPTIONS:
         --no-watch          disable filesystem notifications, poll only
         --no-herdr          don't show herdr agent activity
         --herdr-repos       also watch every repository a herdr agent or workspace is in, added
-                            and removed as they come and go (PATH is optional then)
+                            and removed as they come and go (PATH is optional then); on remote
+                            hosts too, through each one's herdr
+        --host <HOST>       connect to HOST even without a HOST:PATH (for --herdr-repos there)
         --git-tui <CMD>     git TUI that t opens in a worktree (default: $CANOPY_GIT_TUI, else
                             the first of lazygit, gitui, tig on PATH)
         --nerd-font         Nerd Font icons for untracked files and folders (default:
@@ -54,6 +62,8 @@ struct Args {
     paths: Vec<PathBuf>,
     /// `HOST:PATH` arguments.
     remote: Vec<(String, String)>,
+    /// `--host` (no paths of their own).
+    hosts: Vec<String>,
     cfg: Config,
     layout: LayoutMode,
     herdr: bool,
@@ -69,6 +79,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut layout = LayoutMode::default();
     let mut herdr = true;
     let mut herdr_repos = false;
+    let mut hosts: Vec<String> = Vec::new();
     let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
     let mut nerd_font = std::env::var("CANOPY_NERD_FONT").is_ok_and(|v| v == "1");
     let mut remote_cmd = std::env::var("CANOPY_REMOTE_CMD")
@@ -118,6 +129,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 cfg.herdr = false;
             }
             "--herdr-repos" => herdr_repos = true,
+            "--host" => hosts.push(value("--host")?),
             "--nerd-font" => nerd_font = true,
             "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
             "--remote-cmd" => {
@@ -158,6 +170,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         serve,
         paths,
         remote,
+        hosts,
         cfg,
         layout,
         herdr,
@@ -183,7 +196,63 @@ fn remote_arg(arg: &Path) -> Option<(String, String)> {
     Some((host.to_string(), path.to_string()))
 }
 
+/// `canopy remote install HOST [--dir DIR] [--binary FILE]`.
+fn remote_install(args: &[String]) -> ExitCode {
+    let mut host = None;
+    let mut dir = canopy::remote::install::DEFAULT_DIR.to_string();
+    let mut binary = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let mut value = || inline.clone().or_else(|| it.next().cloned());
+        match flag {
+            "--dir" => match value() {
+                Some(v) => dir = v,
+                None => return usage_error("--dir needs a value"),
+            },
+            "--binary" => match value() {
+                Some(v) => binary = Some(PathBuf::from(v)),
+                None => return usage_error("--binary needs a value"),
+            },
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            f if f.starts_with('-') => return usage_error(&format!("unknown option: {f}")),
+            h if host.is_none() => host = Some(h.to_string()),
+            extra => return usage_error(&format!("unexpected argument: {extra}")),
+        }
+    }
+    let Some(host) = host else { return usage_error("remote install needs a HOST") };
+    let opts = canopy::remote::install::Install { host, dir, binary };
+    match canopy::remote::install::run(&opts) {
+        Ok(path) => {
+            eprintln!("installed {path} on {}", opts.host);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("canopy remote install: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("canopy: {msg}\n\nRun 'canopy --help' for usage.");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|a| a == "remote") {
+        return match raw.get(1).map(String::as_str) {
+            Some("install") => remote_install(&raw[2..]),
+            _ => usage_error("remote: expected `remote install HOST`"),
+        };
+    }
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return ExitCode::SUCCESS,
@@ -205,7 +274,7 @@ fn main() -> ExitCode {
     }
     // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
     let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
-    if args.paths.is_empty() && args.remote.is_empty() {
+    if args.paths.is_empty() && args.remote.is_empty() && args.hosts.is_empty() {
         // The current directory, unless --herdr-repos finds the repositories (then it counts
         // only if it is in one).
         match canopy::git::discover(Path::new(".")) {
@@ -233,6 +302,11 @@ fn main() -> ExitCode {
     }
     // One connection per host, its paths in order.
     let mut remotes: Vec<(String, Vec<String>)> = Vec::new();
+    for host in args.hosts {
+        if !remotes.iter().any(|(h, _)| *h == host) {
+            remotes.push((host, Vec::new()));
+        }
+    }
     for (host, path) in args.remote {
         match remotes.iter_mut().find(|(h, _)| *h == host) {
             Some((_, paths)) if paths.contains(&path) => {}

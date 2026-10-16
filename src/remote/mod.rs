@@ -15,6 +15,7 @@
 //! by far the biggest part, and most snapshots are status changes.
 
 pub mod client;
+pub mod install;
 pub mod serve;
 
 use std::io::{self, Write};
@@ -83,6 +84,17 @@ pub enum Mode {
 /// Client → server.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ToServer {
+    /// Which repositories these directories are in (`--herdr-repos`: where the server's herdr
+    /// agents work). Each found repository gets an id, unwatched until [`ToServer::Watch`].
+    /// Answered with a [`ToClient::Reply`] carrying [`Answer::Found`].
+    Discover {
+        id: u64,
+        dirs: Vec<PathBuf>,
+    },
+    /// Stop watching repository `repo` (a herdr-found one nobody works in anymore).
+    Unwatch {
+        repo: u64,
+    },
     /// Start (or switch) watching repository `repo` this way.
     Watch {
         repo: u64,
@@ -123,6 +135,8 @@ pub enum Answer {
     Doc(DiffDoc),
     Text(String),
     Plan(Box<Plan>),
+    /// For [`ToServer::Discover`]: each directory's repository (`None`: not in one).
+    Found(Vec<(PathBuf, Option<RepoInfo>)>),
 }
 
 /// Write `msg` as one line and flush it.
