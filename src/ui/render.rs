@@ -76,7 +76,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_graph(f, app, graph_area);
     draw_shell(f, app, shell_area);
     draw_footer(f, app, footer);
-    if let Some((_, plan)) = &app.confirm {
+    if let Some((_, _, plan)) = &app.confirm {
         draw_confirm(f, plan);
     }
     if app.help {
@@ -414,6 +414,13 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
         spans.push(Span::styled(" · ⚠ disconnected, retrying", warn));
     } else if n == 0 && state == Some(&RemoteState::Connecting) {
         spans.push(Span::styled(" · connecting…", dim));
+    }
+    // Hosts that see the same repository and contribute their agents and edits.
+    for m in &repo.mirrors {
+        spans.push(Span::styled(format!(" · also on {}", m.host), dim));
+        if matches!(app.remote_state(&m.host), Some(RemoteState::Down { .. })) {
+            spans.push(Span::styled(" ⚠", warn));
+        }
     }
     if repo.error.is_none() {
         spans.push(Span::styled(
@@ -1165,6 +1172,15 @@ fn repo_details(app: &App, r: usize) -> Line<'static> {
             spans.push(Span::styled(format!("  ·  canopy {version}"), dim));
         }
         None => {}
+    }
+    for m in &repo.mirrors {
+        spans.push(Span::styled("  ·  ", dim));
+        match app.remote_state(&m.host) {
+            Some(RemoteState::Down { reason, .. }) => {
+                spans.push(Span::styled(format!("{}: {}", m.host, first_line(reason)), warn));
+            }
+            _ => spans.push(Span::styled(format!("also watched from {} (its edits, its agents)", m.host), dim)),
+        }
     }
     if let Some(b) = &snap.base {
         spans.push(Span::styled("  ·  ", dim));

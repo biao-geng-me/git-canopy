@@ -481,3 +481,53 @@ fn handle_answers_requests() {
     });
     assert!(plan.unwrap_err().contains("uncommitted"));
 }
+
+#[test]
+fn another_machines_events_reach_the_worker() {
+    // The worker that refreshes the repository sees no events of its own (another machine's
+    // edits on a shared filesystem); an events-only watcher forwards what it sees.
+    let fx = common::Fixture::new();
+    let cfg = Config {
+        watch: false,
+        poll: false,
+        ..Config::default()
+    };
+    let (owner, rx) = spawn(&fx, cfg);
+    let owner = std::sync::Arc::new(owner);
+    let to_owner = owner.clone();
+    let paths = canopy::git::discover(&fx.repo()).unwrap();
+    let _events = watch::spawn_events(paths, Config::default(), watch::Hub::new(), move |p| {
+        to_owner.request(watch::Request::Touched(p))
+    });
+    let s = wait_for(&rx, Duration::from_secs(10), |s| s.statuses_loaded);
+    assert!(!find(&s, "refactor-db").is_dirty());
+
+    // An edit (retried until the watcher has its watches in place).
+    let file = fx.wt("refactor-db").join("from-elsewhere.txt");
+    let mut seen = false;
+    for i in 0..10 {
+        std::fs::write(&file, format!("{i}")).unwrap();
+        if rx_until(&rx, Duration::from_secs(1), |s| find(s, "refactor-db").is_dirty()) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the forwarded edit made the worker run status");
+
+    // A commit (git dir events): ahead/behind moves without any poll.
+    git(&fx.wt("fix-parser"), &["commit", "-qam", "more"]);
+    assert!(
+        rx_until(&rx, Duration::from_secs(5), |s| find(s, "fix-parser").vs_base == Some((2, 1))),
+        "the forwarded ref change reached the worker"
+    );
+}
+
+fn rx_until(rx: &mpsc::Receiver<std::sync::Arc<Snapshot>>, timeout: Duration, pred: impl Fn(&Snapshot) -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while let Ok(s) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if pred(&s) {
+            return true;
+        }
+    }
+    false
+}

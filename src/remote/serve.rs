@@ -11,12 +11,12 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
-use super::{Answer, Call, PROTOCOL, RepoInfo, ToClient, ToServer, send};
+use super::{Answer, Call, Mode, PROTOCOL, RepoInfo, ToClient, ToServer, send};
 use crate::git::{self, RepoPaths};
 use crate::graph::Graph;
 use crate::herdr;
 use crate::model::Snapshot;
-use crate::watch::{self, Config, Handle, Hub, Reply};
+use crate::watch::{self, Calls, Config, Handle, Hub, Reply};
 
 /// What the writer thread sends; snapshots go through it to drop graphs the client already has.
 enum Out {
@@ -55,21 +55,21 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
             } as u64;
             Ok(RepoInfo {
                 id,
+                identity: git::identity(&found.common_dir),
                 common_dir: found.common_dir,
             })
         })
         .collect();
     let _ = tx.send(Out::Msg(Box::new(ToClient::Repos(answers))));
 
+    // Started by the client's `Watch`, which knows whether another machine watches it already.
     let hub = Hub::new();
-    let handles: Vec<Handle> = repos
+    let mut served: Vec<Served> = repos
         .into_iter()
-        .enumerate()
-        .map(|(id, paths)| {
-            let tx = tx.clone();
-            watch::spawn_with(paths, cfg.clone(), hub.clone(), move |s| {
-                let _ = tx.send(Out::Snapshot(id as u64, s));
-            })
+        .map(|paths| Served {
+            calls: Calls::new(paths.common_dir.clone(), cfg.herdr),
+            paths,
+            worker: None,
         })
         .collect();
     if with_herdr {
@@ -93,13 +93,33 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
             }
         };
         match msg {
+            ToServer::Watch { repo, mode } => {
+                let Some(s) = served.get_mut(repo as usize) else {
+                    continue;
+                };
+                if s.worker.as_ref().is_some_and(|(m, _)| *m == mode) {
+                    continue;
+                }
+                // Stop the old way first: never two workers on one repository.
+                s.worker = None;
+                let (paths, cfg, tx) = (s.paths.clone(), cfg.clone(), tx.clone());
+                let handle = match mode {
+                    Mode::Full => watch::spawn_with(paths, cfg, hub.clone(), move |snap| {
+                        let _ = tx.send(Out::Snapshot(repo, snap));
+                    }),
+                    Mode::Events => watch::spawn_events(paths, cfg, hub.clone(), move |paths| {
+                        let _ = tx.send(Out::Msg(Box::new(ToClient::Touched { repo, paths })));
+                    }),
+                };
+                s.worker = Some((mode, handle));
+            }
             ToServer::Request { repo, req } => {
-                if let Some(h) = handles.get(repo as usize) {
+                if let Some((_, h)) = served.get(repo as usize).and_then(|s| s.worker.as_ref()) {
                     h.request(req);
                 }
             }
-            ToServer::Call { id, repo, call } => match handles.get(repo as usize) {
-                Some(h) => dispatch(h, call, id, &tx),
+            ToServer::Call { id, repo, call } => match served.get(repo as usize) {
+                Some(s) => dispatch(&s.calls, call, id, &tx),
                 None => {
                     let result = Err(format!("no repository {repo}"));
                     let _ = tx.send(Out::Msg(Box::new(ToClient::Reply { id, result })));
@@ -111,7 +131,15 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
     Ok(())
 }
 
-fn dispatch(h: &Handle, call: Call, id: u64, tx: &Sender<Out>) {
+/// One repository being served.
+struct Served {
+    paths: RepoPaths,
+    calls: Calls,
+    /// How it is watched, once the client said (dropping the handle stops the worker).
+    worker: Option<(Mode, Handle)>,
+}
+
+fn dispatch(h: &Calls, call: Call, id: u64, tx: &Sender<Out>) {
     fn reply<T: 'static>(tx: &Sender<Out>, id: u64, wrap: fn(T) -> Answer) -> Reply<T> {
         let tx = tx.clone();
         Box::new(move |r: Result<T, String>| {

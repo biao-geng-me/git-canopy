@@ -115,6 +115,33 @@ pub fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// What makes a repository the same one when two machines see it on a shared filesystem: its
+/// canonical common dir, that directory's inode and birth time, and the filesystem's id
+/// (`statvfs`). The device number is left out: it is per machine (CephFS: 93 on one node, 48
+/// on another). A path alone would not do (`/home/me/proj` exists on many machines); all four
+/// matching by accident would. `None` when the directory can't be read.
+pub fn identity(common_dir: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let dir = canonical(common_dir);
+    let meta = std::fs::metadata(&dir).ok()?;
+    let birth = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a valid NUL-terminated path and a zeroed out-struct that statvfs fills in.
+    let fsid = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        st.f_fsid
+    };
+    Some(format!("{}|{}|{birth}|{fsid:x}", dir.display(), meta.ino()))
+}
+
 /// Split NUL-separated output into records, dropping the trailing empty one.
 pub(crate) fn split_nul(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     let bytes = bytes.strip_suffix(b"\0").unwrap_or(bytes);

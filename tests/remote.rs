@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use canopy::diff::Target;
+use canopy::remote::Mode;
 use canopy::remote::client::{self, Event};
 use canopy::watch::{Config, Request};
 
@@ -78,6 +79,12 @@ fn snapshots_and_calls_over_the_wire() {
     let id = repos[0].as_ref().unwrap().id;
     assert_eq!(repos[1].as_ref().unwrap().id, id);
     assert!(repos[2].as_ref().unwrap_err().contains("nope"));
+    assert_eq!(
+        repos[0].as_ref().unwrap().identity,
+        canopy::git::identity(&repos[0].as_ref().unwrap().common_dir)
+    );
+    // Nothing is watched until the client says how.
+    conn.watch(id, Mode::Full);
 
     let snap = wait(&rx, "statuses and graph", |e| match e {
         Event::Snapshot(r, s) if r == id && s.statuses_loaded && !s.graph.rows.is_empty() => Some(s),
@@ -189,4 +196,43 @@ fn other_protocol_or_no_server_is_reported() {
     assert!(err.contains("command not found"), "{err}");
     let why = closed(&rx);
     assert!(why.contains("hello") && why.contains("command not found"), "{why}");
+}
+
+#[test]
+fn events_only_forwards_file_events() {
+    let fx = common::Fixture::new();
+    let (tx, rx) = mpsc::channel();
+    let conn = client::connect(serve(&[fx.repo()]), move |e| {
+        let _ = tx.send(e);
+    })
+    .unwrap();
+    let id = wait(&rx, "repos", |e| match e {
+        Event::Repos(r) => Some(r[0].as_ref().unwrap().id),
+        _ => None,
+    });
+    conn.watch(id, Mode::Events);
+    // Edits (retried until the watches are in place) come back as the edited worktree's root;
+    // no snapshot ever comes.
+    let wt = fx.wt("refactor-db");
+    let mut touched = None;
+    for i in 0..10 {
+        std::fs::write(wt.join("elsewhere.txt"), format!("{i}")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while let Ok(e) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            match e {
+                Event::Touched(r, paths) if r == id => touched = Some(paths),
+                Event::Snapshot(..) => panic!("events-only sent a snapshot"),
+                Event::Closed(why) => panic!("closed: {why}"),
+                _ => {}
+            }
+        }
+        if touched.is_some() {
+            break;
+        }
+    }
+    let paths = touched.expect("touched paths");
+    assert!(
+        paths.contains(&canopy::git::canonical(&wt)) || paths.contains(&wt),
+        "{paths:?}"
+    );
 }

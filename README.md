@@ -134,6 +134,8 @@ git canopy [OPTIONS] [PATH | HOST:PATH...]
 
 The remote host needs the same canopy version on its `PATH` (or say where with `--remote-cmd`) and ssh access without a password prompt (keys or an agent; canopy runs ssh with `BatchMode=yes`). `--remote-cmd` is a shell command line run on the remote host, so it can set the environment there; for example, when herdr's socket lives in a per-machine `XDG_CONFIG_HOME` that a non-interactive ssh session doesn't have: `--remote-cmd 'XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) ~/bin/canopy'` (single quotes, so `$USER` and `$(uname -m)` are expanded there). A path without a leading `/` is relative to the home directory there. `--herdr-repos` finds repositories through this machine's herdr only.
 
+On a shared filesystem (an HPC cluster's home, NFS) the same repository can be named from several machines, say `canopy ~/proj gh-b-001:proj` from a login node while agents work on a compute node. canopy recognizes it (same directory, inode, birth time and filesystem) and shows it once, refreshed by one machine (this one if it is named here, else the first host to answer), so git runs once. Every other machine that names it only watches its files and passes its edits and commits on, which file events on a network filesystem otherwise never report across machines (without this, they show up at the 10-minute fallback poll), and its herdr's agents appear on the same trees. The header row says `also on gh-b-001`. Cleanup of a worktree goes through the machine whose herdr has its workspace.
+
 ### Keys
 
 | Key | Action |

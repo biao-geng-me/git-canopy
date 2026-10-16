@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{Answer, Call, PROTOCOL, RepoInfo, ToClient, ToServer, send};
+use super::{Answer, Call, Mode, PROTOCOL, RepoInfo, ToClient, ToServer, send};
 use crate::cleanup::Plan;
 use crate::diff::{DiffDoc, Target};
 use crate::graph::Graph;
@@ -37,6 +37,8 @@ pub enum Event {
     Repos(Vec<Result<RepoInfo, String>>),
     /// A snapshot of repository `.0`, its graph filled in.
     Snapshot(u64, Arc<Snapshot>),
+    /// File events of repository `.0`, watched with `Mode::Events`.
+    Touched(u64, Vec<PathBuf>),
     Herdr(Option<Arc<herdr::View>>),
     /// The connection is over (the last event): why, including what the server printed to
     /// stderr. Replies still pending get the same as an error.
@@ -192,6 +194,7 @@ fn read_loop(stdout: impl Read, pending: &PendingMap, emit: &dyn Fn(Event)) -> S
                 emit(Event::Snapshot(repo, snap));
             }
             ToClient::Herdr(view) => emit(Event::Herdr(view)),
+            ToClient::Touched { repo, paths } => emit(Event::Touched(repo, paths)),
             ToClient::Reply { id, result } => {
                 let reply = pending.lock().unwrap().as_mut().and_then(|p| p.remove(&id));
                 if let Some(reply) = reply {
@@ -204,6 +207,11 @@ fn read_loop(stdout: impl Read, pending: &PendingMap, emit: &dyn Fn(Event)) -> S
 }
 
 impl Conn {
+    /// Start (or switch) watching repository `repo` this way; nothing is watched before.
+    pub fn watch(&self, repo: u64, mode: Mode) {
+        let _ = send(&mut *self.0.stdin.lock().unwrap(), &ToServer::Watch { repo, mode });
+    }
+
     pub fn request(&self, repo: u64, req: Request) {
         // A dead connection reports itself with `Event::Closed`.
         let _ = send(&mut *self.0.stdin.lock().unwrap(), &ToServer::Request { repo, req });

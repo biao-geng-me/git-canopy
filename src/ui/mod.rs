@@ -77,7 +77,8 @@ pub enum UiMsg {
     },
     /// The checks for removing a worktree finished: what removing it will do, for the confirm
     /// popup, or why it can't be removed.
-    CleanupPlan(u64, Result<Box<cleanup::Plan>, String>),
+    /// `.1`: the host that checked it (and removes it), whose herdr has the workspace.
+    CleanupPlan(u64, Host, Result<Box<cleanup::Plan>, String>),
     /// Removing a worktree finished: the footer notice.
     CleanupDone(Result<String, String>),
 }
@@ -262,7 +263,7 @@ pub struct App {
     /// `y` was pressed: the next key picks what to copy.
     pub copy_pending: bool,
     /// Removing a worktree, waiting for the user to confirm (with the id of its repository).
-    pub confirm: Option<(u64, cleanup::Plan)>,
+    pub confirm: Option<(u64, Host, cleanup::Plan)>,
     /// Where a worktree removal is (one at a time).
     cleaning: Cleaning,
     clipboard: Vec<crate::clipboard::Method>,
@@ -304,6 +305,14 @@ pub struct Repo {
     remote: Option<RemoteSlot>,
     /// Why there is nothing to show (a remote path that isn't in a repository).
     pub error: Option<String>,
+    /// `git::identity`: the same repository seen from another machine has the same one.
+    identity: Option<String>,
+    /// Other hosts that see this same repository (a shared filesystem): they don't refresh it,
+    /// they forward their file events to this one's worker and add their herdr agents.
+    pub mirrors: Vec<Mirror>,
+    /// The herdr agents and workspaces of its host and its mirrors' hosts (`agents` indexes
+    /// into it); `None` when none of them has herdr.
+    pub view: Option<Arc<herdr::View>>,
     /// herdr agents per worktree (indexes into `App::herdr`'s agents), parallel to its worktrees.
     pub agents: Vec<Vec<usize>>,
     /// Its graph panel (cursor, expansion) while another repository is shown.
@@ -381,6 +390,17 @@ impl Worker {
             Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
         }
     }
+}
+
+/// A remote host's path argument that turned out to be a repository already shown (see
+/// `Repo::mirrors`): watched there with `Mode::Events`.
+pub struct Mirror {
+    pub host: String,
+    /// Index into its host's `Remote::paths`.
+    arg: usize,
+    /// The server's id for it, and its calls (`None` while disconnected).
+    id: Option<u64>,
+    handle: Option<RemoteHandle>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -590,6 +610,7 @@ impl App {
         self.next_id += 1;
         let name = repo_name(&paths.common_dir);
         let common_dir = paths.common_dir.clone();
+        let identity = crate::git::identity(&common_dir);
         let tx = self.tx.clone();
         let worker = watch::spawn_with(paths, self.cfg.clone(), self.hub.clone(), move |s| {
             let _ = tx.send(UiMsg::Snapshot(id, s));
@@ -603,6 +624,9 @@ impl App {
             worker: Worker::Local(worker),
             remote: None,
             error: None,
+            identity,
+            mirrors: Vec::new(),
+            view: None,
             agents: Vec::new(),
             graph: Panel::default(),
             more_requested_at: 0,
@@ -641,6 +665,9 @@ impl App {
                 worker: Worker::Remote(None),
                 remote: Some(RemoteSlot { arg, id: None }),
                 error: None,
+                identity: None,
+                mirrors: Vec::new(),
+                view: None,
                 agents: Vec::new(),
                 graph: Panel::default(),
                 more_requested_at: 0,
@@ -690,9 +717,15 @@ impl App {
             retry: Instant::now() + rm.backoff,
         };
         rm.backoff = (rm.backoff * 2).min(RETRY_MAX);
-        let host = Host::Ssh(rm.host.clone());
-        for repo in self.repos.iter_mut().filter(|r| r.host == host) {
-            repo.worker = Worker::Remote(None);
+        let name = rm.host.clone();
+        let host = Host::Ssh(name.clone());
+        for repo in &mut self.repos {
+            if repo.host == host {
+                repo.worker = Worker::Remote(None);
+            }
+            for m in repo.mirrors.iter_mut().filter(|m| m.host == name) {
+                m.handle = None;
+            }
         }
         self.map_agents();
     }
@@ -720,33 +753,111 @@ impl App {
                 }
             }
             remote::Event::Herdr(view) => {
-                rm.herdr = view;
+                let host = Host::Ssh(host);
+                rm.herdr = view.map(|v| Arc::new(Arc::unwrap_or_clone(v).on(&host)));
                 self.map_agents();
+            }
+            remote::Event::Touched(id, paths) => {
+                // A mirror's file events: the repository's own worker acts on them.
+                let owner = self
+                    .repos
+                    .iter()
+                    .find(|r| r.mirrors.iter().any(|m| m.host == host && m.id == Some(id)));
+                if let Some(repo) = owner {
+                    repo.worker.request(Request::Touched(paths));
+                }
             }
             remote::Event::Closed(reason) => self.disconnected(ri, reason),
         }
     }
 
-    /// The server of remote host `ri` said what its path arguments are: fill in the placeholder
-    /// repositories, drop those that turned out to be the same repository as an earlier one.
+    /// The server of remote host `ri` said what its path arguments are, and nothing is watched
+    /// there yet. Each becomes one of:
+    /// - a mirror of a repository already shown from elsewhere (same `git::identity`: a shared
+    ///   filesystem), watched there for file events only;
+    /// - a repository of its own (the placeholder filled in), watched there in full;
+    /// - nothing, when an earlier path of this host is the same repository;
+    /// - an error on its header row (not a repository).
     fn remote_repos(&mut self, ri: usize, answers: &[Result<crate::remote::RepoInfo, String>]) {
+        use crate::remote::Mode;
         let rm = &self.remotes[ri];
-        let (host, conn) = (Host::Ssh(rm.host.clone()), rm.conn.clone());
+        let (name, conn) = (rm.host.clone(), rm.conn.clone());
+        let host = Host::Ssh(name.clone());
+        let handle = |id: u64| conn.as_ref().map(|c| c.handle(id));
+        let watch = |id: u64, mode: Mode| {
+            if let Some(c) = &conn {
+                c.watch(id, mode);
+            }
+        };
         let mut seen: Vec<u64> = Vec::new();
-        let mut duplicates: Vec<u64> = Vec::new();
+
+        // Mirrors stay mirrors (reconnecting).
+        for repo in &mut self.repos {
+            for m in repo.mirrors.iter_mut().filter(|m| m.host == name) {
+                match answers.get(m.arg) {
+                    Some(Ok(info)) if !seen.contains(&info.id) => {
+                        seen.push(info.id);
+                        m.id = Some(info.id);
+                        m.handle = handle(info.id);
+                        watch(info.id, Mode::Events);
+                    }
+                    _ => {
+                        m.id = None;
+                        m.handle = None;
+                    }
+                }
+            }
+        }
+
+        let mut drop: Vec<u64> = Vec::new();
+        let mut mirrored: Vec<(u64, usize, Mirror)> = Vec::new();
+        for (r, repo) in self.repos.iter().enumerate() {
+            let Some(slot) = repo.remote.filter(|_| repo.host == host) else { continue };
+            let Some(Ok(info)) = answers.get(slot.arg) else { continue };
+            if seen.contains(&info.id) {
+                drop.push(repo.id);
+                continue;
+            }
+            seen.push(info.id);
+            let same = info.identity.as_ref().and_then(|ident| {
+                self.repos
+                    .iter()
+                    .position(|x| x.id != repo.id && x.identity.as_ref() == Some(ident))
+            });
+            if let Some(owner) = same.filter(|&o| o != r) {
+                let m = Mirror {
+                    host: name.clone(),
+                    arg: slot.arg,
+                    id: Some(info.id),
+                    handle: handle(info.id),
+                };
+                mirrored.push((repo.id, owner, m));
+            }
+        }
+        // Mirrors join their repository; their placeholders go.
+        for (placeholder, owner, m) in mirrored {
+            if let Some(id) = m.id {
+                watch(id, Mode::Events);
+            }
+            self.repos[owner].mirrors.push(m);
+            drop.push(placeholder);
+        }
         for repo in self.repos.iter_mut().filter(|r| r.host == host) {
             let Some(slot) = repo.remote.as_mut() else { continue };
+            if drop.contains(&repo.id) {
+                continue;
+            }
             match answers.get(slot.arg) {
-                Some(Ok(info)) if seen.contains(&info.id) => duplicates.push(repo.id),
                 Some(Ok(info)) => {
-                    seen.push(info.id);
                     slot.id = Some(info.id);
                     if repo.common_dir != info.common_dir {
                         repo.common_dir = info.common_dir.clone();
                         repo.name = repo_name(&info.common_dir);
                     }
+                    repo.identity = info.identity.clone();
                     repo.error = None;
-                    repo.worker = Worker::Remote(conn.as_ref().map(|c| c.handle(info.id)));
+                    repo.worker = Worker::Remote(handle(info.id));
+                    watch(info.id, Mode::Full);
                 }
                 Some(Err(e)) => {
                     slot.id = None;
@@ -756,12 +867,51 @@ impl App {
                 None => {}
             }
         }
-        for id in duplicates {
+        for id in drop {
             if let Some(r) = self.repo_index(id) {
                 self.remove_repo(r);
             }
         }
+        self.map_agents();
         self.rebuild();
+    }
+
+    /// A mirror whose repository is no longer watched (a herdr-found one dropped after its
+    /// grace) takes its place: a repository of its own again, watched in full on its host.
+    fn promote(&mut self, m: Mirror) {
+        let Some(rm) = self.remotes.iter().find(|x| x.host == m.host) else { return };
+        let path = rm.paths.get(m.arg).cloned().unwrap_or_default();
+        if let (Some(id), Some(conn)) = (m.id, &rm.conn) {
+            conn.watch(id, crate::remote::Mode::Full);
+        }
+        let id = self.next_id;
+        self.push_repo(Repo {
+            id,
+            host: Host::Ssh(m.host),
+            common_dir: PathBuf::from(&path),
+            snap: Arc::new(Snapshot::default()),
+            name: repo_name(Path::new(&path)),
+            worker: Worker::Remote(m.handle),
+            remote: Some(RemoteSlot { arg: m.arg, id: m.id }),
+            error: None,
+            identity: None,
+            mirrors: Vec::new(),
+            view: None,
+            agents: Vec::new(),
+            graph: Panel::default(),
+            more_requested_at: 0,
+            from_herdr: false,
+            unseen_since: None,
+        });
+    }
+
+    /// Repository `r`'s calls as answered on `host` when that is one of its mirrors (cleanup
+    /// through the herdr that has the workspace); `None`: its own worker answers.
+    fn mirror_worker(&self, r: usize, host: &Host) -> Option<Worker> {
+        let repo = self.repos.get(r)?;
+        let h = host.remote().filter(|_| *host != repo.host)?;
+        let m = repo.mirrors.iter().find(|m| m.host == h)?;
+        Some(Worker::Remote(m.handle.clone()))
     }
 
     /// The herdr view for repositories on `host`: this machine's, or what its serve reports.
@@ -794,7 +944,12 @@ impl App {
     /// Whether the worktree list has a header row per repository: with several, or with any on
     /// another machine (its header says which, and whether it is connected).
     pub fn headers(&self) -> bool {
-        self.repos.len() > 1 || self.repos.iter().any(|r| r.host != Host::Local)
+        self.repos.len() > 1 || self.repos.iter().any(|r| r.host != Host::Local || !r.mirrors.is_empty())
+    }
+
+    /// The state of remote host `name`.
+    pub fn remote_state(&self, name: &str) -> Option<&RemoteState> {
+        self.remotes.iter().find(|x| x.host == name).map(|x| &x.state)
     }
 
     /// Stop watching repository `r` (its worker stops when dropped). The selection stays on the
@@ -804,6 +959,7 @@ impl App {
             return;
         }
         let id = self.line_id(Focus::Worktrees);
+        let mirrors = std::mem::take(&mut self.repos[r].mirrors);
         if r == self.active {
             self.repos.remove(r);
             self.active = 0;
@@ -814,6 +970,9 @@ impl App {
             if r < self.active {
                 self.active -= 1;
             }
+        }
+        for m in mirrors {
+            self.promote(m);
         }
         self.map_agents();
         self.rebuild();
@@ -1315,13 +1474,13 @@ impl App {
                 }
                 self.notice = Some(notice);
             }
-            UiMsg::CleanupPlan(id, plan) => match plan {
+            UiMsg::CleanupPlan(id, via, plan) => match plan {
                 Ok(plan) if matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. }) => {
-                    self.remove_worktree(id, *plan);
+                    self.remove_worktree(id, via, *plan);
                 }
                 Ok(plan) => {
                     self.notice = None;
-                    self.confirm = Some((id, *plan));
+                    self.confirm = Some((id, via, *plan));
                     self.cleaning = Cleaning::Confirming;
                 }
                 Err(e) => {
@@ -1469,20 +1628,31 @@ impl App {
     }
 
     /// Match herdr agents to worktrees (after either side changed).
+    /// Each repository's view is its host's herdr plus its mirrors' hosts' (a shared filesystem:
+    /// agents of several machines in the same trees).
     fn map_agents(&mut self) {
-        let agents: Vec<Vec<Vec<usize>>> = self
+        let views: Vec<Option<Arc<herdr::View>>> = self
             .repos
             .iter()
-            .map(|repo| match self.herdr_of(&repo.host) {
-                Some(view) => {
-                    let paths: Vec<PathBuf> = repo.snap.worktrees.iter().map(|w| w.path.clone()).collect();
-                    herdr::assign(view, &paths)
+            .map(|repo| {
+                let hosts = std::iter::once(repo.host.clone()).chain(repo.mirrors.iter().map(|m| Host::Ssh(m.host.clone())));
+                let views: Vec<&Arc<herdr::View>> = hosts.filter_map(|h| self.herdr_of(&h)).collect();
+                match views.as_slice() {
+                    [] => None,
+                    [one] => Some(Arc::clone(one)),
+                    many => Some(Arc::new(herdr::View::merged(many.iter().map(|v| v.as_ref())))),
                 }
-                None => Vec::new(),
             })
             .collect();
-        for (repo, a) in self.repos.iter_mut().zip(agents) {
-            repo.agents = a;
+        for (repo, view) in self.repos.iter_mut().zip(views) {
+            repo.agents = match &view {
+                Some(v) => {
+                    let paths: Vec<PathBuf> = repo.snap.worktrees.iter().map(|w| w.path.clone()).collect();
+                    herdr::assign(v, &paths)
+                }
+                None => Vec::new(),
+            };
+            repo.view = view;
         }
     }
 
@@ -1494,7 +1664,7 @@ impl App {
     /// The agents working in worktree `wi` of repository `r`, summarized.
     pub fn agent_activity_in(&self, r: usize, wi: usize) -> Option<herdr::Activity> {
         let repo = self.repos.get(r)?;
-        herdr::activity(self.herdr_of(&repo.host)?, repo.agents.get(wi)?)
+        herdr::activity(repo.view.as_ref()?, repo.agents.get(wi)?)
     }
 
     /// Whether worktree `wi` of the shown repository could be removed (with its branch) without
@@ -1525,11 +1695,19 @@ impl App {
     /// in it (say, from a herdr on another machine sharing the filesystem) would go unnoticed.
     /// `w` is in repository `r`; its host's herdr is the one asked.
     fn herdr_unseen(&self, r: usize, w: &crate::model::WorktreeView) -> bool {
-        let Some(host) = self.repos.get(r).map(|x| &x.host) else { return false };
-        self.herdr_dir_of(host).is_some_and(|d| w.path.starts_with(d))
-            && !self
-                .herdr_of(host)
-                .is_some_and(|v| v.workspaces.iter().any(|ws| ws.checkout.as_deref() == Some(&w.path)))
+        let Some(repo) = self.repos.get(r) else { return false };
+        let hosts = std::iter::once(repo.host.clone()).chain(repo.mirrors.iter().map(|m| Host::Ssh(m.host.clone())));
+        let in_herdr_dir = hosts
+            .filter_map(|h| self.herdr_dir_of(&h).map(Path::to_path_buf))
+            .any(|d| w.path.starts_with(d));
+        in_herdr_dir && self.herdr_workspace_host(r, &w.path).is_none()
+    }
+
+    /// The host whose herdr has a workspace for the checkout at `path` of repository `r`.
+    fn herdr_workspace_host(&self, r: usize, path: &Path) -> Option<Host> {
+        let view = self.repos.get(r)?.view.as_ref()?;
+        let ws = view.workspaces.iter().find(|ws| ws.checkout.as_deref() == Some(path))?;
+        Some(ws.host.clone())
     }
 
     fn agent_busy(&self, r: usize, wi: usize) -> bool {
@@ -1545,7 +1723,7 @@ impl App {
     /// How many agents in repository `r`'s worktrees are in `state`.
     pub fn repo_agents_in_state(&self, r: usize, state: herdr::AgentState) -> usize {
         let Some(repo) = self.repos.get(r) else { return 0 };
-        let Some(view) = self.herdr_of(&repo.host) else { return 0 };
+        let Some(view) = &repo.view else { return 0 };
         repo.agents
             .iter()
             .flatten()
@@ -1573,18 +1751,21 @@ impl App {
     /// On a remote host, its herdr is asked (which switches the herdr clients attached to it).
     fn focus_agent(&mut self) {
         let Some(repo) = self.repos.get(self.active) else { return };
-        let Some(view) = self.herdr_of(&repo.host) else { return };
+        let Some(view) = &repo.view else { return };
         let agent = self
             .focused_wi()
             .and_then(|wi| repo.agents.get(wi))
             .and_then(|ids| ids.iter().filter_map(|&i| view.agents.get(i)).max_by_key(|a| a.state));
         let Some(a) = agent else { return };
-        match &repo.worker {
-            Worker::Local(_) => herdr::focus(a.pane_id.clone()),
-            w => match w.remote() {
-                Some(h) => h.focus_agent(a.pane_id.clone()),
-                None => self.notice = Some(NOT_CONNECTED.to_string()),
-            },
+        // The herdr that has the agent: this machine's, the repository's host's or a mirror's.
+        if a.host == Host::Local {
+            herdr::focus(a.pane_id.clone());
+            return;
+        }
+        let mirror = self.mirror_worker(self.active, &a.host);
+        match mirror.as_ref().unwrap_or(&repo.worker).remote() {
+            Some(h) => h.focus_agent(a.pane_id.clone()),
+            None => self.notice = Some(NOT_CONNECTED.to_string()),
         }
     }
 
@@ -1966,17 +2147,22 @@ impl App {
         let Some(base) = self.snap.base.clone() else { return };
         let Some(repo) = self.repos.get(self.active) else { return };
         let (tx, id, name) = (self.tx.clone(), repo.id, w.name.clone());
+        // Checked (and later removed) where the herdr that has its workspace runs, so that herdr
+        // closes it; on a shared filesystem that may be a mirror's host.
+        let via = self.herdr_workspace_host(self.active, &w.path).unwrap_or_else(|| repo.host.clone());
+        let mirror = self.mirror_worker(self.active, &via);
         self.cleaning = Cleaning::Checking {
             path: w.path.clone(),
             confirmed: false,
         };
         self.notice = Some(format!("checking {name}…"));
-        repo.worker.cleanup_plan(
+        let via2 = via.clone();
+        mirror.as_ref().unwrap_or(&repo.worker).cleanup_plan(
             w,
             base,
             Box::new(move |plan| {
                 let plan = plan.map(Box::new).map_err(|e| format!("can't remove {name}: {e}"));
-                let _ = tx.send(UiMsg::CleanupPlan(id, plan));
+                let _ = tx.send(UiMsg::CleanupPlan(id, via2, plan));
             }),
         );
     }
@@ -2000,8 +2186,8 @@ impl App {
 
     /// Carry out a confirmed removal in the background (repository `id` checks everything once
     /// more).
-    fn remove_worktree(&mut self, id: u64, plan: cleanup::Plan) {
-        let Some(repo) = self.repos.iter().find(|r| r.id == id) else {
+    fn remove_worktree(&mut self, id: u64, via: Host, plan: cleanup::Plan) {
+        let Some(r) = self.repo_index(id) else {
             self.cleaning = Cleaning::Idle;
             self.notice = Some(format!("didn't remove {}: its repository is no longer watched", plan.name));
             return;
@@ -2009,7 +2195,8 @@ impl App {
         self.cleaning = Cleaning::Removing;
         self.notice = Some(format!("removing {}…", plan.name));
         let (tx, name) = (self.tx.clone(), plan.name.clone());
-        repo.worker.cleanup_run(
+        let mirror = self.mirror_worker(r, &via);
+        mirror.as_ref().unwrap_or(&self.repos[r].worker).cleanup_run(
             plan,
             Box::new(move |res| {
                 let _ = tx.send(UiMsg::CleanupDone(res.map_err(|e| format!("didn't remove {name}: {e}"))));
@@ -2021,8 +2208,8 @@ impl App {
     fn on_confirm_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('y') | KeyCode::Enter | KeyCode::Backspace => {
-                if let Some((id, plan)) = self.confirm.take() {
-                    self.remove_worktree(id, plan);
+                if let Some((id, via, plan)) = self.confirm.take() {
+                    self.remove_worktree(id, via, plan);
                 }
             }
             KeyCode::Esc | KeyCode::Char('n' | 'q') => {
@@ -2574,6 +2761,7 @@ mod tests {
                 label: "claude".into(),
                 state: herdr::AgentState::Working,
                 cwd: Some(PathBuf::from(cwd)),
+                host: Host::Local,
             })
             .collect();
         let workspaces = checkouts
@@ -2584,6 +2772,7 @@ mod tests {
                 label: String::new(),
                 panes: 1,
                 checkout: Some(PathBuf::from(c)),
+                host: Host::Local,
             })
             .collect();
         Some(Arc::new(herdr::View { agents, workspaces }))
@@ -2592,13 +2781,9 @@ mod tests {
     #[test]
     fn remote_hosts() {
         use crate::remote::{PROTOCOL, RepoInfo, ToClient};
-        let dir = std::env::temp_dir().join(format!("canopy-ui-remote-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         // ssh that runs the remote command line here, and a "server" that says its piece.
+        let dir = fake_ssh("remote");
         let fake_ssh = dir.join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nfor a; do last=$a; done\nexec sh -c \"$last\"\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let wt = crate::model::WorktreeView {
             path: "/r/a".into(),
             name: "main".into(),
@@ -2613,8 +2798,16 @@ mod tests {
                 herdr_dir: Some("/r/herdr".into()),
             },
             ToClient::Repos(vec![
-                Ok(RepoInfo { id: 0, common_dir: "/r/a/.git".into() }),
-                Ok(RepoInfo { id: 0, common_dir: "/r/a/.git".into() }),
+                Ok(RepoInfo {
+                    id: 0,
+                    common_dir: "/r/a/.git".into(),
+                    identity: None,
+                }),
+                Ok(RepoInfo {
+                    id: 0,
+                    common_dir: "/r/a/.git".into(),
+                    identity: None,
+                }),
                 Err("/r/nope: not a repository".into()),
             ]),
             ToClient::Snapshot {
@@ -2634,6 +2827,7 @@ mod tests {
                     label: "claude".into(),
                     state: herdr::AgentState::Blocked,
                     cwd: Some("/r/a/src".into()),
+                    host: Host::Local,
                 }],
                 workspaces: Vec::new(),
             }))),
@@ -2686,6 +2880,104 @@ mod tests {
         let e2 = err.clone();
         app.repos[0].worker.message("x".into(), Box::new(move |r| *e2.lock().unwrap() = Some(r)));
         assert_eq!(err.lock().unwrap().clone(), Some(Err(NOT_CONNECTED.to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ssh that runs the remote command line here, in a fresh temp dir.
+    fn fake_ssh(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("canopy-ui-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nfor a; do last=$a; done\nexec sh -c \"$last\"\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn shared_filesystem_repo_is_shown_once() {
+        use crate::remote::{PROTOCOL, RepoInfo, ToClient};
+        let dir = fake_ssh("mirror");
+        let repo_dir = dir.join("repo");
+        let ok = std::process::Command::new("git").args(["init", "-q"]).arg(&repo_dir).status().unwrap();
+        assert!(ok.success());
+        let paths = crate::git::discover(&repo_dir).unwrap();
+        let identity = crate::git::identity(&paths.common_dir);
+        assert!(identity.is_some());
+        let msgs = [
+            ToClient::Hello {
+                protocol: PROTOCOL,
+                version: "test".into(),
+                host: "node".into(),
+                herdr_dir: None,
+            },
+            // The same repository, as the other machine sees it.
+            ToClient::Repos(vec![Ok(RepoInfo {
+                id: 0,
+                common_dir: paths.common_dir.clone(),
+                identity: identity.clone(),
+            })]),
+            ToClient::Herdr(Some(Arc::new(herdr::View {
+                agents: vec![herdr::Agent {
+                    pane_id: "p9".into(),
+                    workspace_id: "w1".into(),
+                    label: "claude".into(),
+                    state: herdr::AgentState::Blocked,
+                    cwd: Some(crate::git::canonical(&repo_dir)),
+                    host: Host::Local,
+                }],
+                workspaces: Vec::new(),
+            }))),
+        ];
+        let script = dir.join("server.jsonl");
+        let mut out = Vec::new();
+        for m in &msgs {
+            crate::remote::send(&mut out, m).unwrap();
+        }
+        std::fs::write(&script, out).unwrap();
+        let sent = dir.join("sent");
+
+        let (tx, rx) = mpsc::channel();
+        let cfg = Config {
+            watch: false,
+            poll: false,
+            ..Config::default()
+        };
+        let mut app = App::new(tx, &cfg, LayoutMode::Stacked);
+        app.ssh = dir.join("ssh").into();
+        // Say the piece, keep what the client sends back, end.
+        app.remote_cmd = format!(
+            "cat '{}'; IFS= read -r line; printf '%s\\n' \"$line\" > '{}'; sleep 0.3; exit 3 #",
+            script.display(),
+            sent.display()
+        );
+        app.add_repo(paths, false);
+        app.add_remote("node".into(), vec![repo_dir.display().to_string()]);
+        let mut blocked_seen = 0;
+        loop {
+            let msg = rx.recv_timeout(Duration::from_secs(10)).expect("events");
+            let closed = matches!(&msg, UiMsg::Remote { event: remote::Event::Closed(_), .. });
+            app.handle(msg);
+            if app.repos.len() == 1 {
+                blocked_seen = blocked_seen.max(app.repo_agents_in_state(0, herdr::AgentState::Blocked));
+            }
+            if closed {
+                break;
+            }
+        }
+        assert_eq!(app.repos.len(), 1, "one repository, not two");
+        assert_eq!(app.repos[0].host, Host::Local, "this machine refreshes it");
+        assert_eq!(app.repos[0].mirrors.len(), 1);
+        assert_eq!(app.repos[0].mirrors[0].host, "node");
+        assert!(app.headers());
+        assert_eq!(blocked_seen, 1, "the other machine's agent is on the shared tree");
+        // The other machine was told to forward file events only.
+        let sent = std::fs::read_to_string(&sent).unwrap();
+        let msg: crate::remote::ToServer = serde_json::from_str(sent.trim()).unwrap();
+        assert!(
+            matches!(msg, crate::remote::ToServer::Watch { repo: 0, mode: crate::remote::Mode::Events }),
+            "{sent}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

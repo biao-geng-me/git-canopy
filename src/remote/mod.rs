@@ -5,9 +5,11 @@
 //!
 //! The wire is newline-delimited JSON, one message per line. The server speaks first with
 //! [`ToClient::Hello`] (the client ignores anything a login script printed before it), then
-//! [`ToClient::Repos`] (what each path argument resolved to), then snapshots, herdr views and
-//! replies as they come. The client sends [`ToServer`] requests and calls; closing its end
-//! stops the server.
+//! [`ToClient::Repos`] (what each path argument resolved to). Nothing is watched until the
+//! client says how with [`ToServer::Watch`] per repository: in full (snapshots), or only its
+//! file events ([`ToClient::Touched`]), for a repository on a filesystem shared with a machine
+//! that already watches it in full. Then snapshots, events, herdr views and replies come as they
+//! happen. The client sends [`ToServer`] requests and calls; closing its end stops the server.
 //!
 //! A snapshot's graph is sent only when it changed (`graph: None` keeps the previous one): it is
 //! by far the biggest part, and most snapshots are status changes.
@@ -29,7 +31,7 @@ use crate::model::{Snapshot, WorktreeView};
 use crate::watch::Request;
 
 /// Wire protocol version, checked in the hello: both sides must speak the same one.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// Server → client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +55,8 @@ pub enum ToClient {
         /// The snapshot's graph, `None` when it is the one sent last for this repository.
         graph: Option<Arc<Graph>>,
     },
+    /// File events of a repository watched with [`Mode::Events`] (for `watch::Request::Touched`).
+    Touched { repo: u64, paths: Vec<PathBuf> },
     /// What the server's herdr reports (`None`: not reachable there, or `--no-herdr`).
     Herdr(Option<Arc<herdr::View>>),
     /// The answer to [`ToServer::Call`] `id`.
@@ -63,11 +67,27 @@ pub enum ToClient {
 pub struct RepoInfo {
     pub id: u64,
     pub common_dir: PathBuf,
+    /// `git::identity`: equal for the same repository seen from two machines.
+    pub identity: Option<String>,
+}
+
+/// How the server watches a repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    /// A worker and its snapshots, as locally.
+    Full,
+    /// Only file events, forwarded ([`ToClient::Touched`]): another machine refreshes it.
+    Events,
 }
 
 /// Client → server.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ToServer {
+    /// Start (or switch) watching repository `repo` this way.
+    Watch {
+        repo: u64,
+        mode: Mode,
+    },
     Request {
         repo: u64,
         req: Request,

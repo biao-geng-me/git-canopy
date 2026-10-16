@@ -121,6 +121,10 @@ impl Default for Config {
 pub enum Request {
     Refresh,
     LoadMore,
+    /// Paths another machine saw change (its events-only watcher, [`spawn_events`]): its file
+    /// events, which this machine's watches never see on a shared filesystem. Handled like this
+    /// worker's own events, except that any worktree counts, watched here or not.
+    Touched(Vec<PathBuf>),
 }
 
 enum Msg {
@@ -140,6 +144,12 @@ enum Msg {
 /// answer the same requests through a remote handle.
 pub struct Handle {
     tx: Sender<Msg>,
+    calls: Calls,
+}
+
+/// The requests that need no worker (diffs, copy text, cleanup), each run on a thread of its own.
+#[derive(Clone, Debug)]
+pub struct Calls {
     common_dir: PathBuf,
     herdr: bool,
 }
@@ -150,6 +160,38 @@ pub type Reply<T> = Box<dyn FnOnce(Result<T, String>) + Send>;
 impl Handle {
     pub fn request(&self, req: Request) {
         let _ = self.tx.send(Msg::Req(req));
+    }
+
+    pub fn calls(&self) -> &Calls {
+        &self.calls
+    }
+
+    pub fn doc(&self, target: diff::Target, reply: Reply<diff::DiffDoc>) {
+        self.calls.doc(target, reply);
+    }
+
+    pub fn patch(&self, target: diff::Target, file: Option<String>, reply: Reply<String>) {
+        self.calls.patch(target, file, reply);
+    }
+
+    pub fn message(&self, sha: String, reply: Reply<String>) {
+        self.calls.message(sha, reply);
+    }
+
+    pub fn cleanup_plan(&self, w: WorktreeView, base: String, reply: Reply<cleanup::Plan>) {
+        self.calls.cleanup_plan(w, base, reply);
+    }
+
+    pub fn cleanup_run(&self, plan: cleanup::Plan, reply: Reply<String>) {
+        self.calls.cleanup_run(plan, reply);
+    }
+}
+
+impl Calls {
+    /// Calls for the repository at `common_dir`; `herdr`: consult this machine's herdr when
+    /// cleaning up.
+    pub fn new(common_dir: PathBuf, herdr: bool) -> Calls {
+        Calls { common_dir, herdr }
     }
 
     /// A diff document (commit, worktree, branch or overlaps).
@@ -221,13 +263,37 @@ pub fn spawn_with<F>(paths: RepoPaths, cfg: Config, hub: Arc<Hub>, emit: F) -> H
 where
     F: Fn(Arc<Snapshot>) + Send + 'static,
 {
+    start(paths, cfg, hub, Box::new(emit), None)
+}
+
+/// Watch the repository's files without running any git status, log or poll, and hand what
+/// changed to `forward` (worktree roots that were edited, git dir paths that matter): for a
+/// repository that a worker on another machine refreshes, on a filesystem both see. That
+/// worker gets them as [`Request::Touched`]; this machine's edits are invisible to its watches.
+/// The handle answers calls (diffs, cleanup) as usual.
+pub fn spawn_events<F>(paths: RepoPaths, cfg: Config, hub: Arc<Hub>, forward: F) -> Handle
+where
+    F: Fn(Vec<PathBuf>) + Send + 'static,
+{
+    let cfg = Config { poll: false, ..cfg };
+    start(paths, cfg, hub, Box::new(|_| {}), Some(Box::new(forward)))
+}
+
+fn start(
+    paths: RepoPaths,
+    cfg: Config,
+    hub: Arc<Hub>,
+    emit: Box<dyn Fn(Arc<Snapshot>) + Send>,
+    forward: Option<Forward>,
+) -> Handle {
     let (tx, rx) = mpsc::channel();
     let fs_tx = tx.clone();
     let (common_dir, herdr) = (paths.common_dir.clone(), cfg.herdr);
     thread::Builder::new()
         .name("canopy-refresh".into())
         .spawn(move || {
-            let mut w = Worker::new(paths, cfg, Box::new(emit));
+            let mut w = Worker::new(paths, cfg, emit);
+            w.forward = forward;
             if w.cfg.watch {
                 w.start_watcher(&hub, fs_tx);
             }
@@ -235,13 +301,20 @@ where
             w.run(rx);
         })
         .expect("spawn refresh thread");
-    Handle { tx, common_dir, herdr }
+    Handle {
+        tx,
+        calls: Calls { common_dir, herdr },
+    }
 }
+
+type Forward = Box<dyn Fn(Vec<PathBuf>) + Send>;
 
 struct Worker {
     paths: RepoPaths,
     cfg: Config,
     emit: Box<dyn Fn(Arc<Snapshot>) + Send>,
+    /// Events-only ([`spawn_events`]): where file events go instead of being acted on.
+    forward: Option<Forward>,
     /// Its watches in the shared hub (`None`: not watching, polling only).
     watches: Option<Watches>,
     watched_worktrees_dir: bool,
@@ -299,6 +372,7 @@ impl Worker {
             paths,
             cfg,
             emit,
+            forward: None,
             watches: None,
             watched_worktrees_dir: false,
             trees: HashMap::new(),
@@ -450,6 +524,11 @@ impl Worker {
     }
 
     fn initial_load(&mut self) {
+        if self.forward.is_some() {
+            self.list_worktrees();
+            self.sync_tree_watches();
+            return;
+        }
         // Worktree list first (fast), then statuses, then the graph: the overview fills in
         // progressively instead of waiting on the slowest piece. Worktree watches go in before
         // the first statuses, so no edit can slip in between the two unnoticed.
@@ -470,6 +549,7 @@ impl Worker {
 
     fn run(&mut self, rx: mpsc::Receiver<Msg>) {
         let mut pending: Vec<PathBuf> = Vec::new();
+        let mut touched: Vec<PathBuf> = Vec::new();
         let mut debounce_until: Option<Instant> = None;
         loop {
             let mut deadline = Instant::now() + Duration::from_secs(86_400);
@@ -487,6 +567,17 @@ impl Worker {
                     pending.extend(paths);
                     debounce_until.get_or_insert_with(|| Instant::now() + DEBOUNCE);
                 }
+                Ok(Msg::Req(Request::Touched(paths))) if self.forward.is_none() => {
+                    touched.extend(paths);
+                    debounce_until.get_or_insert_with(|| Instant::now() + DEBOUNCE);
+                }
+                Ok(Msg::Req(Request::Touched(_))) => {}
+                Ok(Msg::Req(Request::Refresh)) if self.forward.is_some() => {
+                    self.unwatchable.clear();
+                    self.list_worktrees();
+                    self.sync_tree_watches();
+                }
+                Ok(Msg::Req(Request::LoadMore)) if self.forward.is_some() => {}
                 Ok(Msg::Req(Request::Refresh)) => self.full_refresh(),
                 Ok(Msg::Req(Request::LoadMore)) => {
                     if self.commits.len() >= self.limit {
@@ -501,7 +592,12 @@ impl Worker {
             let now = Instant::now();
             if debounce_until.is_some_and(|d| now >= d) {
                 debounce_until = None;
-                self.on_fs_events(std::mem::take(&mut pending));
+                if !pending.is_empty() {
+                    self.on_fs_events(std::mem::take(&mut pending), false);
+                }
+                if !touched.is_empty() {
+                    self.on_fs_events(std::mem::take(&mut touched), true);
+                }
             }
             self.run_due(now);
         }
@@ -567,13 +663,27 @@ impl Worker {
         self.publish();
     }
 
-    fn on_fs_events(&mut self, paths: Vec<PathBuf>) {
+    /// `forwarded`: the paths come from another machine's watcher ([`Request::Touched`]), already
+    /// filtered there; a worktree counts whether this machine watches it or not.
+    fn on_fs_events(&mut self, paths: Vec<PathBuf>, forwarded: bool) {
         let common = self.paths.common_dir.clone();
         let mut targets: HashSet<PathBuf> = HashSet::new();
         let mut edited: HashSet<PathBuf> = HashSet::new();
         let mut new_dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut git_relevant = false;
+        let mut git_paths: Vec<PathBuf> = Vec::new();
         for p in &paths {
+            if forwarded && !p.starts_with(&common) {
+                let root = self
+                    .worktrees
+                    .iter()
+                    .filter(|w| w.has_worktree() && p.starts_with(&w.path))
+                    .max_by_key(|w| w.path.as_os_str().len());
+                if let Some(w) = root {
+                    edited.insert(w.path.clone());
+                }
+                continue;
+            }
             let Ok(rel) = p.strip_prefix(&common) else {
                 // A working-tree edit in a watched worktree (deepest root wins for nested ones).
                 let Some(root) = self
@@ -602,6 +712,7 @@ impl Worker {
                 continue;
             }
             git_relevant = true;
+            git_paths.push(p.clone());
             if first == "worktrees" {
                 if let Some(name) = comps.next() {
                     let admin = common.join("worktrees").join(&*name);
@@ -621,6 +732,20 @@ impl Worker {
         }
         for (root, dir) in new_dirs {
             self.watch_new_dir(&root, &dir);
+        }
+        if let Some(forward) = &self.forward {
+            // Events-only: the worker that refreshes this repository acts on them. Edited
+            // worktrees go as their roots (the worker needs no more), git dir paths as they are.
+            let mut out: Vec<PathBuf> = edited.into_iter().collect();
+            out.extend(git_paths);
+            if !out.is_empty() {
+                forward(out);
+            }
+            if git_relevant && self.list_worktrees() {
+                self.ensure_worktrees_watch();
+                self.sync_tree_watches();
+            }
+            return;
         }
 
         // Edits: right away unless this worktree was checked very recently.
@@ -649,6 +774,31 @@ impl Worker {
             self.refresh_changes();
             self.publish();
         }
+    }
+
+    /// Events-only: reload just the worktree list (which directories to watch); returns whether
+    /// it changed.
+    fn list_worktrees(&mut self) -> bool {
+        let Ok((entries, raw)) = git::worktree::list(self.repo_dir()) else { return false };
+        let mut h = DefaultHasher::new();
+        raw.hash(&mut h);
+        let fp = h.finish();
+        if fp == self.fingerprint && !self.worktrees.is_empty() {
+            return false;
+        }
+        self.fingerprint = fp;
+        self.worktrees = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut v = WorktreeView::from_entry(e, i == 0, None);
+                if v.has_worktree() {
+                    v.admin_dir = git::worktree::admin_dir(&v.path);
+                }
+                v
+            })
+            .collect();
+        true
     }
 
     /// Reload worktree list and refs; returns whether anything changed.

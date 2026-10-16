@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::Host;
+
 use json::Json;
 
 /// An agent's lifecycle state, ordered by urgency (most urgent last).
@@ -57,6 +59,9 @@ pub struct Agent {
     pub state: AgentState,
     /// `foreground_cwd`, else `cwd` (canonicalized when it exists).
     pub cwd: Option<PathBuf>,
+    /// The machine whose herdr reports it (set by whoever receives a remote view).
+    #[serde(skip)]
+    pub host: Host,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +71,28 @@ pub struct Workspace {
     pub panes: usize,
     /// The worktree the herdr workspace belongs to, if any (canonicalized when it exists).
     pub checkout: Option<PathBuf>,
+    /// The machine whose herdr has it.
+    #[serde(skip)]
+    pub host: Host,
+}
+
+impl View {
+    /// This view as reported by `host`'s herdr: every agent and workspace tagged with it.
+    pub fn on(mut self, host: &Host) -> View {
+        self.agents.iter_mut().for_each(|a| a.host = host.clone());
+        self.workspaces.iter_mut().for_each(|w| w.host = host.clone());
+        self
+    }
+
+    /// Several hosts' views as one (agents and workspaces keep their hosts).
+    pub fn merged<'a>(views: impl IntoIterator<Item = &'a View>) -> View {
+        let mut out = View::default();
+        for v in views {
+            out.agents.extend(v.agents.iter().cloned());
+            out.workspaces.extend(v.workspaces.iter().cloned());
+        }
+        out
+    }
 }
 
 /// What herdr currently reports.
@@ -101,6 +128,7 @@ pub fn parse_agents(resp: &Json) -> Option<Vec<Agent>> {
                         .to_string(),
                     state: AgentState::parse(a.get_str("agent_status").unwrap_or_default()),
                     cwd: path_of(a.get_str("foreground_cwd")).or_else(|| path_of(a.get_str("cwd"))),
+                    host: Host::Local,
                 })
             })
             .collect(),
@@ -122,6 +150,7 @@ pub fn parse_workspaces(resp: &Json) -> Option<Vec<Workspace>> {
                     label: w.get_str("label").unwrap_or_default().to_string(),
                     panes: w.get("pane_count").and_then(Json::num).unwrap_or(0.0) as usize,
                     checkout: path_of(w.get("worktree").and_then(|t| t.get_str("checkout_path"))),
+                    host: Host::Local,
                 })
             })
             .collect(),
@@ -146,7 +175,8 @@ pub fn assign(view: &View, worktrees: &[PathBuf]) -> Vec<Vec<usize>> {
     for (ai, a) in view.agents.iter().enumerate() {
         let by_cwd = a.cwd.as_deref().and_then(|c| deepest(c, worktrees));
         let by_workspace = || {
-            let ws = view.workspaces.iter().find(|w| w.id == a.workspace_id)?;
+            // Workspace ids are per herdr server: two hosts' `w1` are different workspaces.
+            let ws = view.workspaces.iter().find(|w| w.id == a.workspace_id && w.host == a.host)?;
             deepest(ws.checkout.as_deref()?, worktrees)
         };
         if let Some(wi) = by_cwd.or_else(by_workspace) {
