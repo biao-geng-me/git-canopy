@@ -74,7 +74,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("canopy {}", env!("CARGO_PKG_VERSION"));
+                println!("canopy {}", env!("CANOPY_BUILD"));
                 return Ok(None);
             }
             "-i" | "--interval" => {

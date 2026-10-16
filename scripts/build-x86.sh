@@ -8,6 +8,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 REV=$(git rev-parse --short HEAD)
+# The export has no .git: hand build.rs the commit it is built from.
+BUILD_REV=$(git log -1 --format='%h %cs' "$REV")
 OUT=$ROOT/target/x86_64
 mkdir -p "$OUT"
 # --export=NONE: an aarch64 PATH/CARGO_HOME inherited from tigris would pick the Arm toolchain.
@@ -17,6 +19,7 @@ sbatch --parsable -M sporc -p debug -A flowlab -q qos_tier3 -J canopy-x86 -c 8 -
 set -euo pipefail
 export CARGO_HOME=\$HOME/sw/x86_64/cargo RUSTUP_HOME=\$HOME/sw/x86_64/rustup
 export PATH=\$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin
+export CANOPY_BUILD_REV="$BUILD_REV"
 SRC=\$(mktemp -d /tmp/canopy-x86.XXXXXX)
 trap 'rm -rf "\$SRC"' EXIT
 git -C "$ROOT" archive $REV | tar -x -C "\$SRC"

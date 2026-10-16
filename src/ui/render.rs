@@ -2056,16 +2056,17 @@ fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
 
 fn draw_help(f: &mut Frame) {
     let area = f.area();
+    let build = format!(" canopy {}", env!("CANOPY_BUILD"));
     let widest = HELP.iter().map(|(_, d)| d.width()).max().unwrap_or(0) as u16;
-    let w = (1 + 19 + widest + 3).min(area.width); // " key  description " + frame
-    let h = (HELP.len() as u16 + 4).min(area.height);
+    let w = (1 + 19 + widest + 3).max(build.width() as u16 + 3).min(area.width); // " key  description " + frame
+    let h = (HELP.len() as u16 + 2 + 4).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
     };
-    let lines: Vec<Line> = HELP
+    let mut lines: Vec<Line> = HELP
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
@@ -2074,6 +2075,8 @@ fn draw_help(f: &mut Frame) {
             ])
         })
         .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(build, Style::new().fg(C_DIM)));
     f.render_widget(Clear, rect);
     // A popup over other content keeps a full frame.
     let block = Block::bordered()
