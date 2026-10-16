@@ -37,6 +37,7 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
         protocol: PROTOCOL,
         version: env!("CANOPY_BUILD").to_string(),
         host: hostname(),
+        herdr_dir: if with_herdr { herdr::worktree_dir() } else { None },
     })));
 
     // Resolve every path first, so the client knows the ids before the first snapshot.
@@ -126,6 +127,10 @@ fn dispatch(h: &Handle, call: Call, id: u64, tx: &Sender<Out>) {
             h.cleanup_plan(*worktree, base, reply(tx, id, |p| Answer::Plan(Box::new(p))))
         }
         Call::CleanupRun(plan) => h.cleanup_run(*plan, reply(tx, id, Answer::Text)),
+        Call::FocusAgent(pane) => {
+            herdr::focus(pane);
+            reply(tx, id, Answer::Text)(Ok(String::new()));
+        }
     }
 }
 

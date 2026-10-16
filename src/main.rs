@@ -9,13 +9,16 @@ const USAGE: &str = "\
 canopy - live view of every git worktree of a repo
 
 USAGE:
-    canopy [OPTIONS] [PATH...]
-    git canopy [OPTIONS] [PATH...]
+    canopy [OPTIONS] [PATH | HOST:PATH...]
+    git canopy [OPTIONS] [PATH | HOST:PATH...]
     canopy serve [OPTIONS] [PATH...]
 
 ARGS:
     PATH    any directory inside a repository (default: current directory); several watch
             several repositories, listed in that order
+    HOST:PATH
+            a repository on another machine, watched there by `canopy serve` over ssh (HOST
+            as ssh takes it; PATH relative to the home directory there unless absolute)
 
     serve   watch the repositories for a canopy on another machine, which runs this over
             ssh and talks to it on stdin/stdout (-i, --no-poll, --base, --no-watch and
@@ -35,6 +38,9 @@ OPTIONS:
                             the first of lazygit, gitui, tig on PATH)
         --nerd-font         Nerd Font icons for untracked files and folders (default:
                             $CANOPY_NERD_FONT=1)
+        --remote-cmd <CMD>  how to run canopy on a remote host, as a shell command line there
+                            (default: $CANOPY_REMOTE_CMD, else canopy), e.g.
+                            'XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) ~/bin/canopy'
     -h, --help              print help
     -V, --version           print version
 
@@ -46,12 +52,15 @@ struct Args {
     /// `canopy serve`.
     serve: bool,
     paths: Vec<PathBuf>,
+    /// `HOST:PATH` arguments.
+    remote: Vec<(String, String)>,
     cfg: Config,
     layout: LayoutMode,
     herdr: bool,
     herdr_repos: bool,
     git_tui: Option<String>,
     nerd_font: bool,
+    remote_cmd: String,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -62,6 +71,10 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut herdr_repos = false;
     let mut git_tui = std::env::var("CANOPY_GIT_TUI").ok().filter(|s| !s.trim().is_empty());
     let mut nerd_font = std::env::var("CANOPY_NERD_FONT").is_ok_and(|v| v == "1");
+    let mut remote_cmd = std::env::var("CANOPY_REMOTE_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "canopy".into());
     let mut it = std::env::args_os().skip(1).peekable();
     let serve = it.next_if(|a| a == "serve").is_some();
     while let Some(arg) = it.next() {
@@ -107,6 +120,12 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--herdr-repos" => herdr_repos = true,
             "--nerd-font" => nerd_font = true,
             "--git-tui" => git_tui = Some(value("--git-tui")?).filter(|s| !s.trim().is_empty()),
+            "--remote-cmd" => {
+                remote_cmd = value("--remote-cmd")?;
+                if remote_cmd.trim().is_empty() {
+                    return Err("--remote-cmd needs a command".into());
+                }
+            }
             "--layout" => {
                 layout = match value("--layout")?.as_str() {
                     "stacked" => LayoutMode::Stacked,
@@ -118,6 +137,17 @@ fn parse_args() -> Result<Option<Args>, String> {
             _ => paths.push(PathBuf::from(arg)),
         }
     }
+    // HOST:PATH, unless it is a local directory (`./a:b` stays local).
+    let mut remote = Vec::new();
+    if !serve {
+        paths.retain(|p| match remote_arg(p) {
+            Some(r) => {
+                remote.push(r);
+                false
+            }
+            None => true,
+        });
+    }
     if serve && herdr_repos {
         return Err("serve doesn't take --herdr-repos (yet)".to_string());
     }
@@ -127,13 +157,30 @@ fn parse_args() -> Result<Option<Args>, String> {
     Ok(Some(Args {
         serve,
         paths,
+        remote,
         cfg,
         layout,
         herdr,
         herdr_repos,
         git_tui,
         nerd_font,
+        remote_cmd,
     }))
+}
+
+/// `HOST:PATH` as (host, path), like scp: a colon before any slash, and not a local directory.
+/// An empty path is the home directory there.
+fn remote_arg(arg: &Path) -> Option<(String, String)> {
+    if arg.is_dir() {
+        return None;
+    }
+    let s = arg.to_str()?;
+    let (host, path) = s.split_once(':')?;
+    if host.is_empty() || host.contains('/') {
+        return None;
+    }
+    let path = if path.is_empty() { "." } else { path };
+    Some((host.to_string(), path.to_string()))
 }
 
 fn main() -> ExitCode {
@@ -158,7 +205,7 @@ fn main() -> ExitCode {
     }
     // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
     let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
-    if args.paths.is_empty() {
+    if args.paths.is_empty() && args.remote.is_empty() {
         // The current directory, unless --herdr-repos finds the repositories (then it counts
         // only if it is in one).
         match canopy::git::discover(Path::new(".")) {
@@ -184,18 +231,45 @@ fn main() -> ExitCode {
             }
         }
     }
+    // One connection per host, its paths in order.
+    let mut remotes: Vec<(String, Vec<String>)> = Vec::new();
+    for (host, path) in args.remote {
+        match remotes.iter_mut().find(|(h, _)| *h == host) {
+            Some((_, paths)) if paths.contains(&path) => {}
+            Some((_, paths)) => paths.push(path),
+            None => remotes.push((host, vec![path])),
+        }
+    }
     let opts = canopy::ui::Options {
         layout: args.layout,
         herdr: args.herdr,
         herdr_repos: args.herdr_repos,
         git_tui: args.git_tui,
         nerd_font: args.nerd_font,
+        remote_cmd: args.remote_cmd,
     };
-    match canopy::ui::run(repos, args.cfg, opts) {
+    match canopy::ui::run(repos, remotes, args.cfg, opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("canopy: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_arguments() {
+        let r = |s: &str| remote_arg(Path::new(s));
+        assert_eq!(r("gh-b-001:/home/me/proj"), Some(("gh-b-001".into(), "/home/me/proj".into())));
+        assert_eq!(r("me@box:proj"), Some(("me@box".into(), "proj".into())));
+        assert_eq!(r("box:"), Some(("box".into(), ".".into())));
+        assert_eq!(r("./a:b"), None);
+        assert_eq!(r("/abs/a:b"), None);
+        assert_eq!(r(":x"), None);
+        assert_eq!(r("plain"), None);
     }
 }

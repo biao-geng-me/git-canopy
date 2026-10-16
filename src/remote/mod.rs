@@ -40,6 +40,9 @@ pub enum ToClient {
         version: String,
         /// The server's host name.
         host: String,
+        /// Where the server's herdr creates worktrees (`herdr::worktree_dir`; `None` with
+        /// `--no-herdr`), for the "herdr made it but can't see it" cleanup guard.
+        herdr_dir: Option<PathBuf>,
     },
     /// What each path argument resolved to, in order (two paths in one repository get the same
     /// id).
@@ -81,10 +84,18 @@ pub enum ToServer {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Call {
     Doc(Target),
-    Patch { target: Target, file: Option<String> },
+    Patch {
+        target: Target,
+        file: Option<String>,
+    },
     Message(String),
-    CleanupPlan { worktree: Box<WorktreeView>, base: String },
+    CleanupPlan {
+        worktree: Box<WorktreeView>,
+        base: String,
+    },
     CleanupRun(Box<Plan>),
+    /// Ask the server's herdr to focus this agent pane (`a`); answered with empty text.
+    FocusAgent(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

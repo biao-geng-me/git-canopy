@@ -33,6 +33,7 @@ use crate::git::RepoPaths;
 use crate::graph::RowKind;
 use crate::herdr;
 use crate::model::{Cleanup, Host, Snapshot};
+use crate::remote::client::{self as remote, Conn, RemoteHandle};
 use crate::watch::{self, Config, Request};
 use diff_view::{Action, DiffView};
 use inset::{Entry, Expansion, Item, Key, Open, VLine};
@@ -41,6 +42,12 @@ pub enum UiMsg {
     Input(Event),
     /// A new snapshot of the repository with id `.0` (`Repo::id`).
     Snapshot(u64, Arc<Snapshot>),
+    /// News from the server of remote host `host`, connection attempt number `attempt`.
+    Remote {
+        host: String,
+        attempt: u64,
+        event: remote::Event,
+    },
     /// Which repository each directory herdr reported is in (`None`: not in one), for
     /// `--herdr-repos`.
     Discovered(Vec<(PathBuf, Option<RepoPaths>)>),
@@ -227,6 +234,12 @@ pub struct App {
     pub herdr: Option<Arc<herdr::View>>,
     /// Every watched repository; `snap` and `graph` are those of `repos[active]`.
     pub repos: Vec<Repo>,
+    /// The remote hosts (`host:path` arguments), one connection each.
+    pub remotes: Vec<Remote>,
+    /// How `canopy serve` is started on a remote host (`--remote-cmd`), before its arguments.
+    remote_cmd: String,
+    /// The ssh program (`CANOPY_SSH`, for tests: a script that runs the command line locally).
+    ssh: std::ffi::OsString,
     /// The repository the graph shows: always that of the selected worktree-list row.
     pub active: usize,
     /// What each base row of the worktree list is (its `VLine::Row` indexes this).
@@ -286,7 +299,11 @@ pub struct Repo {
     pub snap: Arc<Snapshot>,
     /// Shown in its header row until the first snapshot names it.
     pub name: String,
-    worker: watch::Handle,
+    worker: Worker,
+    /// On a remote host: which of its path arguments this is, and the server's id for it.
+    remote: Option<RemoteSlot>,
+    /// Why there is nothing to show (a remote path that isn't in a repository).
+    pub error: Option<String>,
     /// herdr agents per worktree (indexes into `App::herdr`'s agents), parallel to its worktrees.
     pub agents: Vec<Vec<usize>>,
     /// Its graph panel (cursor, expansion) while another repository is shown.
@@ -299,6 +316,108 @@ pub struct Repo {
     /// Since when no herdr agent or workspace is in it.
     unseen_since: Option<Instant>,
 }
+
+/// What answers for a repository: its own worker, or the server of its host (`None` while that
+/// host isn't connected). The same requests either way.
+enum Worker {
+    Local(watch::Handle),
+    Remote(Option<RemoteHandle>),
+}
+
+const NOT_CONNECTED: &str = "its host isn't connected";
+
+impl Worker {
+    fn remote(&self) -> Option<&RemoteHandle> {
+        match self {
+            Worker::Remote(h) => h.as_ref(),
+            Worker::Local(_) => None,
+        }
+    }
+
+    fn request(&self, req: Request) {
+        match self {
+            Worker::Local(h) => h.request(req),
+            Worker::Remote(Some(h)) => h.request(req),
+            Worker::Remote(None) => {}
+        }
+    }
+
+    fn doc(&self, target: diff::Target, reply: watch::Reply<DiffDoc>) {
+        match self {
+            Worker::Local(h) => h.doc(target, reply),
+            Worker::Remote(Some(h)) => h.doc(target, reply),
+            Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
+        }
+    }
+
+    fn patch(&self, target: diff::Target, file: Option<String>, reply: watch::Reply<String>) {
+        match self {
+            Worker::Local(h) => h.patch(target, file, reply),
+            Worker::Remote(Some(h)) => h.patch(target, file, reply),
+            Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
+        }
+    }
+
+    fn message(&self, sha: String, reply: watch::Reply<String>) {
+        match self {
+            Worker::Local(h) => h.message(sha, reply),
+            Worker::Remote(Some(h)) => h.message(sha, reply),
+            Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
+        }
+    }
+
+    fn cleanup_plan(&self, w: crate::model::WorktreeView, base: String, reply: watch::Reply<cleanup::Plan>) {
+        match self {
+            Worker::Local(h) => h.cleanup_plan(w, base, reply),
+            Worker::Remote(Some(h)) => h.cleanup_plan(w, base, reply),
+            Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
+        }
+    }
+
+    fn cleanup_run(&self, plan: cleanup::Plan, reply: watch::Reply<String>) {
+        match self {
+            Worker::Local(h) => h.cleanup_run(plan, reply),
+            Worker::Remote(Some(h)) => h.cleanup_run(plan, reply),
+            Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RemoteSlot {
+    /// Index into its host's `Remote::paths`.
+    arg: usize,
+    /// The server's id for the repository, once it answered.
+    id: Option<u64>,
+}
+
+/// A remote host and its `canopy serve` connection.
+pub struct Remote {
+    pub host: String,
+    /// The paths asked for there, in command-line order.
+    paths: Vec<String>,
+    conn: Option<Conn>,
+    /// Connection attempt; events from earlier ones are ignored.
+    attempt: u64,
+    pub state: RemoteState,
+    /// What its herdr reports (`None`: not reachable there).
+    pub herdr: Option<Arc<herdr::View>>,
+    /// Where its herdr creates worktrees.
+    herdr_dir: Option<PathBuf>,
+    backoff: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteState {
+    Connecting,
+    /// Connected to canopy `version` there.
+    Up(String),
+    /// Disconnected (or never connected), retried at `retry`.
+    Down { reason: String, retry: Instant },
+}
+
+const RETRY_MIN: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// How long a repository found through herdr stays after its last agent and workspace are gone
 /// (an agent restarted in it, or the user still reviewing what it did).
@@ -343,6 +462,9 @@ impl App {
             docs: HashMap::new(),
             herdr: None,
             repos: Vec::new(),
+            remotes: Vec::new(),
+            remote_cmd: "canopy".into(),
+            ssh: std::env::var_os("CANOPY_SSH").unwrap_or_else(|| "ssh".into()),
             active: 0,
             wt_rows: Vec::new(),
             graph_jump: None,
@@ -396,14 +518,15 @@ impl App {
         };
         let Some(repo) = self.repos.get(r) else { return String::new() };
         let own = name(repo);
-        if self.repos.iter().filter(|x| name(x) == own).count() < 2 {
-            return own;
+        let at = repo.host.remote().map(|h| format!(" @ {h}")).unwrap_or_default();
+        if self.repos.iter().filter(|x| x.host == repo.host && name(x) == own).count() < 2 {
+            return format!("{own}{at}");
         }
         let main = repo.snap.worktrees.iter().find(|w| w.is_main).map(|w| w.path.as_path());
-        let dir = main.unwrap_or(&repo.snap.common_dir);
+        let dir = main.unwrap_or(&repo.common_dir);
         match dir.parent().and_then(Path::file_name) {
-            Some(parent) => format!("{}/{own}", parent.to_string_lossy()),
-            None => own,
+            Some(parent) => format!("{}/{own}{at}", parent.to_string_lossy()),
+            None => format!("{own}{at}"),
         }
     }
 
@@ -471,26 +594,207 @@ impl App {
         let worker = watch::spawn_with(paths, self.cfg.clone(), self.hub.clone(), move |s| {
             let _ = tx.send(UiMsg::Snapshot(id, s));
         });
-        self.repos.push(Repo {
+        self.push_repo(Repo {
             id,
             host: Host::Local,
             common_dir,
             snap: Arc::new(Snapshot::default()),
             name,
-            worker,
+            worker: Worker::Local(worker),
+            remote: None,
+            error: None,
             agents: Vec::new(),
             graph: Panel::default(),
             more_requested_at: 0,
             from_herdr,
             unseen_since: None,
         });
+        // The second repository brings header rows: stay on the same row.
+        self.relocate(Focus::Worktrees, line);
+    }
+
+    /// List `repo` last.
+    fn push_repo(&mut self, repo: Repo) {
+        self.next_id = self.next_id.max(repo.id + 1);
+        self.repos.push(repo);
         if self.repos.len() == 1 {
             self.snap = self.repos[0].snap.clone();
         }
         self.map_agents();
         self.rebuild();
-        // The second repository brings header rows: stay on the same row.
-        self.relocate(Focus::Worktrees, line);
+    }
+
+    /// Watch `paths` on remote `host` through `canopy serve` there: one placeholder repository
+    /// per path until the server says what they are.
+    fn add_remote(&mut self, host: String, paths: Vec<String>) {
+        for (arg, path) in paths.iter().enumerate() {
+            let id = self.next_id;
+            let name = Path::new(path)
+                .file_name()
+                .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+            self.push_repo(Repo {
+                id,
+                host: Host::Ssh(host.clone()),
+                common_dir: PathBuf::from(path),
+                snap: Arc::new(Snapshot::default()),
+                name,
+                worker: Worker::Remote(None),
+                remote: Some(RemoteSlot { arg, id: None }),
+                error: None,
+                agents: Vec::new(),
+                graph: Panel::default(),
+                more_requested_at: 0,
+                from_herdr: false,
+                unseen_since: None,
+            });
+        }
+        self.remotes.push(Remote {
+            host,
+            paths,
+            conn: None,
+            attempt: 0,
+            state: RemoteState::Connecting,
+            herdr: None,
+            herdr_dir: None,
+            backoff: RETRY_MIN,
+        });
+        self.connect(self.remotes.len() - 1);
+    }
+
+    /// (Re)connect to remote host `ri`.
+    fn connect(&mut self, ri: usize) {
+        let with_herdr = self.with_herdr;
+        let (cfg, program, tx) = (self.cfg.clone(), self.remote_cmd.clone(), self.tx.clone());
+        let rm = &mut self.remotes[ri];
+        rm.attempt += 1;
+        rm.state = RemoteState::Connecting;
+        let (host, attempt) = (rm.host.clone(), rm.attempt);
+        let cmd = remote::ssh(&self.ssh, &host, &program, &remote::serve_args(&cfg, with_herdr, &rm.paths));
+        let emit_host = host.clone();
+        match remote::connect(cmd, move |event| {
+            let host = emit_host.clone();
+            let _ = tx.send(UiMsg::Remote { host, attempt, event });
+        }) {
+            Ok(conn) => rm.conn = Some(conn),
+            Err(e) => self.disconnected(ri, format!("can't run ssh: {e}")),
+        }
+    }
+
+    /// Remote host `ri`'s connection ended: keep its repositories' last snapshots, retry later.
+    fn disconnected(&mut self, ri: usize, reason: String) {
+        let rm = &mut self.remotes[ri];
+        rm.conn = None;
+        rm.herdr = None;
+        rm.state = RemoteState::Down {
+            reason,
+            retry: Instant::now() + rm.backoff,
+        };
+        rm.backoff = (rm.backoff * 2).min(RETRY_MAX);
+        let host = Host::Ssh(rm.host.clone());
+        for repo in self.repos.iter_mut().filter(|r| r.host == host) {
+            repo.worker = Worker::Remote(None);
+        }
+        self.map_agents();
+    }
+
+    fn on_remote(&mut self, host: String, attempt: u64, event: remote::Event) {
+        let Some(ri) = self.remotes.iter().position(|x| x.host == host && x.attempt == attempt) else {
+            return;
+        };
+        let rm = &mut self.remotes[ri];
+        match event {
+            remote::Event::Hello { version, herdr_dir, .. } => {
+                rm.state = RemoteState::Up(version);
+                rm.backoff = RETRY_MIN;
+                rm.herdr_dir = herdr_dir;
+            }
+            remote::Event::Repos(answers) => self.remote_repos(ri, &answers),
+            remote::Event::Snapshot(id, snap) => {
+                let host = Host::Ssh(host);
+                let r = self
+                    .repos
+                    .iter()
+                    .position(|x| x.host == host && x.remote.is_some_and(|s| s.id == Some(id)));
+                if let Some(r) = r {
+                    self.on_repo_snapshot(r, snap);
+                }
+            }
+            remote::Event::Herdr(view) => {
+                rm.herdr = view;
+                self.map_agents();
+            }
+            remote::Event::Closed(reason) => self.disconnected(ri, reason),
+        }
+    }
+
+    /// The server of remote host `ri` said what its path arguments are: fill in the placeholder
+    /// repositories, drop those that turned out to be the same repository as an earlier one.
+    fn remote_repos(&mut self, ri: usize, answers: &[Result<crate::remote::RepoInfo, String>]) {
+        let rm = &self.remotes[ri];
+        let (host, conn) = (Host::Ssh(rm.host.clone()), rm.conn.clone());
+        let mut seen: Vec<u64> = Vec::new();
+        let mut duplicates: Vec<u64> = Vec::new();
+        for repo in self.repos.iter_mut().filter(|r| r.host == host) {
+            let Some(slot) = repo.remote.as_mut() else { continue };
+            match answers.get(slot.arg) {
+                Some(Ok(info)) if seen.contains(&info.id) => duplicates.push(repo.id),
+                Some(Ok(info)) => {
+                    seen.push(info.id);
+                    slot.id = Some(info.id);
+                    if repo.common_dir != info.common_dir {
+                        repo.common_dir = info.common_dir.clone();
+                        repo.name = repo_name(&info.common_dir);
+                    }
+                    repo.error = None;
+                    repo.worker = Worker::Remote(conn.as_ref().map(|c| c.handle(info.id)));
+                }
+                Some(Err(e)) => {
+                    slot.id = None;
+                    repo.error = Some(e.clone());
+                    repo.worker = Worker::Remote(None);
+                }
+                None => {}
+            }
+        }
+        for id in duplicates {
+            if let Some(r) = self.repo_index(id) {
+                self.remove_repo(r);
+            }
+        }
+        self.rebuild();
+    }
+
+    /// The herdr view for repositories on `host`: this machine's, or what its serve reports.
+    pub fn herdr_of(&self, host: &Host) -> Option<&Arc<herdr::View>> {
+        match host {
+            Host::Local => self.herdr.as_ref(),
+            Host::Ssh(h) => self.remotes.iter().find(|x| &x.host == h)?.herdr.as_ref(),
+        }
+    }
+
+    /// Whether any host's herdr is reachable.
+    pub fn any_herdr(&self) -> bool {
+        self.herdr.is_some() || self.remotes.iter().any(|x| x.herdr.is_some())
+    }
+
+    /// Where `host`'s herdr creates worktrees.
+    fn herdr_dir_of(&self, host: &Host) -> Option<&Path> {
+        match host {
+            Host::Local => self.herdr_dir.as_deref(),
+            Host::Ssh(h) => self.remotes.iter().find(|x| &x.host == h)?.herdr_dir.as_deref(),
+        }
+    }
+
+    /// The remote host repository `r` is on.
+    pub fn remote_of(&self, r: usize) -> Option<&Remote> {
+        let h = self.repos.get(r)?.host.remote()?;
+        self.remotes.iter().find(|x| x.host == h)
+    }
+
+    /// Whether the worktree list has a header row per repository: with several, or with any on
+    /// another machine (its header says which, and whether it is connected).
+    pub fn headers(&self) -> bool {
+        self.repos.len() > 1 || self.repos.iter().any(|r| r.host != Host::Local)
     }
 
     /// Stop watching repository `r` (its worker stops when dropped). The selection stays on the
@@ -572,20 +876,34 @@ impl App {
         }
     }
 
-    /// When [`App::tick`] has something to do next (a repository's grace running out).
+    /// When [`App::tick`] has something to do next (a repository's grace running out, a remote
+    /// host to reconnect to).
     fn next_deadline(&self) -> Option<Instant> {
-        self.herdr.as_ref()?;
-        self.repos
-            .iter()
-            .filter(|r| r.from_herdr)
-            .filter_map(|r| r.unseen_since)
-            .min()
-            .map(|t| t + HERDR_REPO_GRACE)
+        let grace = self.herdr.as_ref().and_then(|_| {
+            self.repos
+                .iter()
+                .filter(|r| r.from_herdr)
+                .filter_map(|r| r.unseen_since)
+                .min()
+                .map(|t| t + HERDR_REPO_GRACE)
+        });
+        let retry = self.remotes.iter().filter_map(|x| match x.state {
+            RemoteState::Down { retry, .. } => Some(retry),
+            _ => None,
+        });
+        grace.into_iter().chain(retry).min()
     }
 
     /// Time passed without a message.
     fn tick(&mut self) {
-        self.reconcile_repos(Instant::now());
+        let now = Instant::now();
+        self.reconcile_repos(now);
+        let due: Vec<usize> = (0..self.remotes.len())
+            .filter(|&ri| matches!(self.remotes[ri].state, RemoteState::Down { retry, .. } if retry <= now))
+            .collect();
+        for ri in due {
+            self.connect(ri);
+        }
         self.follow_wt_selection();
     }
 
@@ -686,7 +1004,7 @@ impl App {
     /// Rebuild both panels' visual lines, requesting docs for newly opened rows.
     /// Only the graph expands; the worktree panel is a plain list.
     fn rebuild(&mut self) {
-        let headers = self.repos.len() > 1;
+        let headers = self.headers();
         self.wt_rows = Vec::new();
         for (r, repo) in self.repos.iter().enumerate() {
             if headers {
@@ -952,18 +1270,11 @@ impl App {
     fn handle_msg(&mut self, msg: UiMsg) {
         match msg {
             UiMsg::Snapshot(id, s) => {
-                let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
-                let Some(r) = self.repo_index(id) else { return };
-                if r == self.active {
-                    self.on_snapshot(s, ids);
-                } else if let Some(repo) = self.repos.get_mut(r) {
-                    repo.snap = s;
-                    self.map_agents();
-                    self.refresh_docs();
-                    self.rebuild();
-                    self.relocate(Focus::Worktrees, ids.0);
+                if let Some(r) = self.repo_index(id) {
+                    self.on_repo_snapshot(r, s);
                 }
             }
+            UiMsg::Remote { host, attempt, event } => self.on_remote(host, attempt, event),
             UiMsg::Inset { key, req, result } => {
                 let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
                 if let Some(e) = self.docs.get_mut(&key).filter(|e| e.req == req) {
@@ -1080,6 +1391,20 @@ impl App {
         }
     }
 
+    /// A new snapshot of repository `r`.
+    fn on_repo_snapshot(&mut self, r: usize, s: Arc<Snapshot>) {
+        let ids = (self.line_id(Focus::Worktrees), self.line_id(Focus::Graph));
+        if r == self.active {
+            self.on_snapshot(s, ids);
+        } else if let Some(repo) = self.repos.get_mut(r) {
+            repo.snap = s;
+            self.map_agents();
+            self.refresh_docs();
+            self.rebuild();
+            self.relocate(Focus::Worktrees, ids.0);
+        }
+    }
+
     fn on_snapshot(&mut self, snap: Arc<Snapshot>, ids: (Option<LineId>, Option<LineId>)) {
         let first_wts = self.snap.worktrees.is_empty();
         let first_graph = self.snap.graph.rows.is_empty();
@@ -1145,14 +1470,19 @@ impl App {
 
     /// Match herdr agents to worktrees (after either side changed).
     fn map_agents(&mut self) {
-        for repo in &mut self.repos {
-            repo.agents = match &self.herdr {
+        let agents: Vec<Vec<Vec<usize>>> = self
+            .repos
+            .iter()
+            .map(|repo| match self.herdr_of(&repo.host) {
                 Some(view) => {
                     let paths: Vec<PathBuf> = repo.snap.worktrees.iter().map(|w| w.path.clone()).collect();
                     herdr::assign(view, &paths)
                 }
                 None => Vec::new(),
-            };
+            })
+            .collect();
+        for (repo, a) in self.repos.iter_mut().zip(agents) {
+            repo.agents = a;
         }
     }
 
@@ -1163,7 +1493,8 @@ impl App {
 
     /// The agents working in worktree `wi` of repository `r`, summarized.
     pub fn agent_activity_in(&self, r: usize, wi: usize) -> Option<herdr::Activity> {
-        herdr::activity(self.herdr.as_ref()?, self.repos.get(r)?.agents.get(wi)?)
+        let repo = self.repos.get(r)?;
+        herdr::activity(self.herdr_of(&repo.host)?, repo.agents.get(wi)?)
     }
 
     /// Whether worktree `wi` of the shown repository could be removed (with its branch) without
@@ -1177,7 +1508,7 @@ impl App {
     pub fn cleanup_in(&self, r: usize, wi: usize) -> Cleanup {
         let Some(repo) = self.repos.get(r) else { return Cleanup::No };
         let Some(w) = repo.snap.worktrees.get(wi) else { return Cleanup::No };
-        if self.herdr_unseen(w) {
+        if self.herdr_unseen(r, w) {
             return Cleanup::No;
         }
         w.cleanup(repo.snap.base.as_deref(), self.agent_busy(r, wi))
@@ -1187,16 +1518,17 @@ impl App {
     fn cleanup_blocker(&self, wi: usize) -> Option<String> {
         let w = self.snap.worktrees.get(wi)?;
         w.cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(self.active, wi))
-            .or_else(|| self.herdr_unseen(w).then(|| crate::model::HERDR_UNSEEN.to_string()))
+            .or_else(|| self.herdr_unseen(self.active, w).then(|| crate::model::HERDR_UNSEEN.to_string()))
     }
 
     /// Whether herdr made worktree `w` but no herdr workspace canopy can see has it, so agents
     /// in it (say, from a herdr on another machine sharing the filesystem) would go unnoticed.
-    fn herdr_unseen(&self, w: &crate::model::WorktreeView) -> bool {
-        self.herdr_dir.as_deref().is_some_and(|d| w.path.starts_with(d))
+    /// `w` is in repository `r`; its host's herdr is the one asked.
+    fn herdr_unseen(&self, r: usize, w: &crate::model::WorktreeView) -> bool {
+        let Some(host) = self.repos.get(r).map(|x| &x.host) else { return false };
+        self.herdr_dir_of(host).is_some_and(|d| w.path.starts_with(d))
             && !self
-                .herdr
-                .as_ref()
+                .herdr_of(host)
                 .is_some_and(|v| v.workspaces.iter().any(|ws| ws.checkout.as_deref() == Some(&w.path)))
     }
 
@@ -1207,11 +1539,17 @@ impl App {
 
     /// How many agents in the watched repositories' worktrees are in `state`.
     pub fn agents_in_state(&self, state: herdr::AgentState) -> usize {
-        let Some(view) = &self.herdr else { return 0 };
-        self.repos
+        (0..self.repos.len()).map(|r| self.repo_agents_in_state(r, state)).sum()
+    }
+
+    /// How many agents in repository `r`'s worktrees are in `state`.
+    pub fn repo_agents_in_state(&self, r: usize, state: herdr::AgentState) -> usize {
+        let Some(repo) = self.repos.get(r) else { return 0 };
+        let Some(view) = self.herdr_of(&repo.host) else { return 0 };
+        repo.agents
             .iter()
-            .flat_map(|r| r.agents.iter().flatten())
-            .filter(|&&i| view.agents[i].state == state)
+            .flatten()
+            .filter(|&&i| view.agents.get(i).is_some_and(|a| a.state == state))
             .count()
     }
 
@@ -1232,14 +1570,21 @@ impl App {
     }
 
     /// `a`: ask herdr to focus the pane of the selected worktree's most urgent agent.
+    /// On a remote host, its herdr is asked (which switches the herdr clients attached to it).
     fn focus_agent(&mut self) {
-        let Some(view) = &self.herdr else { return };
-        let wi = self.focused_wi();
-        let agent = wi
-            .and_then(|wi| self.repos.get(self.active)?.agents.get(wi))
-            .and_then(|ids| ids.iter().map(|&i| &view.agents[i]).max_by_key(|a| a.state));
-        if let Some(a) = agent {
-            herdr::focus(a.pane_id.clone());
+        let Some(repo) = self.repos.get(self.active) else { return };
+        let Some(view) = self.herdr_of(&repo.host) else { return };
+        let agent = self
+            .focused_wi()
+            .and_then(|wi| repo.agents.get(wi))
+            .and_then(|ids| ids.iter().filter_map(|&i| view.agents.get(i)).max_by_key(|a| a.state));
+        let Some(a) = agent else { return };
+        match &repo.worker {
+            Worker::Local(_) => herdr::focus(a.pane_id.clone()),
+            w => match w.remote() {
+                Some(h) => h.focus_agent(a.pane_id.clone()),
+                None => self.notice = Some(NOT_CONNECTED.to_string()),
+            },
         }
     }
 
@@ -1297,7 +1642,7 @@ impl App {
             KeyCode::Char('a') => self.focus_agent(),
             KeyCode::Char('s') => {
                 if let Some(w) = self.focused_worktree() {
-                    self.open_shell(w.path.clone(), None);
+                    self.open_shell_here(w.path.clone(), None);
                 }
             }
             KeyCode::Char('t') => self.open_git_tui(),
@@ -1537,6 +1882,19 @@ impl App {
         None
     }
 
+    /// A shell (or `command`) in worktree `path` of the shown repository, on its host: there,
+    /// it is `ssh -t host` into that directory, opened like a local one.
+    fn open_shell_here(&mut self, path: PathBuf, command: Option<String>) {
+        match self.host().remote() {
+            None => self.open_shell(path, command),
+            Some(h) => {
+                let run = command.map_or_else(|| r#"exec "${SHELL:-sh}" -l"#.to_string(), |c| format!("exec {c}"));
+                let ssh = remote_shell(h, &path, &run);
+                self.open_shell(home_dir(), Some(ssh));
+            }
+        }
+    }
+
     /// A shell in worktree `path` (running `command` if given): a pane split below canopy's if
     /// canopy runs in herdr or tmux, else an inset below the graph. The splits are requested off
     /// the UI thread.
@@ -1683,6 +2041,21 @@ impl App {
         let Some(path) = self.focused_worktree().map(|w| w.path.clone()) else {
             return;
         };
+        if let Some(h) = self.host().remote() {
+            // Which TUIs exist is the remote host's business.
+            let run = match &self.git_tui {
+                Some(c) => format!("exec {c}"),
+                None => format!(
+                    "for t in {}; do command -v \"$t\" >/dev/null 2>&1 && exec \"$t\"; done; \
+                     echo 'no git TUI ({}) on this host; set one with --git-tui'; sleep 5",
+                    GIT_TUIS.join(" "),
+                    GIT_TUIS.join(", ")
+                ),
+            };
+            let ssh = remote_shell(h, &path, &run);
+            self.open_shell(home_dir(), Some(ssh));
+            return;
+        }
         match self.git_tui.clone().or_else(find_git_tui) {
             Some(cmd) => self.open_shell(path, Some(cmd)),
             None => {
@@ -1835,7 +2208,7 @@ impl App {
                     self.last_click = None;
                     match self.wt_field_at(f, idx, m.column - inner.x) {
                         Some(WtField::Agent) => self.focus_agent(),
-                        Some(WtField::Path(path)) => self.open_shell(path, None),
+                        Some(WtField::Path(path)) => self.open_shell_here(path, None),
                         Some(WtField::Overlap(wi)) => self.open_overlaps(wi),
                         None => self.open_full(f, idx),
                     }
@@ -2031,6 +2404,18 @@ fn find_git_tui() -> Option<String> {
 }
 
 /// `lazygit` for `/usr/bin/lazygit -p x`: what the inset's title calls it.
+/// `ssh -t host` running `run` in directory `path` there.
+fn remote_shell(host: &str, path: &Path, run: &str) -> String {
+    let q = remote::shell_quote;
+    let script = format!("cd {} && {run}", q(&path.to_string_lossy()));
+    format!("ssh -t {} {}", q(host), q(&script))
+}
+
+/// Where a pane for a remote shell starts locally.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
 fn program_name(command: &str) -> String {
     let first = command.split_whitespace().next().unwrap_or(command);
     Path::new(first)
@@ -2063,11 +2448,13 @@ pub struct Options {
     pub git_tui: Option<String>,
     /// Nerd Font glyphs for untracked files and folders (`--nerd-font`).
     pub nerd_font: bool,
+    /// How `canopy serve` is started on remote hosts (`--remote-cmd`).
+    pub remote_cmd: String,
 }
 
-/// Run the TUI on `repos` (distinct common dirs; none only with `herdr_repos`) until the user
-/// quits.
-pub fn run(repos: Vec<RepoPaths>, cfg: Config, opts: Options) -> Result<()> {
+/// Run the TUI on `repos` (distinct common dirs) and on `remotes` (host, paths there) until the
+/// user quits. No repository at all only with `herdr_repos`.
+pub fn run(repos: Vec<RepoPaths>, remotes: Vec<(String, Vec<String>)>, cfg: Config, opts: Options) -> Result<()> {
     let with_herdr = opts.herdr;
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
@@ -2082,11 +2469,15 @@ pub fn run(repos: Vec<RepoPaths>, cfg: Config, opts: Options) -> Result<()> {
     app.herdr_dir = herdr::worktree_dir();
     app.git_tui = opts.git_tui;
     app.nerd_font = opts.nerd_font;
+    app.remote_cmd = opts.remote_cmd;
     if with_herdr && opts.herdr_repos {
         app.discovery = Some(Discovery::default());
     }
     for paths in repos {
         app.add_repo(paths, false);
+    }
+    for (host, paths) in remotes {
+        app.add_remote(host, paths);
     }
 
     // Disable mouse capture on panic too; ratatui's own hook restores the rest.
@@ -2196,6 +2587,106 @@ mod tests {
             })
             .collect();
         Some(Arc::new(herdr::View { agents, workspaces }))
+    }
+
+    #[test]
+    fn remote_hosts() {
+        use crate::remote::{PROTOCOL, RepoInfo, ToClient};
+        let dir = std::env::temp_dir().join(format!("canopy-ui-remote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ssh that runs the remote command line here, and a "server" that says its piece.
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nfor a; do last=$a; done\nexec sh -c \"$last\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wt = crate::model::WorktreeView {
+            path: "/r/a".into(),
+            name: "main".into(),
+            is_main: true,
+            ..Default::default()
+        };
+        let msgs = [
+            ToClient::Hello {
+                protocol: PROTOCOL,
+                version: "test".into(),
+                host: "box".into(),
+                herdr_dir: Some("/r/herdr".into()),
+            },
+            ToClient::Repos(vec![
+                Ok(RepoInfo { id: 0, common_dir: "/r/a/.git".into() }),
+                Ok(RepoInfo { id: 0, common_dir: "/r/a/.git".into() }),
+                Err("/r/nope: not a repository".into()),
+            ]),
+            ToClient::Snapshot {
+                repo: 0,
+                snap: Arc::new(Snapshot {
+                    repo_name: "a".into(),
+                    common_dir: "/r/a/.git".into(),
+                    worktrees: vec![wt],
+                    ..Default::default()
+                }),
+                graph: Some(Default::default()),
+            },
+            ToClient::Herdr(Some(Arc::new(herdr::View {
+                agents: vec![herdr::Agent {
+                    pane_id: "p1".into(),
+                    workspace_id: "w1".into(),
+                    label: "claude".into(),
+                    state: herdr::AgentState::Blocked,
+                    cwd: Some("/r/a/src".into()),
+                }],
+                workspaces: Vec::new(),
+            }))),
+        ];
+        let script = dir.join("server.jsonl");
+        let mut out = Vec::new();
+        for m in &msgs {
+            crate::remote::send(&mut out, m).unwrap();
+        }
+        std::fs::write(&script, out).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx, &Config::default(), LayoutMode::Stacked);
+        app.ssh = fake_ssh.into();
+        // `#` comments out the serve arguments that follow.
+        app.remote_cmd = format!("cat '{}'; sleep 0.3; echo 'box went away' >&2; exit 3 #", script.display());
+        app.add_remote("box".into(), vec!["/r/a".into(), "/r/a/wt".into(), "/r/nope".into()]);
+        assert_eq!(app.repos.len(), 3, "a placeholder per path");
+        assert!(app.headers());
+        assert_eq!(app.remotes[0].state, RemoteState::Connecting);
+
+        let mut saw_agents = false;
+        loop {
+            let msg = rx.recv_timeout(Duration::from_secs(10)).expect("events from the fake server");
+            let closed = matches!(&msg, UiMsg::Remote { event: remote::Event::Closed(_), .. });
+            app.handle(msg);
+            if app.remotes[0].herdr.is_some() {
+                saw_agents = app.repo_agents_in_state(0, herdr::AgentState::Blocked) == 1;
+            }
+            if closed {
+                break;
+            }
+        }
+        // The duplicate path is gone, the bad one says why, the real one has its snapshot.
+        assert_eq!(app.repos.len(), 2);
+        assert_eq!(app.repos[0].common_dir, PathBuf::from("/r/a/.git"));
+        assert_eq!(app.repos[0].snap.worktrees.len(), 1);
+        assert_eq!(app.repo_label(0), "a @ box");
+        assert!(app.repos[1].error.as_deref().is_some_and(|e| e.contains("not a repository")));
+        assert!(saw_agents, "the host's herdr agents map onto its worktrees");
+        assert_eq!(app.herdr_dir_of(&Host::Ssh("box".into())), Some(Path::new("/r/herdr")));
+        // Gone: the snapshot stays, agents don't, a retry is scheduled.
+        match &app.remotes[0].state {
+            RemoteState::Down { reason, .. } => assert!(reason.contains("box went away"), "{reason}"),
+            s => panic!("not down: {s:?}"),
+        }
+        assert!(app.remotes[0].herdr.is_none());
+        assert!(app.next_deadline().is_some());
+        let err = Arc::new(std::sync::Mutex::new(None));
+        let e2 = err.clone();
+        app.repos[0].worker.message("x".into(), Box::new(move |r| *e2.lock().unwrap() = Some(r)));
+        assert_eq!(err.lock().unwrap().clone(), Some(Err(NOT_CONNECTED.to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,9 +27,11 @@ const STDERR_TAIL: usize = 20;
 #[derive(Debug)]
 pub enum Event {
     /// The server's build and host name.
+    /// The server's build and host name, and where its herdr creates worktrees.
     Hello {
         version: String,
         host: String,
+        herdr_dir: Option<PathBuf>,
     },
     /// What each path argument resolved to, in order.
     Repos(Vec<Result<RepoInfo, String>>),
@@ -142,6 +145,7 @@ fn read_loop(stdout: impl Read, pending: &PendingMap, emit: &dyn Fn(Event)) -> S
                 protocol,
                 version,
                 host,
+                herdr_dir,
             }) => {
                 if protocol != PROTOCOL {
                     return format!(
@@ -149,7 +153,11 @@ fn read_loop(stdout: impl Read, pending: &PendingMap, emit: &dyn Fn(Event)) -> S
                          install the same version on both"
                     );
                 }
-                emit(Event::Hello { version, host });
+                emit(Event::Hello {
+                    version,
+                    host,
+                    herdr_dir,
+                });
                 break;
             }
             Ok(_) => return "the server didn't say hello first".into(),
@@ -293,11 +301,16 @@ impl RemoteHandle {
         self.conn
             .call(self.repo, Call::CleanupRun(Box::new(plan)), expect(reply, text));
     }
+
+    /// Ask the server's herdr to focus agent pane `pane`.
+    pub fn focus_agent(&self, pane: String) {
+        self.conn.call(self.repo, Call::FocusAgent(pane), Box::new(|_| {}));
+    }
 }
 
-/// The arguments for `canopy serve` with `cfg`'s settings (`program` is the remote canopy).
-pub fn serve_args(program: &str, cfg: &Config, herdr: bool, paths: &[String]) -> Vec<String> {
-    let mut args = vec![program.to_string(), "serve".to_string()];
+/// The arguments for `canopy serve` with `cfg`'s settings (after the program itself).
+pub fn serve_args(cfg: &Config, herdr: bool, paths: &[String]) -> Vec<String> {
+    let mut args = vec!["serve".to_string()];
     args.push(format!("--interval={}", cfg.interval.as_secs_f64()));
     if !cfg.poll {
         args.push("--no-poll".into());
@@ -316,10 +329,11 @@ pub fn serve_args(program: &str, cfg: &Config, herdr: bool, paths: &[String]) ->
     args
 }
 
-/// `ssh host <args>`, never prompting (an unreachable or password-only host fails instead), with
-/// keepalives so a dead connection is noticed.
-pub fn ssh(host: &str, args: &[String]) -> Command {
-    let mut cmd = Command::new("ssh");
+/// `<ssh> host <program> <args>` (`ssh` is normally `ssh`), never prompting (an unreachable or password-only host fails
+/// instead), with keepalives so a dead connection is noticed. `program` goes to the remote shell
+/// as it is (`XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) canopy` works), the arguments quoted.
+pub fn ssh(ssh: &std::ffi::OsStr, host: &str, program: &str, args: &[String]) -> Command {
+    let mut cmd = Command::new(ssh);
     cmd.args([
         "-T",
         "-o",
@@ -330,13 +344,13 @@ pub fn ssh(host: &str, args: &[String]) -> Command {
         "ServerAliveCountMax=3",
     ]);
     // The remote side joins the arguments into one shell command line.
-    cmd.arg("--")
-        .arg(host)
-        .arg(args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
+    let line = std::iter::once(program.to_string()).chain(args.iter().map(|a| shell_quote(a)));
+    cmd.arg("--").arg(host).arg(line.collect::<Vec<_>>().join(" "));
     cmd
 }
 
-fn shell_quote(s: &str) -> String {
+/// `s` quoted for a POSIX shell (as it is when that's safe).
+pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b))
@@ -369,9 +383,8 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            serve_args("canopy", &cfg, false, &["/r/a".into()]),
+            serve_args(&cfg, false, &["/r/a".into()]),
             [
-                "canopy",
                 "serve",
                 "--interval=60",
                 "--no-poll",
@@ -381,5 +394,14 @@ mod tests {
                 "/r/a"
             ]
         );
+        let cmd = ssh(
+            "ssh".as_ref(),
+            "gh-b-001",
+            "X=$(uname -m) canopy",
+            &["serve".into(), "my dir".into()],
+        );
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args.last().unwrap(), "X=$(uname -m) canopy serve 'my dir'");
+        assert_eq!(args[args.len() - 2], "gh-b-001");
     }
 }

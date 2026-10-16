@@ -18,9 +18,8 @@ fn serve(paths: &[std::path::PathBuf]) -> Command {
         ..Config::default()
     };
     let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-    let args = client::serve_args(BIN, &cfg, false, &paths);
-    let mut cmd = Command::new(&args[0]);
-    cmd.args(&args[1..]);
+    let mut cmd = Command::new(BIN);
+    cmd.args(client::serve_args(&cfg, false, &paths));
     cmd
 }
 

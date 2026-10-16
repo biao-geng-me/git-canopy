@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use super::copy;
 use super::diff_view::Pane;
 use super::inset::{self, Item, VLine};
-use super::{App, Focus, InsetText, LayoutMode, WtFields, WtRef};
+use super::{App, Focus, InsetText, LayoutMode, RemoteState, WtFields, WtRef};
 use crate::diff::FileDiff;
 use crate::graph::{self, LabelKind, Row, RowKind};
 use crate::herdr::{self, AgentState};
@@ -405,24 +405,32 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
         spans.push(Span::styled(format!(" · base {b}"), dim));
     }
     let n = snap.worktrees.len();
-    spans.push(Span::styled(
-        match n {
-            0 => " · loading…".to_string(),
-            1 => " · 1 worktree".to_string(),
-            n => format!(" · {n} worktrees"),
-        },
-        dim,
-    ));
+    let warn = Style::new().fg(C_CONFLICT);
+    let state = app.remote_of(r).map(|x| &x.state);
+    if let Some(e) = &repo.error {
+        spans.push(Span::styled(format!(" · ⚠ {}", first_line(e)), warn));
+    } else if let Some(RemoteState::Down { .. }) = state {
+        // The last snapshot stays, marked as such; the details line says why.
+        spans.push(Span::styled(" · ⚠ disconnected, retrying", warn));
+    } else if n == 0 && state == Some(&RemoteState::Connecting) {
+        spans.push(Span::styled(" · connecting…", dim));
+    }
+    if repo.error.is_none() {
+        spans.push(Span::styled(
+            match n {
+                0 if state.is_some() => String::new(),
+                0 => " · loading…".to_string(),
+                1 => " · 1 worktree".to_string(),
+                n => format!(" · {n} worktrees"),
+            },
+            dim,
+        ));
+    }
     let dirty = snap.worktrees.iter().filter(|w| w.is_dirty()).count();
     if dirty > 0 {
         spans.push(Span::styled(format!("  ✎ {dirty}"), Style::new().fg(C_MODIFIED)));
     }
-    let blocked: usize = repo
-        .agents
-        .iter()
-        .flatten()
-        .filter(|&&i| app.herdr.as_ref().is_some_and(|v| v.agents[i].state == AgentState::Blocked))
-        .count();
+    let blocked = app.repo_agents_in_state(r, AgentState::Blocked);
     if blocked > 0 {
         spans.push(Span::styled(
             format!("  ◆ {blocked} blocked"),
@@ -430,6 +438,10 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or_default().to_string()
 }
 
 const NAME_MAX: usize = 28;
@@ -1026,7 +1038,7 @@ fn graph_line(app: &App, r: usize, now: i64, width: usize) -> Line<'static> {
 fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Graph && !app.shell_focus;
     let mut title = vec![Span::raw(" graph ")];
-    if app.repos.len() > 1 {
+    if app.headers() {
         let name = app.repo_label(app.active);
         title.push(Span::styled(format!("{name} "), Style::new().add_modifier(Modifier::BOLD)));
     }
@@ -1129,9 +1141,31 @@ pub fn tilde(p: &std::path::Path) -> String {
 
 /// Footer details of a repository header: where it is, and what its worktrees are up to.
 fn repo_details(app: &App, r: usize) -> Line<'static> {
-    let snap = &app.repos[r].snap;
+    let repo = &app.repos[r];
+    let snap = &repo.snap;
     let dim = Style::new().fg(C_DIM);
-    let mut spans = vec![Span::raw(tilde(&snap.common_dir))];
+    let warn = Style::new().fg(C_CONFLICT);
+    let host = repo.host.remote().map(|h| format!("{h}:")).unwrap_or_default();
+    if let Some(e) = &repo.error {
+        return Line::from(vec![Span::raw(format!("{host}{} ", repo.common_dir.display())), Span::styled(first_line(e), warn)]);
+    }
+    let mut spans = vec![Span::raw(format!("{host}{}", tilde(&repo.common_dir)))];
+    match app.remote_of(r).map(|x| &x.state) {
+        Some(RemoteState::Down { reason, retry }) => {
+            let secs = retry.saturating_duration_since(std::time::Instant::now()).as_secs();
+            spans.push(Span::styled("  ·  ", dim));
+            spans.push(Span::styled(format!("{} (retry in {secs}s)", first_line(reason)), warn));
+            return Line::from(spans);
+        }
+        Some(RemoteState::Connecting) => {
+            spans.push(Span::styled("  ·  connecting…", dim));
+            return Line::from(spans);
+        }
+        Some(RemoteState::Up(version)) => {
+            spans.push(Span::styled(format!("  ·  canopy {version}"), dim));
+        }
+        None => {}
+    }
     if let Some(b) = &snap.base {
         spans.push(Span::styled("  ·  ", dim));
         spans.push(Span::raw(format!("base {b}")));
@@ -1258,7 +1292,7 @@ fn graph_details(app: &App) -> Option<Line<'static>> {
 /// `herdr: 3 agents, 1 blocked · ` for the agents working in this repo's worktrees (empty when
 /// herdr isn't connected).
 fn herdr_summary(app: &App) -> Vec<Span<'static>> {
-    if app.herdr.is_none() {
+    if !app.any_herdr() {
         return Vec::new();
     }
     let dim = Style::new().fg(C_DIM);

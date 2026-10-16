@@ -296,12 +296,23 @@ pub fn detect_base(explicit: Option<&str>, refs: &[RefEntry], worktrees: &[Workt
 }
 
 /// The machine a repository is on: paths are only meaningful together with it (`/home/me/proj`
-/// can exist on two machines). Only this one for now; remote hosts (`canopy serve` over ssh)
-/// come in 0.5.
+/// can exist on two machines).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Host {
     #[default]
     Local,
+    /// Reached with `ssh <name> canopy serve` (`name` as ssh takes it: `gh-b-001`, `me@box`).
+    Ssh(String),
+}
+
+impl Host {
+    /// The ssh name, for a remote host.
+    pub fn remote(&self) -> Option<&str> {
+        match self {
+            Host::Local => None,
+            Host::Ssh(name) => Some(name),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

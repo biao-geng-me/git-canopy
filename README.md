@@ -99,11 +99,12 @@ For a fully static Linux binary from a checkout: `cargo build --release --target
 ## Usage
 
 ```
-canopy [OPTIONS] [PATH...]
-git canopy [OPTIONS] [PATH...]
+canopy [OPTIONS] [PATH | HOST:PATH...]
+git canopy [OPTIONS] [PATH | HOST:PATH...]
 
   PATH                    any directory inside a repository (default: current directory);
                           several watch several repositories
+  HOST:PATH               a repository on another machine, watched there over ssh
   -i, --interval <SECS>   poll interval for worktrees that can't be watched (default: 60);
                           watched worktrees are re-checked every 10 minutes regardless
       --base <BRANCH>     branch to compare worktrees against (default: main, master, trunk,
@@ -117,6 +118,8 @@ git canopy [OPTIONS] [PATH...]
                           lazygit, gitui, tig on PATH)
       --nerd-font         Nerd Font icons for untracked files and folders (default:
                           $CANOPY_NERD_FONT=1)
+      --remote-cmd <CMD>  how to run canopy on remote hosts (default: $CANOPY_REMOTE_CMD,
+                          else canopy)
 ```
 
 ### Several repositories
@@ -124,6 +127,12 @@ git canopy [OPTIONS] [PATH...]
 `canopy ~/a ~/b` watches both. The worktree list groups each repository's worktrees under a header row (name, base branch, worktree and dirty counts, blocked agents), and the graph shows the repository of the selected row: moving the selection into another repository switches the graph, which keeps its own cursor and expanded rows for each. Paths inside the same repository count once. With one repository there are no header rows.
 
 `canopy --herdr-repos` also watches every repository that a herdr agent works in or a herdr workspace is checked out in, so one canopy follows all your agents without listing their projects. Repositories appear as agents start in them and are dropped two minutes after their last agent and workspace are gone (repositories named on the command line always stay). Without a `PATH` it starts with the current directory's repository if there is one, else empty until herdr names one.
+
+### Other machines
+
+`canopy ~/a gh-b-001:/home/me/proj laptop:work/b` also watches repositories on other machines. For each host canopy runs `ssh <host> canopy serve <paths>`, which watches the repositories there, with that machine's git, file events and herdr, and streams what it sees back. Edits show up as fast as local ones, agents are those of that machine's herdr, and diffs, copying, cleanup, `s` and `t` (an `ssh -t` into the worktree) all work there. Each remote repository's header row names its host (`three-ux @ gh-b-001`) and says when it is connecting or disconnected; a lost connection keeps the last state on screen and is retried with backoff (2 s, doubling up to a minute), and cleanup isn't offered while it is down.
+
+The remote host needs the same canopy version on its `PATH` (or say where with `--remote-cmd`) and ssh access without a password prompt (keys or an agent; canopy runs ssh with `BatchMode=yes`). `--remote-cmd` is a shell command line run on the remote host, so it can set the environment there; for example, when herdr's socket lives in a per-machine `XDG_CONFIG_HOME` that a non-interactive ssh session doesn't have: `--remote-cmd 'XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) ~/bin/canopy'` (single quotes, so `$USER` and `$(uname -m)` are expanded there). A path without a leading `/` is relative to the home directory there. `--herdr-repos` finds repositories through this machine's herdr only.
 
 ### Keys
 
@@ -275,7 +284,7 @@ terminals support and which also works over SSH.
   directories (metadata only, normally served from the kernel's cache, no file contents), plus two
   cheap repo-wide commands.
 - The graph loads the newest 1000 commits first and loads more as you scroll toward the end.
-- `canopy serve PATH...` is the machine-side half of watching repositories on other machines (coming next): it watches the repositories where they are and talks to another canopy over stdin/stdout, which in practice will be an ssh connection. On its own it is only useful for testing.
+- `canopy serve PATH...` is what runs on the other machine for `HOST:PATH` (see Other machines): it talks to the canopy that started it over stdin/stdout. You don't run it yourself.
 
 ## Development
 
