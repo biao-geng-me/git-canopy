@@ -340,6 +340,23 @@ pub struct Repo {
     unseen_since: Option<Instant>,
 }
 
+impl Repo {
+    /// Its main worktree's directory name (the path argument's until the first snapshot).
+    fn display_name(&self) -> String {
+        if self.snap.repo_name.is_empty() { self.name.clone() } else { self.snap.repo_name.clone() }
+    }
+}
+
+/// This machine's name for header rows, without the domain.
+fn local_machine() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let full = crate::remote::hostname();
+        let short = full.split('.').next().unwrap_or_default();
+        if short.is_empty() { "this machine".into() } else { short.into() }
+    })
+}
+
 /// What answers for a repository: its own worker, or the server of its host (`None` while that
 /// host isn't connected). The same requests either way.
 enum Worker {
@@ -560,9 +577,7 @@ impl App {
     /// name, with the parent directory in front when another watched repository has the same
     /// name (`alpha/repo`, `beta/repo`).
     pub fn repo_label(&self, r: usize) -> String {
-        let name = |repo: &Repo| {
-            if repo.snap.repo_name.is_empty() { repo.name.clone() } else { repo.snap.repo_name.clone() }
-        };
+        let name = Repo::display_name;
         let Some(repo) = self.repos.get(r) else { return String::new() };
         let own = name(repo);
         let at = repo.host.remote().map(|h| format!(" @ {h}")).unwrap_or_default();
@@ -574,6 +589,23 @@ impl App {
         match dir.parent().and_then(Path::file_name) {
             Some(parent) => format!("{}/{own}{at}", parent.to_string_lossy()),
             None => format!("{own}{at}"),
+        }
+    }
+
+    /// Repository `r`'s header row label: its machine when every repository shown is the same
+    /// project, each on a machine of its own (one repository watched here and with `--host`),
+    /// else [`App::repo_label`].
+    pub fn header_label(&self, r: usize) -> String {
+        let Some(repo) = self.repos.get(r) else { return String::new() };
+        let first = self.repos[0].display_name();
+        let one_project = self.repos.iter().all(|x| x.display_name() == first)
+            && self.repos.iter().enumerate().all(|(i, x)| self.repos[..i].iter().all(|y| y.host != x.host));
+        if !one_project {
+            return self.repo_label(r);
+        }
+        match &repo.host {
+            Host::Local => local_machine().to_string(),
+            Host::Ssh(h) => h.clone(),
         }
     }
 
@@ -3280,6 +3312,7 @@ mod tests {
         assert_eq!(app.repos[0].common_dir, PathBuf::from("/r/a/.git"));
         assert_eq!(app.repos[0].snap.worktrees.len(), 1);
         assert_eq!(app.repo_label(0), "a @ box");
+        assert_eq!(app.header_label(0), "a @ box", "two repositories on one machine: named");
         assert!(app.repos[1].error.as_deref().is_some_and(|e| e.contains("not a repository")));
         assert!(saw_agents, "the host's herdr agents map onto its worktrees");
         assert_eq!(app.herdr_dir_of(&Host::Ssh("box".into())), Some(Path::new("/r/herdr")));
@@ -3384,6 +3417,7 @@ mod tests {
         assert_eq!(app.repos[0].mirrors.len(), 1);
         assert_eq!(app.repos[0].mirrors[0].host, "node");
         assert!(app.headers());
+        assert_eq!(app.header_label(0), local_machine(), "one project: its header names the machine");
         assert_eq!(blocked_seen, 1, "the other machine's agent is on the shared tree");
         // The other machine was told to forward file events only.
         let sent = std::fs::read_to_string(&sent).unwrap();
@@ -3472,6 +3506,7 @@ mod tests {
         let r = &app.repos[0];
         assert_eq!((r.host.clone(), r.common_dir.clone()), (Host::Ssh("node".into()), PathBuf::from("/r/b/.git")));
         assert_eq!(app.repo_label(0), "b @ node");
+        assert_eq!(app.header_label(0), "node");
 
         // The agent left: the repository stays for the grace, then goes, unwatched there.
         let attempt = app.remotes[0].attempt;

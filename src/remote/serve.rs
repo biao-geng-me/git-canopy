@@ -36,7 +36,7 @@ pub fn run(paths: Vec<PathBuf>, cfg: Config, with_herdr: bool) -> Result<()> {
     let _ = tx.send(Out::Msg(Box::new(ToClient::Hello {
         protocol: PROTOCOL,
         version: env!("CANOPY_BUILD").to_string(),
-        host: hostname(),
+        host: super::hostname(),
         herdr_dir: if with_herdr { herdr::worktree_dir() } else { None },
     })));
 
@@ -219,18 +219,5 @@ fn take_stdio() -> std::io::Result<(File, File)> {
         }
         libc::close(null);
         Ok((File::from_raw_fd(input), File::from_raw_fd(output)))
-    }
-}
-
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: the buffer is valid for its length; gethostname NUL-terminates within it or
-    // truncates, and the last byte stays 0 either way.
-    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } == 0;
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
-    if ok {
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    } else {
-        String::new()
     }
 }

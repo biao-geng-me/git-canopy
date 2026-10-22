@@ -404,7 +404,7 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
     let fold = if app.is_folded(r) { "▸ " } else { "▾ " };
     let mut spans = vec![
         Span::styled(fold, dim),
-        Span::styled(app.repo_label(r), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(app.header_label(r), Style::new().add_modifier(Modifier::BOLD)),
     ];
     if let Some(b) = &snap.base {
         spans.push(Span::styled(format!(" · base {b}"), dim));

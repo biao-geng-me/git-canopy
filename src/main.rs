@@ -41,7 +41,10 @@ OPTIONS:
         --herdr-repos       also watch every repository a herdr agent or workspace is in, added
                             and removed as they come and go (PATH is optional then); on remote
                             hosts too, through each one's herdr
-        --host <HOST>       connect to HOST even without a HOST:PATH (for --herdr-repos there)
+        --host <HOST>       also watch the same repositories on HOST (each PATH, or the current
+                            directory's repository, at the same place under the home directory
+                            there, else the same absolute path); with --herdr-repos, HOST's
+                            herdr names repositories too
         --git-tui <CMD>     git TUI that t opens in a worktree (default: $CANOPY_GIT_TUI, else
                             the first of lazygit, gitui, tig on PATH)
         --nerd-font         Nerd Font icons for untracked files and folders (default:
@@ -196,6 +199,36 @@ fn remote_arg(arg: &Path) -> Option<(String, String)> {
     Some((host.to_string(), path.to_string()))
 }
 
+/// The directory a repository is known by on another machine: its main checkout (a linked
+/// worktree there is less likely to exist), or the repository itself when bare.
+fn checkout(r: &canopy::git::RepoPaths) -> PathBuf {
+    match r.common_dir.file_name() {
+        Some(n) if n == ".git" => r.common_dir.parent().unwrap_or(&r.common_dir).to_path_buf(),
+        _ => r.common_dir.clone(),
+    }
+}
+
+/// `$HOME` as given and resolved (paths here are canonical, `$HOME` may not be).
+fn home_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let real = std::fs::canonicalize(&home).ok();
+    std::iter::once(home).chain(real).collect()
+}
+
+/// `dir` as a path for `canopy serve` on another machine: relative to the home directory (which
+/// serve resolves there) when it is under ours, else absolute.
+fn remote_path(dir: &Path, homes: &[PathBuf]) -> String {
+    for home in homes {
+        if let Ok(rel) = dir.strip_prefix(home) {
+            let rel = rel.to_string_lossy();
+            return if rel.is_empty() { ".".into() } else { rel.into_owned() };
+        }
+    }
+    dir.to_string_lossy().into_owned()
+}
+
 /// `canopy remote install HOST [--dir DIR] [--binary FILE]`.
 fn remote_install(args: &[String]) -> ExitCode {
     let mut host = None;
@@ -274,7 +307,7 @@ fn main() -> ExitCode {
     }
     // One entry per repository: paths inside the same one (say, two of its worktrees) count once.
     let mut repos: Vec<canopy::git::RepoPaths> = Vec::new();
-    if args.paths.is_empty() && args.remote.is_empty() && args.hosts.is_empty() {
+    if args.paths.is_empty() && args.remote.is_empty() {
         // The current directory, unless --herdr-repos finds the repositories (then it counts
         // only if it is in one).
         match canopy::git::discover(Path::new(".")) {
@@ -300,11 +333,14 @@ fn main() -> ExitCode {
             }
         }
     }
-    // One connection per host, its paths in order.
+    // One connection per host, its paths in order. Every --host also gets the repositories named
+    // here (same place relative to the home directory, else the same absolute path).
     let mut remotes: Vec<(String, Vec<String>)> = Vec::new();
+    let homes = home_dirs();
     for host in args.hosts {
         if !remotes.iter().any(|(h, _)| *h == host) {
-            remotes.push((host, Vec::new()));
+            let paths = repos.iter().map(|r| remote_path(&checkout(r), &homes)).collect();
+            remotes.push((host, paths));
         }
     }
     for (host, path) in args.remote {
@@ -345,5 +381,17 @@ mod tests {
         assert_eq!(r("/abs/a:b"), None);
         assert_eq!(r(":x"), None);
         assert_eq!(r("plain"), None);
+    }
+
+    #[test]
+    fn host_paths() {
+        let homes = [PathBuf::from("/home/me"), PathBuf::from("/shared/home/me")];
+        let p = |s: &str| remote_path(Path::new(s), &homes);
+        assert_eq!(p("/home/me/proj"), "proj");
+        assert_eq!(p("/shared/home/me/src/proj"), "src/proj");
+        assert_eq!(p("/home/me"), ".");
+        assert_eq!(p("/home/meta/proj"), "/home/meta/proj");
+        assert_eq!(p("/scratch/proj"), "/scratch/proj");
+        assert_eq!(remote_path(Path::new("/x/proj"), &[]), "/x/proj");
     }
 }

@@ -120,10 +120,21 @@ git canopy [OPTIONS] [PATH | HOST:PATH...]
                           $CANOPY_NERD_FONT=1)
       --remote-cmd <CMD>  how to run canopy on remote hosts (default: $CANOPY_REMOTE_CMD,
                           else canopy)
-      --host <HOST>       connect to HOST without a HOST:PATH (for --herdr-repos there)
+      --host <HOST>       also watch the same repositories on HOST (same place under the
+                          home directory there, else the same path); with --herdr-repos,
+                          HOST's herdr names repositories too
 
 canopy remote install HOST [--dir DIR] [--binary FILE]
 ```
+
+### Which repositories
+
+- `canopy` watches the repository it is started in, on this machine.
+- `canopy --host gh-b-001` also watches that repository on gh-b-001 (see Other machines).
+- `canopy ~/a ~/b` watches the repositories named; `--host` applies to each of them.
+- `canopy --herdr-repos` finds every repository a herdr agent works in, on this machine and on each `--host`.
+
+One repository is usually what you want: one project, one view. The others are there for when you do want several.
 
 ### Several repositories
 
@@ -135,9 +146,11 @@ With several repositories the list folds: each header row (`▸ three-ux · base
 
 ### Other machines
 
-`canopy ~/a gh-b-001:/home/me/proj laptop:work/b` also watches repositories on other machines. For each host canopy runs `ssh <host> canopy serve <paths>`, which watches the repositories there, with that machine's git, file events and herdr, and streams what it sees back. Edits show up as fast as local ones, agents are those of that machine's herdr, and diffs, copying, cleanup, `s` and `t` (an `ssh -t` into the worktree) all work there. Each remote repository's header row names its host (`three-ux @ gh-b-001`) and says when it is connecting or disconnected; a lost connection keeps the last state on screen and is retried with backoff (2 s, doubling up to a minute), and cleanup isn't offered while it is down.
+`canopy ~/a gh-b-001:/home/me/proj laptop:work/b` also watches repositories on other machines. For each host canopy runs `ssh <host> canopy serve <paths>`, which watches the repositories there, with that machine's git, file events and herdr, and streams what it sees back. Edits show up as fast as local ones, agents are those of that machine's herdr, and diffs, copying, cleanup, `s` and `t` (an `ssh -t` into the worktree) all work there. Each remote repository's header row names its host (`three-ux @ gh-b-001`; when everything shown is one project, the header rows are just the machines) and says when it is connecting or disconnected; a lost connection keeps the last state on screen and is retried with backoff (2 s, doubling up to a minute), and cleanup isn't offered while it is down.
 
-The remote host needs the same canopy version on its `PATH` (or say where with `--remote-cmd`) and ssh access without a password prompt (keys or an agent; canopy runs ssh with `BatchMode=yes`). `--remote-cmd` is a shell command line run on the remote host, so it can set the environment there; for example, when herdr's socket lives in a per-machine `XDG_CONFIG_HOME` that a non-interactive ssh session doesn't have: `--remote-cmd 'XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) ~/bin/canopy'` (single quotes, so `$USER` and `$(uname -m)` are expanded there). A path without a leading `/` is relative to the home directory there. With `--herdr-repos`, each host's herdr names repositories too: `canopy --herdr-repos --host gh-b-001` follows every repository an agent works in, on this machine and on gh-b-001 (`--host` connects to a host without naming any path there).
+The remote host needs the same canopy version on its `PATH` (or say where with `--remote-cmd`) and ssh access without a password prompt (keys or an agent; canopy runs ssh with `BatchMode=yes`). `--remote-cmd` is a shell command line run on the remote host, so it can set the environment there; for example, when herdr's socket lives in a per-machine `XDG_CONFIG_HOME` that a non-interactive ssh session doesn't have: `--remote-cmd 'XDG_CONFIG_HOME=/tmp/$USER/xdg/$(uname -m) ~/bin/canopy'` (single quotes, so `$USER` and `$(uname -m)` are expanded there). A path without a leading `/` is relative to the home directory there.
+
+`--host HOST` watches the same repositories on HOST: the current directory's repository, or each `PATH`, at the same place relative to the home directory there (`~/proj` here is `~/proj` there), else at the same absolute path. On a filesystem both machines share (an HPC home) it is the very same repository, shown once with `also on HOST` on its header: HOST adds its herdr agents and forwards its file events, so edits made there show up as fast as local ones. With separate clones each machine's clone is listed under a header row named after the machine, each with its own graph. A repository at a different path there needs `HOST:PATH`. With `--herdr-repos`, each host's herdr names repositories too: `canopy --herdr-repos --host gh-b-001` follows every repository an agent works in, on this machine and on gh-b-001.
 
 `canopy remote install HOST` puts this canopy on HOST (into `~/.local/bin`, or `--dir DIR`) and checks that it runs there; for a host of another architecture give a build for it with `--binary FILE`. It refuses to replace a symlink, and to put a binary of the wrong architecture into a directory that this machine shares (one home directory for machines of different architectures: use a per-architecture `--dir`). If `canopy` isn't on that host's `PATH` for ssh commands, it says what to pass as `--remote-cmd`.
 
