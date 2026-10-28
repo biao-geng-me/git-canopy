@@ -531,3 +531,29 @@ fn rx_until(rx: &mpsc::Receiver<std::sync::Arc<Snapshot>>, timeout: Duration, pr
     }
     false
 }
+
+#[test]
+fn deleted_remote_branch_disappears() {
+    for how in ["push", "packed", "prune"] {
+        let fx = common::Fixture::new();
+        git(&fx.repo(), &["push", "-q", "origin", "feat-auth"]);
+        if how != "push" {
+            git(&fx.repo(), &["pack-refs", "--all"]);
+        }
+        let cfg = Config { interval: Duration::from_secs(3600), ..Config::default() };
+        let (_h, rx) = spawn(&fx, cfg);
+        let has = |s: &Snapshot| s.graph.labels.iter().flatten().any(|l| l.text.contains("origin/feat-auth"));
+        wait_for(&rx, Duration::from_secs(10), |s| s.watching && has(s));
+        std::thread::sleep(Duration::from_millis(500));
+        if how == "prune" {
+            let origin = fx.repo().parent().unwrap().join("origin.git");
+            git(&origin, &["branch", "-D", "feat-auth"]);
+            git(&fx.repo(), &["fetch", "-q", "--prune", "origin"]);
+        } else {
+            git(&fx.repo(), &["push", "-q", "origin", "--delete", "feat-auth"]);
+        }
+        eprintln!("{how}: waiting");
+        wait_for(&rx, Duration::from_secs(5), |s| !has(s));
+        eprintln!("{how}: ok");
+    }
+}
