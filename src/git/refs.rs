@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefKind {
@@ -56,6 +57,103 @@ pub fn parse(bytes: &[u8]) -> Vec<RefEntry> {
             })
         })
         .collect()
+}
+
+/// Full names of the branches and remote-tracking branches (`refs/heads/…`, `refs/remotes/…`)
+/// whose history contains `sha`; symbolic refs (`origin/HEAD`) are left out.
+pub fn containing(dir: &Path, sha: &str) -> Result<Vec<String>> {
+    let out = super::run(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(symref)",
+            "--contains",
+            sha,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| {
+            let (name, symref) = l.split_once('\0')?;
+            symref.is_empty().then(|| name.to_string())
+        })
+        .collect())
+}
+
+/// Where a branch's upstream is: `refs/remotes/origin/x` here, branch `x` of remote `origin`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upstream {
+    /// The remote-tracking ref, `refs/remotes/origin/x`.
+    pub tracking: String,
+    pub remote: String,
+    /// The branch on the remote, `x` (without `refs/heads/`).
+    pub branch: String,
+}
+
+impl Upstream {
+    /// `origin/x`.
+    pub fn short(&self) -> &str {
+        short(&self.tracking)
+    }
+}
+
+/// The upstream configured for local branch `branch` (it may no longer exist: "gone"). Only
+/// upstreams on a remote, not another local branch.
+pub fn upstream(dir: &Path, branch: &str) -> Result<Option<Upstream>> {
+    let out = super::run(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let text = String::from_utf8_lossy(&out);
+    let mut f = text.trim_end().split('\0');
+    let (Some(tracking), Some(remote), Some(remote_ref)) = (f.next(), f.next(), f.next()) else {
+        return Ok(None);
+    };
+    match (tracking.starts_with("refs/remotes/"), remote_ref.strip_prefix("refs/heads/")) {
+        (true, Some(b)) if !remote.is_empty() && remote != "." => Ok(Some(Upstream {
+            tracking: tracking.to_string(),
+            remote: remote.to_string(),
+            branch: b.to_string(),
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// The remote and branch a remote-tracking ref (`refs/remotes/origin/x`) stands for, by the
+/// longest configured remote name it starts with (remote names may contain `/`).
+pub fn remote_of(dir: &Path, tracking: &str) -> Result<Option<Upstream>> {
+    let rest = tracking.strip_prefix("refs/remotes/").unwrap_or(tracking);
+    let out = super::run(dir, &["remote"])?;
+    let text = String::from_utf8_lossy(&out);
+    let best = text
+        .lines()
+        .filter(|r| rest.strip_prefix(r).is_some_and(|b| b.starts_with('/')))
+        .max_by_key(|r| r.len());
+    Ok(best.map(|r| Upstream {
+        tracking: format!("refs/remotes/{rest}"),
+        remote: r.to_string(),
+        branch: rest[r.len() + 1..].to_string(),
+    }))
+}
+
+/// The commit `refname` points at, `None` when it doesn't exist.
+pub fn resolve(dir: &Path, refname: &str) -> Option<String> {
+    let out = super::run(dir, &["rev-parse", "--verify", "-q", &format!("{refname}^{{commit}}")]).ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// `main` for `refs/heads/main`, `origin/main` for `refs/remotes/origin/main`.
+pub fn short(refname: &str) -> &str {
+    refname
+        .strip_prefix("refs/heads/")
+        .or_else(|| refname.strip_prefix("refs/remotes/"))
+        .unwrap_or(refname)
 }
 
 #[cfg(test)]

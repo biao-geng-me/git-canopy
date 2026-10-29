@@ -76,8 +76,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_graph(f, app, graph_area);
     draw_shell(f, app, shell_area);
     draw_footer(f, app, footer);
-    if let Some((_, _, plan)) = &app.confirm {
-        draw_confirm(f, plan);
+    if let Some(c) = &app.confirm {
+        draw_confirm(f, c);
     }
     if app.help {
         draw_help(f);
@@ -1258,8 +1258,9 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
         }
     }
     let base = app.snap.base.as_deref().unwrap_or("base");
+    let into = w.merged_into.as_deref().unwrap_or(base);
     let landed = match w.landed {
-        Some(Landed::Merged) => Some(format!("merged into {base}")),
+        Some(Landed::Merged) => Some(format!("merged into {into}")),
         Some(Landed::Applied) => Some(format!("in {base} (squashed or rebased)")),
         Some(Landed::Unused) => Some("no commits of its own".to_string()),
         None => None,
@@ -2051,8 +2052,8 @@ const HELP: &[(&str, &str)] = &[
     ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
     ("b", "diff vs base: all changes since the fork"),
     ("o  dbl-click ⚠", "overlaps: both sides' changes to shared files"),
-    ("Backspace", "clean up a ⌫ worktree: checkout, branch, herdr workspace"),
-    ("Backspace ×2", "the same without the confirm popup (checks still run)"),
+    ("Backspace", "clean up: choose checkout, workspace, branch, remote branch"),
+    ("Backspace ×2", "delete what can go without the popup (checks still run)"),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("y y", "copy the sha / path / file under the cursor"),
     ("y h  y s", "copy sha / short sha"),
@@ -2072,67 +2073,107 @@ const HELP: &[(&str, &str)] = &[
     ("q", "back"),
 ];
 
-/// The confirm popup for removing a worktree: exactly what will happen.
-fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
+/// The cleanup popup: every item that could be deleted, chosen or not, and why some can't be.
+fn draw_confirm(f: &mut Frame, c: &crate::ui::Confirm) {
+    use crate::cleanup::What;
+    let plan = &c.plan;
     let area = f.area();
-    let w = area.width.min(88);
+    let w = area.width.min(96);
     let inner = w.saturating_sub(4) as usize;
     let dim = Style::new().fg(C_DIM);
-    let bullet = |text: String| Line::from(vec![Span::styled(" • ", dim), Span::raw(truncate(&text, inner.saturating_sub(3)))]);
-    let state = match plan.landed {
-        Landed::Merged => format!("its work is in {} (merged)", plan.base),
-        Landed::Applied => format!("its work is in {} (squashed or rebased)", plan.base),
-        Landed::Unused => format!("no commits of its own (HEAD is in {})", plan.base),
-    };
+    let warn = Style::new().fg(C_MODIFIED);
+    let key = Style::new().fg(Color::Cyan);
     let mut lines = vec![
         Line::from(vec![
-            Span::raw(" Remove "),
+            Span::raw(" Clean up "),
             Span::styled(plan.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw("?"),
         ]),
-        Line::styled(format!(" {state}; nothing uncommitted"), dim),
         Line::raw(""),
     ];
-    if let Some(ws) = &plan.workspace {
-        let panes = if ws.panes == 1 { "1 pane".to_string() } else { format!("{} panes", ws.panes) };
-        lines.push(bullet(format!("closes herdr workspace {} ({panes})", ws.label)));
-    }
-    // Long paths keep their end, the part that names the worktree.
-    let removes = if plan.workspace.is_some() { "herdr removes " } else { "removes " };
-    let room = inner.saturating_sub(3 + removes.len());
-    lines.push(bullet(format!("{removes}{}", truncate_left(&tilde(&plan.path), room))));
-    if plan.ignored_total > 0 {
-        let more = plan.ignored_total.saturating_sub(plan.ignored.len());
-        let mut list = plan.ignored.join(", ");
-        if more > 0 {
-            list.push_str(&format!(" +{more}"));
+    let mut cursor_line = 0;
+    for (i, item) in plan.items.iter().enumerate() {
+        let on = c.chosen.get(i).copied().unwrap_or(false);
+        let blocked = plan.blocked(i);
+        let mark = match (on, blocked.is_some()) {
+            (true, _) => "[x]",
+            (false, false) => "[ ]",
+            (false, true) => " - ",
+        };
+        let what = match &item.what {
+            What::Workspace(ws) => {
+                let panes = if ws.panes == 1 { "1 pane".to_string() } else { format!("{} panes", ws.panes) };
+                format!("herdr workspace {} ({panes})", ws.label)
+            }
+            What::Checkout { path, .. } => format!("checkout {}", tilde(path)),
+            What::Branch(b) => format!("branch {b}"),
+            What::Remote(u) => format!("remote branch {}", u.short()),
+        };
+        let at = item.sha.as_deref().map(|s| format!(" at {}", &s[..s.len().min(7)])).unwrap_or_default();
+        let selected = i == c.cursor;
+        let row_style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+        let text_style = if blocked.is_some() { dim } else { Style::new() };
+        if selected {
+            cursor_line = lines.len();
         }
-        lines.push(Line::styled(
-            truncate(&format!("     with ignored files: {list}"), inner),
-            Style::new().fg(C_MODIFIED),
-        ));
-    }
-    if let Some(b) = &plan.branch {
-        lines.push(bullet(format!("deletes branch {b} (at {})", &plan.head[..plan.head.len().min(7)])));
-    }
-    for a in &plan.stray_agents {
-        lines.push(Line::styled(
-            truncate(&format!(" ! agent {a} stays open in a deleted directory"), inner),
-            Style::new().fg(C_MODIFIED),
-        ));
+        let label = truncate_left(&what, inner.saturating_sub(6 + at.len()));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), row_style),
+            Span::styled(label, text_style),
+            Span::styled(at, dim),
+        ]));
+        let detail = |text: String, style: Style| Line::styled(truncate(&format!("       {text}"), inner), style);
+        match blocked {
+            Some(b) => lines.push(detail(b, dim)),
+            None => {
+                let kept: Vec<&str> = item
+                    .keepers
+                    .iter()
+                    .filter(|k| !matches!(&item.what, What::Checkout { .. }) || !k.starts_with("refs/heads/"))
+                    .map(|k| crate::git::refs::short(k))
+                    .take(3)
+                    .collect();
+                match &item.what {
+                    What::Branch(_) | What::Remote(_) if !kept.is_empty() => {
+                        lines.push(detail(format!("its commits are in {}", kept.join(", ")), dim));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let What::Checkout { ignored, ignored_total, stray_agents, .. } = &item.what {
+            if *ignored_total > 0 {
+                let more = ignored_total.saturating_sub(ignored.len());
+                let mut list = ignored.join(", ");
+                if more > 0 {
+                    list.push_str(&format!(" +{more}"));
+                }
+                lines.push(detail(format!("with ignored files: {list}"), warn));
+            }
+            for a in stray_agents {
+                lines.push(detail(format!("! agent {a} stays open in a deleted directory"), warn));
+            }
+        }
     }
     lines.push(Line::raw(""));
+    if let Some(why) = &c.refused {
+        lines.push(Line::styled(truncate(&format!(" {why}"), inner), warn));
+    }
     lines.push(Line::from(vec![
-        Span::styled(" y", Style::new().fg(Color::Cyan)),
-        Span::styled(" / ", dim),
-        Span::styled("Enter", Style::new().fg(Color::Cyan)),
-        Span::styled(" / ", dim),
-        Span::styled("Backspace", Style::new().fg(Color::Cyan)),
-        Span::raw(" remove    "),
-        Span::styled("Esc", Style::new().fg(Color::Cyan)),
+        Span::styled(" Space", key),
+        Span::raw(" choose  "),
+        Span::styled("a", key),
+        Span::raw(" all  "),
+        Span::styled("Enter", key),
+        Span::styled("/", dim),
+        Span::styled("⌫", key),
+        Span::raw(" delete chosen  "),
+        Span::styled("Esc", key),
         Span::raw(" cancel"),
     ]));
     let h = (lines.len() as u16 + 4).min(area.height);
+    // Keep the cursor's line in view when the popup is taller than the screen.
+    let room = h.saturating_sub(4) as usize;
+    let scroll = cursor_line.saturating_sub(room.saturating_sub(2)) as u16;
     let rect = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
@@ -2145,7 +2186,7 @@ fn draw_confirm(f: &mut Frame, plan: &crate::cleanup::Plan) {
         .border_style(Style::new().fg(C_MODIFIED))
         .title(" clean up ")
         .padding(Padding::new(1, 1, 1, 1));
-    f.render_widget(Paragraph::new(lines).block(block), rect);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), rect);
 }
 
 fn draw_help(f: &mut Frame) {

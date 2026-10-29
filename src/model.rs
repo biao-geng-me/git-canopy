@@ -49,21 +49,27 @@ pub struct WorktreeView {
     pub changes: Option<Arc<Changes>>,
     /// Other worktrees (or the base branch) that changed some of the same files.
     pub overlaps: Vec<Overlap>,
-    /// Whether its commits are already in the base branch (`None`: not known to be, or it is
-    /// the base branch).
+    /// Whether its commits are already in the base branch or another branch (`None`: not known
+    /// to be, or it is the base branch).
     pub landed: Option<Landed>,
+    /// The branch its commits are in when that isn't the base branch (`feat-y`, `origin/feat-y`):
+    /// another branch that contains its HEAD, other than its own upstream.
+    pub merged_into: Option<String>,
 }
 
-/// How a worktree's committed work relates to the base branch.
+/// How a worktree's committed work relates to the base branch, or to another branch that
+/// contains it (`WorktreeView::merged_into`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Landed {
-    /// HEAD is in the base branch (merged or fast-forwarded), after commits of its own.
+    /// HEAD is in the base branch or another branch (merged or fast-forwarded), after commits
+    /// of its own.
     Merged,
     /// HEAD isn't in the base branch, but every file it changed since forking has the same
     /// content there: squash-merged, rebased or cherry-picked.
     Applied,
-    /// HEAD is in the base branch with no commits of its own: a fresh branch (never moved since
-    /// it was created) or a detached checkout of a base commit. Nothing committed to lose.
+    /// HEAD is in the base branch (or another branch) with no commits of its own: a fresh
+    /// branch (never moved since it was created) or a detached checkout of a base commit.
+    /// Nothing committed to lose.
     Unused,
 }
 
@@ -148,9 +154,10 @@ impl WorktreeView {
             "it is locked".to_string()
         } else if self.landed.is_none() {
             match self.vs_base {
-                Some((ahead, _)) if ahead > 0 => {
-                    format!("not merged: {ahead} commit{} not in {base_name}", if ahead == 1 { "" } else { "s" })
-                }
+                Some((ahead, _)) if ahead > 0 => format!(
+                    "not merged: {ahead} commit{} not in {base_name} or any other branch",
+                    if ahead == 1 { "" } else { "s" }
+                ),
                 _ => format!("not known to be merged into {base_name}"),
             }
         } else if agent_busy {
@@ -436,7 +443,7 @@ mod tests {
                 w.landed = None;
                 w.vs_base = Some((3, 0));
             }),
-            "not merged: 3 commits not in main"
+            "not merged: 3 commits not in main or any other branch"
         );
         // No commits of its own: nothing committed to lose either.
         assert_eq!(with(&|w| w.landed = Some(Landed::Unused)), (Cleanup::Safe, None));

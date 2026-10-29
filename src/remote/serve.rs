@@ -166,10 +166,8 @@ fn dispatch(h: &Calls, call: Call, id: u64, tx: &Sender<Out>) {
         Call::Doc(target) => h.doc(target, reply(tx, id, Answer::Doc)),
         Call::Patch { target, file } => h.patch(target, file, reply(tx, id, Answer::Text)),
         Call::Message(sha) => h.message(sha, reply(tx, id, Answer::Text)),
-        Call::CleanupPlan { worktree, base } => {
-            h.cleanup_plan(*worktree, base, reply(tx, id, |p| Answer::Plan(Box::new(p))))
-        }
-        Call::CleanupRun(plan) => h.cleanup_run(*plan, reply(tx, id, Answer::Text)),
+        Call::CleanupPlan { target, base } => h.cleanup_plan(target, base, reply(tx, id, |p| Answer::Plan(Box::new(p)))),
+        Call::CleanupRun { plan, chosen } => h.cleanup_run(*plan, chosen, reply(tx, id, Answer::Text)),
         Call::FocusAgent(pane) => {
             herdr::focus(pane);
             reply(tx, id, Answer::Text)(Ok(String::new()));

@@ -29,8 +29,9 @@ with one exception the user confirms each time: cleaning up a worktree whose wor
 - **Overview first, details on demand:** the main screen answers "what is every tree doing, and which are
   dirty?" Drill-down (diff, full commit message) via keyboard and mouse.
 - **Never interfere with agents:** every git invocation uses `--no-optional-locks` (or
-  `GIT_OPTIONAL_LOCKS=0`) so `status` never grabs `index.lock` while an agent commits. Never write to the repo,
-  except the confirmed cleanup of a worktree verified safe (see Design decisions, Cleanup).
+  `GIT_OPTIONAL_LOCKS=0`) so `status` never grabs `index.lock` while an agent commits. Never write to the repo
+  (or a remote), except the cleanup the user picks, each item verified to lose nothing (see Design
+  decisions, Cleanup).
 
 ## Stack
 
@@ -130,7 +131,8 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
   `t` does the same and then types ` exec <git tui>` into that new pane (`pane.send_input` with
   `keys: ["Enter"]`, the exact request `herdr pane run` sends, captured with a logging fake socket),
   since `pane.split` takes no command; Backspace cleanup sends `worktree.remove` for the workspace
-  backed by the removed checkout (see Cleanup). canopy never prompts, sends keys to, starts or stops
+  backed by the removed checkout, or `workspace.close` when only the workspace is picked (see
+  Cleanup). canopy never prompts, sends keys to, starts or stops
   agents; the only input it sends goes to a pane it just created.
 - **JSON:** a small hand-written parser (`herdr/json.rs`), written before serde came in for the remote wire; it could move to `serde_json` now.
 - **Learned from the live server:** herdr answers one request per connection and then closes it, so
@@ -152,30 +154,32 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 7. (Later, not now) herdr plugin: `herdr-plugin.toml` with a popup pane running canopy and a startup
    poller that sets a per-workspace `$wt_dirty` sidebar token via `herdr workspace report-metadata`.
 
-## Status (2026-10-22)
+## Status (2026-10-29)
 
-Built since 0.3.0 and committed on `main`, not pushed, not released (`Cargo.toml` still says 0.3.0): multi-repo 0.4 (steps 1–4), remote machines 0.5 steps 1–4 (`canopy serve`, `HOST:PATH`, one repo seen from several machines shown once with forwarded file events, `--herdr-repos` per host, `--host`, `canopy remote install`), folding repository groups in the worktree list (`n`, `f`), and `--host` as "the same repositories on that host too" (see Scope). Details in the sections below.
+Built since 0.3.0 and committed on `main`, not pushed, not released (`Cargo.toml` still says 0.3.0): multi-repo 0.4 (steps 1–4), remote machines 0.5 steps 1–4 (`canopy serve`, `HOST:PATH`, one repo seen from several machines shown once with forwarded file events, `--herdr-repos` per host, `--host`, `canopy remote install`), folding repository groups in the worktree list (`n`, `f`), `--host` as "the same repositories on that host too" (see Scope), and the cleanup popup with items to pick, merged into any branch, remote branches and branch labels (see Design decisions, Cleanup; `PROTOCOL` 3). Details in the sections below.
 
 Open, in rough order:
 - A serve that finds no herdr says so: report the socket path it tried (in the hello or a herdr-state message) so the header/details can show `gh-b-001: no herdr (looked in …)` instead of looking like a host without agents (the user hit this with `CANOPY_REMOTE_CMD` exported in another shell).
 - Remote gaps: a local herdr-found repo matching a remote owner is shown twice; a remote owner that stays down doesn't hand over to a mirror; `cleanup::plan` rechecks only its own host's herdr.
 - Maybe herdr's saved machines as hosts (`herdr machine list`).
+- `workspace.close` (only the herdr workspace picked) is tested against the fake socket only, not a live herdr; herdr's CLI says only "Close a workspace", so check on a throwaway server that it leaves the checkout.
+- The base-branch guess is wrong when the integration branch isn't main/master/trunk/develop (whisker_sensor_repo: `bluerov-whisker-imu`, 119 commits ahead of `main`): ahead/behind, change size, overlaps and `b` compare with `main` there. Cleanup no longer depends on it. Maybe `git config canopy.base` per repo, or a hint when everything is in the main worktree's branch.
 - Release 0.5 when the user asks (bump, tag, musl asset; an aarch64 asset would help `remote install` for Arm hosts).
 
 ## Roadmap after 0.2
 
 Still read-only apart from cleanup. No git operations on work in progress (staging, committing,
 rebasing in an agent's worktree races the agent and breaks the "never interfere" guarantee); a key
-hands off to a real git TUI instead. Cleanup is different: it only touches a worktree whose work is
-in base, with no busy agent, after the user confirms.
+hands off to a real git TUI instead. Cleanup is different: it only deletes what loses no commits
+(work merged into some other branch), with no busy agent, after the user picks it.
 
 - **0.3, reviewing agent work (built):** `t` opens a git TUI (lazygit, …) in the worktree, the same way `s`
   opens a shell; a change-size column (`+412 −38` vs the base branch, uncommitted included); `b` diffs
   a worktree against its merge base with the base branch (everything the agent did); overlap warnings
   between worktrees that touch the same files.
-- **Cleanup (built):** `⌫` marks worktrees that are safe to clean up; Backspace removes one (checkout,
-  branch, herdr workspace) after a confirm popup. canopy's one write, see Design decisions. Maybe
-  later: Backspace on a merged branch label without a worktree deletes just the branch.
+- **Cleanup (built, remodeled 2026-10-29):** `⌫` marks worktrees that are safe to clean up; Backspace
+  opens a popup to pick what goes (herdr workspace, checkout, branch, remote branch; or a commit's
+  branch labels), a double tap deletes the default. canopy's one write, see Design decisions.
 - **Later:** graph search and a per-worktree filter; `e` opens `$EDITOR` at the file/line under the
   cursor.
 - Not planned: notifications (herdr already notifies on blocked agents).
@@ -357,7 +361,13 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
   in it, or the overlaps change. `yd` gives both sides' raw patches with `#` comment lines: for
   pasting to an agent, not for `git apply`.
 - **Merged / safe to clean up:** `WorktreeView::landed`, computed in the worker per (base sha, HEAD,
-  branch) and cached. HEAD in base (`ahead == 0`): `Merged` if the branch's reflog has more than its
+  branch, plus the refs fingerprint when HEAD isn't in base) and cached. **Merged into any branch
+  counts (user's rule, 2026-10-29):** HEAD not in base but contained in another branch, local or
+  remote (`for-each-ref --contains`), other than its own branch and its own upstream, is `Merged`
+  (or `Unused` when the branch never moved) with `WorktreeView::merged_into` = that branch (local
+  first, the main worktree's branch first; `watch::other_branch`), shown as `merged into <b>`.
+  Found on whisker_sensor_repo, where agents' branches merge into `bluerov-whisker-imu` and `main`
+  is far behind, so nothing was ever `⌫`. HEAD in base (`ahead == 0`): `Merged` if the branch's reflog has more than its
   creation entry (fast-forwarded or merged after commits of its own), else `Unused` (a fresh
   branch, a detached checkout of a base commit, or no reflog). `Unused` is removable too (user's
   call: no commits to lose, e.g. read-only test checkouts) but must not read as "done": gray `⌫`,
@@ -372,30 +382,7 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
   be lost (`Untracked`). Same glyph after `[name]` in the graph; the details line spells it out.
   `⌫`, not `✓`, which is herdr's "done". The `◌` row's "uncommitted" word is red.
 - **Cleanup guards against agents canopy can't see** (an agent in another herdr, e.g. on another machine sharing the filesystem, or one that hasn't changed anything yet). (1) `Unused` worktrees that git used in the last hour (`model::FRESH_SECS`; `WorktreeView::git_used_at` = newest mtime of the admin dir's `HEAD`, `index`, `commondir`, `git::worktree::last_used`) aren't offered: a fresh tree is indistinguishable from a just-started agent's, and holding back something with nothing to lose costs only waiting; merged work isn't held back. (2) A checkout in herdr's worktree directory (`[worktrees] directory` in herdr's `config.toml`, default `~/.herdr/worktrees`, `herdr::worktree_dir`) is only cleaned up through a workspace the reachable herdr has for it (`App::herdr_unseen`, `model::HERDR_UNSEEN`); herdr unreachable or `--no-herdr` → refused too. Both are checked again in `cleanup::plan`/`run`. Tests backdate the admin dir (`Fixture::age`).
-- **Cleanup (Backspace, `cleanup.rs`):** on a `⌫` worktree (its row, or its `[name]`/`◌` graph row;
-  on a commit several worktrees share, the cleanable one). Anything else gets a footer reason
-  (`WorktreeView::cleanup_blocker`, the same function behind `⌫`). `cleanup::plan` runs off the UI
-  thread: re-verifies (fresh `status`: no changes, *no untracked* files; same HEAD and branch;
-  `cleanup::landed` recomputed against the base tip), reads herdr fresh (busy agent in the worktree →
-  refuse; the workspace backed by the checkout is canopy's own `HERDR_WORKSPACE_ID` → refuse), and
-  lists ignored files (`ls-files -o -i --directory`), which `git worktree remove` deletes silently.
-  The popup shows exactly that; `y`/Enter/Backspace runs `cleanup::run` (so a double Backspace is a
-  quick delete; a second Backspace while still checking, on the same worktree, queues the confirm
-  and skips the popup, `ui::Cleaning`), which verifies everything again, then
-  removes the checkout: herdr's `worktree.remove {workspace_id, force:false}` when a workspace is
-  backed by it, else `git worktree remove` (never `--force`); then `git branch -D` only if the branch
-  still points at the verified sha (`-D` because squash-merged branches fail `-d`; safe because of
-  our own check). Footer: the sha and `git branch <b> <sha>` to restore. Untracked files are refused
-  rather than forced (user can delete them, `s` opens a shell). Remotes never touched. Agents
-  outside that workspace with a cwd inside it (idle/done) are listed as left in a deleted directory;
-  unrelated workspaces are never closed. **herdr 0.9.3 `worktree.remove`, verified on a throwaway
-  server** (relative `HOME`, every `HERDR_*` unset): runs `git worktree remove`, so a dirty checkout
-  fails with `dirty_worktree_requires_force`; a clean one is removed (ignored files included) and
-  the workspace is closed with all its panes; **the branch is left**, hence canopy deletes it; works
-  the same for worktrees made by herdr (`worktree create`) or by git and opened in herdr. The main
-  checkout's workspace also has a `worktree` record (`is_linked_worktree: false`). Tests: plain git,
-  squash-merged, refusals after planning, and a fake herdr socket (`tests/cleanup.rs`); live: the
-  popup and both removal paths against the throwaway herdr in a private tmux.
+- **Cleanup (Backspace, `cleanup.rs`, remodeled 2026-10-29):** the user wanted to pick what goes after work is merged: worktree, branch, herdr workspace, remote upstream. Backspace on any worktree (its row, or its `[name]`/`◌` graph row; on a commit several worktrees share, the cleanable one) or on a graph commit without a worktree (`cleanup::Target::Worktree` / `Target::Refs {sha, refs}` with its Branch/Remote labels) asks the owning host for a `cleanup::Plan` off the UI thread: a list of `Item`s, each `What` (`Workspace`, `Checkout {path, ignored, stray_agents}`, `Branch(b)`, `Remote(Upstream)`), the `sha` it drops a ref to, its `keepers` (full ref names that keep that commit: `for-each-ref --contains`, plus the base branch, or the base's upstream for a remote, when the content is there squashed, `squashed_into`), a `blocker`, and `requires` (a checkout goes with its workspace, a branch with its checkout). Rules: a branch needs a keeper other than itself (any local or remote branch, its own upstream included); a remote branch needs a keeper among the *remote-tracking* refs other than itself (the remote never loses its only copy; not the base's upstream); a checkout needs a clean tree (no untracked files), not main/current/locked/mid-operation, no busy agent, the herdr-unseen and fresh-tree guards, and a keeper (its own branch counts, so a clean unmerged checkout can go alone); a workspace not canopy's own, no busy agent. `Plan::check(chosen)` counts what is chosen together (an item's keepers minus every ref chosen), so two branches at one commit, or a local branch whose only keeper is the upstream being deleted, never both go; `toggle` propagates `requires` both ways and refuses a choice that fails `check`; `blocked(i)` gives the inherited reason for the popup. `default_choice` = greedy over the items in order, all or nothing for a worktree with a branch: only when its branch goes with a keeper other than its own upstream (pushed-only work, or a checkout that can't go, chooses nothing; the user picks). Popup (`ui::Confirm`, `draw_confirm`): `[x]`/`[ ]`/` - ` per item with sha, reason or "its commits are in …" (base, main worktree's branch, local, then remote); `↑↓` move, Space toggles, `a` all that can go, Enter/`y`/Backspace deletes what is chosen, Esc cancels; a second Backspace while the plan is checking deletes the default without the popup (opens it when the default is empty). `cleanup::run(plan, chosen)` builds a fresh plan for the same target, maps the chosen items onto it (same item, same sha, else "moved") and checks again, then: workspace + checkout → herdr's `worktree.remove {workspace_id, force:false}`; workspace alone → `workspace.close`; checkout alone → `git worktree remove` (never `--force`); branches → `git branch -D` only while the branch still points at the checked sha (`-D` because squash-merged branches fail `-d`; safe because of our own check); remote branches last → `ls-remote` confirms a keeper is at the same commit on its remote, then `git push --porcelain --force-with-lease=refs/heads/x:<sha> <remote> :refs/heads/x` (`git::run_net`: `GIT_SSH_COMMAND=ssh -o BatchMode=yes` unless an ssh command is configured, `GIT_TERMINAL_PROMPT=0`, 30 s timeout; a failure keeps that remote branch and is reported in the notice, the local items stay done). Footer: what was removed and `git branch <b> <sha>` to restore. Agents outside the workspace with a cwd inside the checkout (idle/done) are listed as left in a deleted directory; unrelated workspaces are never closed. Wire: `Call::CleanupPlan {target, base}`, `Call::CleanupRun {plan, chosen}`, `PROTOCOL` 3. **herdr 0.9.3 `worktree.remove`, verified on a throwaway server** (relative `HOME`, every `HERDR_*` unset): runs `git worktree remove`, so a dirty checkout fails with `dirty_worktree_requires_force`; a clean one is removed (ignored files included) and the workspace is closed with all its panes; **the branch is left**, hence canopy deletes it; works the same for worktrees made by herdr (`worktree create`) or by git and opened in herdr. The main checkout's workspace also has a `worktree` record (`is_linked_worktree: false`). Tests (`tests/cleanup.rs`): plain git, squash-merged, merged into a non-base branch, two branches at one commit (worktrees and labels), refusals after planning, fresh and detached trees, a remote branch kept as the only copy and deleted once another remote branch has it, the lease keeping a remote branch someone pushed to, branch labels without a worktree, herdr removal, workspace alone, herdr refusals (fake socket); `refresh::merged_worktrees_are_marked_for_cleanup` covers `merged_into` and its loss when the keeping branch is deleted. Live (2026-10-29, private tmux on whisker_sensor_repo, popups only, nothing deleted): eight agent worktrees shown `merged into bluerov-whisker-imu`; their checkouts refused from the login node (herdr unseen), `din-5` + `origin/din-5` offered on its graph row.
 - **Diff vs base (`b`):** `diff::Target::Branch { path, base }` resolves `merge-base <base> HEAD` at
   load time (so it never goes stale) and shows `diff-index -p <merge base>` + untracked, like the
   worktree diff. Copy (`yd`) gives the same as a patch.

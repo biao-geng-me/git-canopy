@@ -178,12 +178,12 @@ impl Handle {
         self.calls.message(sha, reply);
     }
 
-    pub fn cleanup_plan(&self, w: WorktreeView, base: String, reply: Reply<cleanup::Plan>) {
-        self.calls.cleanup_plan(w, base, reply);
+    pub fn cleanup_plan(&self, target: cleanup::Target, base: Option<String>, reply: Reply<cleanup::Plan>) {
+        self.calls.cleanup_plan(target, base, reply);
     }
 
-    pub fn cleanup_run(&self, plan: cleanup::Plan, reply: Reply<String>) {
-        self.calls.cleanup_run(plan, reply);
+    pub fn cleanup_run(&self, plan: cleanup::Plan, chosen: Vec<bool>, reply: Reply<String>) {
+        self.calls.cleanup_run(plan, chosen, reply);
     }
 }
 
@@ -213,23 +213,23 @@ impl Calls {
         });
     }
 
-    /// Check worktree `w` again and work out what removing it involves (with this machine's
-    /// herdr, if enabled).
-    pub fn cleanup_plan(&self, w: WorktreeView, base: String, reply: Reply<cleanup::Plan>) {
+    /// Work out what cleaning up `target` could delete (with this machine's herdr, if enabled).
+    pub fn cleanup_plan(&self, target: cleanup::Target, base: Option<String>, reply: Reply<cleanup::Plan>) {
         let (dir, herdr) = (self.common_dir.clone(), self.herdr);
         job("canopy-cleanup", reply, move || {
             let sock = if herdr { crate::herdr::socket_path() } else { None };
             let herdr_dir = crate::herdr::worktree_dir();
             let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            cleanup::plan(&dir, &w, &base, sock, herdr_dir.as_deref(), own.as_deref())
+            cleanup::plan(&dir, target, base.as_deref(), sock, herdr_dir.as_deref(), own.as_deref())
         });
     }
 
-    /// Carry out a confirmed `plan` (it checks everything once more). Answers the footer notice.
-    pub fn cleanup_run(&self, plan: cleanup::Plan, reply: Reply<String>) {
+    /// Delete the items `chosen` in `plan` (it checks everything once more). Answers the footer
+    /// notice.
+    pub fn cleanup_run(&self, plan: cleanup::Plan, chosen: Vec<bool>, reply: Reply<String>) {
         job("canopy-cleanup", reply, move || {
             let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            cleanup::run(&plan, own.as_deref())
+            cleanup::run(&plan, &chosen, own.as_deref())
         });
     }
 }
@@ -352,7 +352,7 @@ struct Worker {
     /// Commit time per HEAD sha.
     head_cache: HashMap<String, i64>,
     /// Whether a HEAD's work is in the base branch.
-    landed_cache: HashMap<LandedKey, Option<Landed>>,
+    landed_cache: HashMap<LandedKey, Option<(Landed, Option<String>)>>,
 
     limit: usize,
     commits: Arc<Vec<Commit>>,
@@ -844,6 +844,7 @@ impl Worker {
                     v.changes = prev.changes;
                     v.overlaps = prev.overlaps;
                     v.landed = prev.landed;
+                    v.merged_into = prev.merged_into;
                 }
                 if v.admin_dir.is_none() && v.has_worktree() {
                     v.admin_dir = git::worktree::admin_dir(&v.path);
@@ -1023,7 +1024,8 @@ impl Worker {
             for w in &mut self.worktrees {
                 changed |= w.changes.take().is_some()
                     || !std::mem::take(&mut w.overlaps).is_empty()
-                    || w.landed.take().is_some();
+                    || w.landed.take().is_some()
+                    || w.merged_into.take().is_some();
             }
             return changed;
         };
@@ -1178,59 +1180,75 @@ impl Worker {
             });
         }
 
-        // Whether each worktree's work is already in the base branch. HEAD in base: merged if
-        // the branch ever moved (its reflog has more than the creation entry), else unused
-        // (also detached checkouts, and branches without a reflog: nothing to lose either way).
-        // HEAD not in base: applied if every file it changed since forking is the same there.
+        // Whether each worktree's work is already in the base branch, or in another branch.
+        // HEAD in base: merged if the branch ever moved (its reflog has more than the creation
+        // entry), else unused (also detached checkouts, and branches without a reflog: nothing
+        // to lose either way). HEAD not in base: the same when another branch (local or remote,
+        // not its own upstream) contains it, else applied if every file it changed since
+        // forking is the same in base. Answers about other branches depend on every ref, so
+        // they are keyed by the refs fingerprint too.
         enum Check {
             Reflog(String),
-            Content(Vec<String>),
+            Elsewhere { branch: Option<String>, paths: Option<Vec<String>> },
         }
+        let main_branch = self.worktrees.first().and_then(|w| w.branch.clone());
+        let mut keys: Vec<Option<LandedKey>> = vec![None; self.worktrees.len()];
         let mut checks: Vec<(LandedKey, Check)> = Vec::new();
         for (s, f) in sides.iter().zip(&fork) {
             let (Some(wi), Some(f)) = (s.wi, f) else { continue };
             let w = &self.worktrees[wi];
             let Some((ahead, _)) = w.vs_base.filter(|_| !s.is_base) else { continue };
-            let key = (base_sha.clone(), s.head.clone(), w.branch.clone());
+            let fp = if ahead == 0 { 0 } else { self.fingerprint };
+            let key = (base_sha.clone(), s.head.clone(), w.branch.clone(), fp);
+            keys[wi] = Some(key.clone());
             if self.landed_cache.contains_key(&key) {
                 continue;
             }
             let check = if ahead == 0 {
                 let Some(b) = &w.branch else {
-                    self.landed_cache.insert(key, Some(Landed::Unused));
+                    self.landed_cache.insert(key, Some((Landed::Unused, None)));
                     continue;
                 };
                 Check::Reflog(b.clone())
             } else {
-                let Some(committed) = self.between_cache.get(&(f.clone(), s.head.clone())) else {
-                    continue;
-                };
-                if committed.is_empty() || committed.len() > git::changes::MAX_APPLIED_FILES {
-                    self.landed_cache.insert(key, None);
-                    continue;
+                let paths = self
+                    .between_cache
+                    .get(&(f.clone(), s.head.clone()))
+                    .filter(|c| !c.is_empty() && c.len() <= git::changes::MAX_APPLIED_FILES)
+                    .map(|c| c.iter().map(|c| c.path.clone()).collect());
+                Check::Elsewhere {
+                    branch: w.branch.clone(),
+                    paths,
                 }
-                Check::Content(committed.iter().map(|c| c.path.clone()).collect())
             };
             checks.push((key, check));
         }
-        let found = par_map(&checks, PARALLELISM, |((base, head, _), check)| match check {
-            Check::Reflog(b) => match git::changes::reflog_len(&dir, b, 2) {
-                Ok(n) if n >= 2 => Some(Landed::Merged),
-                _ => Some(Landed::Unused),
-            },
-            Check::Content(paths) => git::changes::same_content(&dir, head, base, paths)
-                .ok()
-                .and_then(|same| same.then_some(Landed::Applied)),
+        let moved = |b: &str| git::changes::reflog_len(&dir, b, 2).is_ok_and(|n| n >= 2);
+        let found = par_map(&checks, PARALLELISM, |((base, head, _, _), check)| match check {
+            Check::Reflog(b) => Some((if moved(b) { Landed::Merged } else { Landed::Unused }, None)),
+            Check::Elsewhere { branch, paths } => {
+                let into = git::refs::containing(&dir, head)
+                    .ok()
+                    .and_then(|refs| other_branch(&dir, refs, branch.as_deref(), main_branch.as_deref()));
+                match (into, paths) {
+                    (Some(into), _) => {
+                        let landed = if branch.as_deref().is_some_and(moved) { Landed::Merged } else { Landed::Unused };
+                        Some((landed, Some(into)))
+                    }
+                    (None, Some(paths)) => git::changes::same_content(&dir, head, base, paths)
+                        .ok()
+                        .and_then(|same| same.then_some((Landed::Applied, None))),
+                    (None, None) => None,
+                }
+            }
         });
         for ((key, _), v) in checks.into_iter().zip(found) {
             self.landed_cache.insert(key, v);
         }
-        let mut landed: Vec<Option<Landed>> = vec![None; self.worktrees.len()];
-        for s in &sides {
-            let Some(wi) = s.wi else { continue };
-            let key = (base_sha.clone(), s.head.clone(), self.worktrees[wi].branch.clone());
-            landed[wi] = self.landed_cache.get(&key).copied().flatten();
-        }
+        let landed: Vec<Option<(Landed, Option<String>)>> = keys
+            .iter()
+            .map(|k| k.as_ref().and_then(|k| self.landed_cache.get(k).cloned().flatten()))
+            .collect();
 
         // Overlaps: per pair, the files both sides changed in their own work (committed or not).
         let touched = |s: &Side, from: &str| -> Option<Vec<String>> {
@@ -1241,7 +1259,7 @@ impl Worker {
         };
         let mut overlaps: Vec<Vec<Overlap>> = vec![Vec::new(); self.worktrees.len()];
         // A merged worktree's work is in base already: overlapping it means nothing.
-        let merged = |s: &Side| s.wi.is_some_and(|wi| matches!(landed[wi], Some(Landed::Merged | Landed::Applied)));
+        let merged = |s: &Side| s.wi.is_some_and(|wi| matches!(landed[wi], Some((Landed::Merged | Landed::Applied, _))));
         for (i, j, from_i, from_j) in &pairs {
             let (a, b) = (&sides[*i], &sides[*j]);
             if merged(a) || merged(b) {
@@ -1271,10 +1289,12 @@ impl Worker {
         let mut changed = false;
         for (((w, ch), mut ov), l) in self.worktrees.iter_mut().zip(changes).zip(overlaps).zip(landed) {
             ov.sort_by(|a, b| b.files.len().cmp(&a.files.len()).then_with(|| a.with.cmp(&b.with)));
-            changed |= w.changes != ch || w.overlaps != ov || w.landed != l;
+            let (l, into) = l.map_or((None, None), |(l, into)| (Some(l), into));
+            changed |= w.changes != ch || w.overlaps != ov || w.landed != l || w.merged_into != into;
             w.changes = ch;
             w.overlaps = ov;
             w.landed = l;
+            w.merged_into = into;
         }
         changed
     }
@@ -1361,8 +1381,21 @@ fn watch_dirs(watches: &Watches, ignored: Vec<PathBuf>, dirs: Vec<PathBuf>) -> O
     Some(tw)
 }
 
-/// (base sha, HEAD, branch).
-type LandedKey = (String, String, Option<String>);
+/// (base sha, HEAD, branch, refs fingerprint or 0 when the answer depends on base only).
+type LandedKey = (String, String, Option<String>, u64);
+
+/// The branch (short name) that keeps `branch`'s work, among `refs` (full names of the refs that
+/// contain its HEAD): not the branch itself or its own upstream. Local branches first, the main
+/// worktree's branch before others.
+fn other_branch(dir: &Path, refs: Vec<String>, branch: Option<&str>, main_branch: Option<&str>) -> Option<String> {
+    let own = branch.map(|b| format!("refs/heads/{b}"));
+    let upstream = branch.and_then(|b| git::refs::upstream(dir, b).ok().flatten()).map(|u| u.tracking);
+    let main = main_branch.map(|b| format!("refs/heads/{b}"));
+    refs.into_iter()
+        .filter(|r| Some(r) != own.as_ref() && Some(r) != upstream.as_ref())
+        .min_by_key(|r| (!r.starts_with("refs/heads/"), Some(r) != main.as_ref(), r.clone()))
+        .map(|r| git::refs::short(&r).to_string())
+}
 
 fn sorted_pair(a: String, b: String) -> (String, String) {
     if a <= b { (a, b) } else { (b, a) }

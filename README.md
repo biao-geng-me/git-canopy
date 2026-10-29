@@ -176,8 +176,8 @@ On a shared filesystem (an HPC cluster's home, NFS) the same repository can be n
 | `Space`/`Enter`/`←`/`→` on a repository header | fold / unfold its worktrees |
 | `s`, double-click a worktree path | open a shell in that worktree (see [Shells](#shells)) |
 | `t` | open a git TUI (lazygit, gitui, tig) in that worktree, like a shell |
-| `Backspace` | clean up a `⌫` worktree: remove its checkout, its branch and its herdr workspace, after confirming (see below) |
-| `Backspace` twice | the same without the confirm popup (every check still runs) |
+| `Backspace` | clean up: choose what goes of a worktree's checkout, herdr workspace, branch and remote branch, or of a commit's branch labels (see below) |
+| `Backspace` twice | delete everything that can go without the popup (every check still runs) |
 | `y` + key | copy to the clipboard (see [Copying](#copying)) |
 | `r` | refresh now |
 | `?` | help |
@@ -207,8 +207,8 @@ The mouse works too: the line under the pointer is faintly highlighted; a click 
 | `✎` | uncommitted changes |
 | `⚠` | conflicts or an operation in progress (merge, rebase, cherry-pick, …) |
 | `⚠ name` (light red, after the counts) | overlaps: `name` changed some of the same files |
-| `⌫` (green) | safe to clean up: its work is in the base branch (`merged`), nothing uncommitted, no agent busy |
-| `⌫` (gray) | safe to clean up: no commits of its own (HEAD is in the base branch, e.g. a fresh or a detached test checkout), nothing uncommitted, and git hasn't used it for an hour |
+| `⌫` (green) | safe to clean up: its work is in the base branch or another branch (`merged`), nothing uncommitted, no agent busy |
+| `⌫` (gray) | safe to clean up: no commits of its own (HEAD is in the base branch or another branch, e.g. a fresh or a detached test checkout), nothing uncommitted, and git hasn't used it for an hour |
 | `⌫` (yellow) | the same, but it has untracked files that cleaning up would lose |
 | `✗` | prunable: the worktree directory is gone |
 | `…` | status still loading |
@@ -216,34 +216,26 @@ The mouse works too: the line under the pointer is faintly highlighted; a click 
 In the graph, `◉` marks a commit that is some worktree's HEAD, `○` a merge commit and `◌` uncommitted
 changes.
 
-`merged` (where `↑a ↓b` would be) means the worktree's work is already in the base branch: its HEAD
-is in base after commits of its own, or every file it changed has the same content in base
-(squash-merged, rebased or cherry-picked). A worktree whose HEAD is in base without commits of its
-own has nothing committed to lose either, so it can be cleaned up too (gray `⌫`): canopy can't tell
-whether such a tree is finished or not started, only that removing it loses no commits. `⌫`
-additionally needs a clean tree, no agent other than idle/done in it, and a worktree that could be
-removed at all (not the main one, not on the base branch, not locked, not the one canopy runs in).
+`merged` (where `↑a ↓b` would be) means the worktree's work is already in another branch: its HEAD is in the base branch, or in any other branch, local or remote (`origin/x`), except the worktree's own upstream, after commits of its own; or every file it changed has the same content in base (squash-merged, rebased or cherry-picked). The details line names the branch (`merged into integration`). Merged into an integration branch that isn't the base yet counts too: deleting the worktree's branch loses nothing while that branch has its commits. A worktree whose HEAD is in a branch without commits of its own has nothing committed to lose either, so it can be cleaned up too (gray `⌫`): canopy can't tell whether such a tree is finished or not started, only that removing it loses no commits. `⌫` additionally needs a clean tree, no agent other than idle/done in it, and a worktree that could be removed at all (not the main one, not on the base branch, not locked, not the one canopy runs in).
 
 Two more checks guard against agents canopy can't see, such as one in a herdr on another machine that shares the filesystem, or one that hasn't changed anything yet. A worktree without commits of its own isn't offered while git has used it in the last hour, since it may be an agent's tree that was just set up. And a checkout in herdr's worktree directory (`~/.herdr/worktrees` unless herdr's config says otherwise) is only cleaned up when the herdr canopy talks to has a workspace for it.
 
 ### Cleaning up
 
-`Backspace` on a `⌫` worktree (its row, or its `[name]` or `◌` row in the graph) removes it, after a
-popup that says exactly what will happen and waits for `y`, `Enter` or `Backspace` (`Esc` cancels).
-A quick double tap of `Backspace` skips the popup:
+`Backspace` opens a popup listing what could be deleted, each with a box to tick (`Space`), and `Enter` (or `Backspace`) deletes what is ticked; `a` ticks everything that can go, `Esc` cancels. On a worktree (its row, or its `[name]` or `◌` row in the graph) the items are:
 
-- if a herdr workspace is backed by that checkout, herdr's `worktree.remove` deletes the checkout and
-  closes the workspace with its panes; otherwise `git worktree remove`;
-- ignored files in the checkout (`target/`, `node_modules/`, `.env`, …) go with it, and the popup
-  lists them;
-- then the branch is deleted, if it still points at the commit that was checked. The footer prints
-  the sha and the `git branch <name> <sha>` that restores it.
+- the herdr workspace backed by the checkout (closed with its panes);
+- the checkout, with the ignored files in it (`target/`, `node_modules/`, `.env`, …), which the popup lists; it goes together with its workspace, through herdr's `worktree.remove` (else `git worktree remove`);
+- the branch, which goes together with the checkout;
+- the branch's upstream on the remote (`origin/x`), deleted there with `git push`.
 
-Everything is checked again right before anything is removed: a clean tree (no untracked files
-either), the same HEAD, its work in the base branch, no busy agent. Nothing is forced: a worktree with
-untracked files is refused (delete them first, `s` opens a shell there), and git itself refuses a
-dirty checkout. Remote branches are never touched. On a worktree that isn't `⌫`, `Backspace` just says why
-not. This is the only thing canopy ever writes to a repository.
+On a graph commit without a worktree, the items are its branch labels: each local branch, with its upstream, and each remote branch.
+
+An item that can't go is shown with the reason. Nothing that goes may take the last copy of a commit with it: a branch goes only while another branch, local or remote, has its commits (or base has its content, when it was squash-merged), and a remote branch only while another branch on the remote has its commits, so the remote never loses the only copy. What is ticked together counts together: two branches at the same commit are never both deleted, and the local branch of work that only its upstream has can go only while the upstream stays. The checkout can go alone whenever it is clean: its committed work stays in its branch.
+
+Ticked at first is everything that can go when the worktree's work is merged into another branch (not just pushed to its upstream); otherwise nothing, and you tick what you want. A quick double tap of `Backspace` deletes that first choice without the popup (when there is nothing to delete, the popup opens instead).
+
+Everything is checked again right before anything is deleted: a clean tree (no untracked files either), the same HEAD and branch tips, the same commits elsewhere, no busy agent. Nothing is forced: a worktree with untracked files is refused (delete them first, `s` opens a shell there), git itself refuses a dirty checkout, a branch is deleted only while it still points at the commit that was checked (the footer prints the `git branch <name> <sha>` that restores it), and a remote branch only with `--force-with-lease` at that commit, after `ls-remote` confirms the branch that keeps its commits is still there on the remote. The remote is reached with ssh in batch mode and without credential prompts (30 s at most); when that fails, the local items are still deleted and the footer says why the remote branch was kept. canopy never fetches, so a branch deleted on the remote stays as `origin/x` here until `git fetch --prune`. Deleting is the only thing canopy ever writes, to a repository or a remote.
 
 ## herdr agent activity
 

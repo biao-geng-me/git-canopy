@@ -30,7 +30,7 @@ use ratatui::layout::{Position, Rect};
 use crate::cleanup;
 use crate::diff::{self, DiffDoc};
 use crate::git::RepoPaths;
-use crate::graph::RowKind;
+use crate::graph::{LabelKind, RowKind};
 use crate::herdr;
 use crate::model::{Cleanup, Host, Snapshot};
 use crate::remote::client::{self as remote, Conn, RemoteHandle};
@@ -123,17 +123,30 @@ pub struct WtFields {
     pub overlap: Option<Range<u16>>,
 }
 
-/// Progress of a worktree removal started with Backspace.
+/// Progress of a cleanup started with Backspace.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Cleaning {
     #[default]
     Idle,
-    /// Checking the worktree at `path` before the confirm popup. `confirmed`: Backspace was
-    /// pressed again meanwhile, so it is removed as soon as the checks pass, without the popup.
-    Checking { path: PathBuf, confirmed: bool },
+    /// Checking a target (a worktree's path, or a commit's sha) before the popup. `confirmed`:
+    /// Backspace was pressed again meanwhile, so the plan's default choice is deleted as soon as
+    /// the checks pass, without the popup.
+    Checking { key: String, confirmed: bool },
     /// The confirm popup is open (`App::confirm`).
     Confirming,
     Removing,
+}
+
+/// The cleanup popup (Backspace): the plan, which items are chosen, and the cursor.
+pub struct Confirm {
+    /// The repository's id, and the host that made the plan (and carries it out).
+    pub id: u64,
+    pub via: Host,
+    pub plan: cleanup::Plan,
+    pub chosen: Vec<bool>,
+    pub cursor: usize,
+    /// Why the last toggle was refused.
+    pub refused: Option<String>,
 }
 
 /// A shell (or a git TUI) in an inset below the graph.
@@ -276,8 +289,8 @@ pub struct App {
     pub notice: Option<String>,
     /// `y` was pressed: the next key picks what to copy.
     pub copy_pending: bool,
-    /// Removing a worktree, waiting for the user to confirm (with the id of its repository).
-    pub confirm: Option<(u64, Host, cleanup::Plan)>,
+    /// The cleanup popup: what can be deleted, waiting for the user to choose and confirm.
+    pub confirm: Option<Confirm>,
     /// Where a worktree removal is (one at a time).
     cleaning: Cleaning,
     clipboard: Vec<crate::clipboard::Method>,
@@ -406,18 +419,18 @@ impl Worker {
         }
     }
 
-    fn cleanup_plan(&self, w: crate::model::WorktreeView, base: String, reply: watch::Reply<cleanup::Plan>) {
+    fn cleanup_plan(&self, target: cleanup::Target, base: Option<String>, reply: watch::Reply<cleanup::Plan>) {
         match self {
-            Worker::Local(h) => h.cleanup_plan(w, base, reply),
-            Worker::Remote(Some(h)) => h.cleanup_plan(w, base, reply),
+            Worker::Local(h) => h.cleanup_plan(target, base, reply),
+            Worker::Remote(Some(h)) => h.cleanup_plan(target, base, reply),
             Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
         }
     }
 
-    fn cleanup_run(&self, plan: cleanup::Plan, reply: watch::Reply<String>) {
+    fn cleanup_run(&self, plan: cleanup::Plan, chosen: Vec<bool>, reply: watch::Reply<String>) {
         match self {
-            Worker::Local(h) => h.cleanup_run(plan, reply),
-            Worker::Remote(Some(h)) => h.cleanup_run(plan, reply),
+            Worker::Local(h) => h.cleanup_run(plan, chosen, reply),
+            Worker::Remote(Some(h)) => h.cleanup_run(plan, chosen, reply),
             Worker::Remote(None) => reply(Err(NOT_CONNECTED.into())),
         }
     }
@@ -1883,13 +1896,24 @@ impl App {
                 self.notice = Some(notice);
             }
             UiMsg::CleanupPlan(id, via, plan) => match plan {
-                Ok(plan) if matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. }) => {
-                    self.remove_worktree(id, via, *plan);
-                }
                 Ok(plan) => {
-                    self.notice = None;
-                    self.confirm = Some((id, via, *plan));
-                    self.cleaning = Cleaning::Confirming;
+                    let chosen = plan.default_choice();
+                    let quick = matches!(self.cleaning, Cleaning::Checking { confirmed: true, .. });
+                    if quick && chosen.iter().any(|&c| c) {
+                        self.run_cleanup(id, via, *plan, chosen);
+                    } else {
+                        self.notice = None;
+                        let cursor = (0..plan.items.len()).find(|&i| plan.blocked(i).is_none()).unwrap_or(0);
+                        self.confirm = Some(Confirm {
+                            id,
+                            via,
+                            plan: *plan,
+                            chosen,
+                            cursor,
+                            refused: None,
+                        });
+                        self.cleaning = Cleaning::Confirming;
+                    }
                 }
                 Err(e) => {
                     self.cleaning = Cleaning::Idle;
@@ -2099,13 +2123,6 @@ impl App {
             return Cleanup::No;
         }
         w.cleanup(repo.snap.base.as_deref(), self.agent_busy(r, wi))
-    }
-
-    /// Why worktree `wi` of the shown repository can't be cleaned up (untracked files aside).
-    fn cleanup_blocker(&self, wi: usize) -> Option<String> {
-        let w = self.snap.worktrees.get(wi)?;
-        w.cleanup_blocker(self.snap.base.as_deref(), self.agent_busy(self.active, wi))
-            .or_else(|| self.herdr_unseen(self.active, w).then(|| crate::model::HERDR_UNSEEN.to_string()))
     }
 
     /// Whether herdr made worktree `w` but no herdr workspace canopy can see has it, so agents
@@ -2546,114 +2563,159 @@ impl App {
         });
     }
 
-    /// Backspace: remove the focused worktree with its branch (and herdr workspace) once the user
-    /// confirms. Only for worktrees marked `⌫` (their work is in base, nothing would be lost);
-    /// everything is checked again off the UI thread before the confirm popup opens.
+    /// Backspace: clean up what is under the cursor, a worktree (its checkout, herdr workspace,
+    /// branch and the branch's upstream) or a graph commit's branch labels. The plan is made
+    /// off the UI thread and opens the popup, where the user picks what goes; pressed again
+    /// before the plan is in, its default choice goes without the popup.
     fn start_cleanup(&mut self) {
-        let target = self.cleanup_target();
+        let Some((key, target)) = self.cleanup_target() else {
+            self.notice = Some("nothing to clean up here: no worktree or branch on this commit".into());
+            return;
+        };
         match &mut self.cleaning {
             Cleaning::Idle => {}
-            // A double tap: remove it right after the checks, without the popup.
-            Cleaning::Checking { path, confirmed } if target.map(|wi| &self.snap.worktrees[wi].path) == Some(path) => {
+            // A double tap: delete the default choice right after the checks, without the popup.
+            Cleaning::Checking { key: k, confirmed } if *k == key => {
                 *confirmed = true;
                 return;
             }
             _ => {
-                self.notice = Some("a removal is already in progress".into());
+                self.notice = Some("a cleanup is already in progress".into());
                 return;
             }
         }
-        let Some(wi) = target else { return };
-        let w = self.snap.worktrees[wi].clone();
-        match self.cleanup(wi) {
-            Cleanup::Safe => {}
-            Cleanup::Untracked => {
-                let st = w.status.as_ref();
-                let (files, dirs) = st.map_or((0, 0), |s| (s.untracked - s.untracked_dirs, s.untracked_dirs));
-                let count = |n: u32, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-                let what = match (files, dirs) {
-                    (f, 0) => count(f, "untracked file"),
-                    (0, d) => count(d, "new folder"),
-                    (f, d) => format!("{} and {}", count(f, "untracked file"), count(d, "new folder")),
-                };
-                self.notice = Some(format!(
-                    "can't remove {}: {what} would be lost; delete them first (s opens a shell there)",
-                    w.name
-                ));
-                return;
-            }
-            Cleanup::No => {
-                let why = self.cleanup_blocker(wi).unwrap_or_else(|| "it isn't safe to remove".into());
-                self.notice = Some(format!("can't remove {}: {why}", w.name));
-                return;
-            }
-        }
-        let Some(base) = self.snap.base.clone() else { return };
         let Some(repo) = self.repos.get(self.active) else { return };
-        let (tx, id, name) = (self.tx.clone(), repo.id, w.name.clone());
-        // Checked (and later removed) where the herdr that has its workspace runs, so that herdr
-        // closes it; on a shared filesystem that may be a mirror's host.
-        let via = self.herdr_workspace_host(self.active, &w.path).unwrap_or_else(|| repo.host.clone());
-        let mirror = self.mirror_worker(self.active, &via);
-        self.cleaning = Cleaning::Checking {
-            path: w.path.clone(),
-            confirmed: false,
+        let (tx, id) = (self.tx.clone(), repo.id);
+        let name = match &target {
+            cleanup::Target::Worktree(w) => w.name.clone(),
+            cleanup::Target::Refs { refs, .. } => {
+                refs.iter().map(|r| crate::git::refs::short(r)).collect::<Vec<_>>().join(", ")
+            }
         };
+        // Planned (and later carried out) where the herdr that has the worktree's workspace
+        // runs, so that herdr closes it; on a shared filesystem that may be a mirror's host.
+        let via = match &target {
+            cleanup::Target::Worktree(w) => self.herdr_workspace_host(self.active, &w.path),
+            cleanup::Target::Refs { .. } => None,
+        }
+        .unwrap_or_else(|| repo.host.clone());
+        let mirror = self.mirror_worker(self.active, &via);
+        self.cleaning = Cleaning::Checking { key, confirmed: false };
         self.notice = Some(format!("checking {name}…"));
         let via2 = via.clone();
         mirror.as_ref().unwrap_or(&repo.worker).cleanup_plan(
-            w,
-            base,
+            target,
+            self.snap.base.clone(),
             Box::new(move |plan| {
-                let plan = plan.map(Box::new).map_err(|e| format!("can't remove {name}: {e}"));
+                let plan = plan.map(Box::new).map_err(|e| format!("can't clean up {name}: {e}"));
                 let _ = tx.send(UiMsg::CleanupPlan(id, via2, plan));
             }),
         );
     }
 
-    /// The worktree Backspace acts on. On a graph commit that several worktrees have checked out
-    /// (a merged branch and its base), the one that can be cleaned up.
-    fn cleanup_target(&self) -> Option<usize> {
-        let focused = self.focused_wi()?;
+    /// What Backspace acts on, with a key that tells a second press on the same thing. On a
+    /// graph commit that several worktrees have checked out (a merged branch and its base), the
+    /// one that can be cleaned up; on a commit without a worktree, its branch labels.
+    fn cleanup_target(&self) -> Option<(String, cleanup::Target)> {
+        let worktree = |wi: usize| {
+            let w = self.snap.worktrees.get(wi)?;
+            Some((w.path.to_string_lossy().into_owned(), cleanup::Target::Worktree(Box::new(w.clone()))))
+        };
         if self.focus != Focus::Graph {
-            return Some(focused);
+            return worktree(self.focused_wi()?);
         }
+        let Some(focused) = self.focused_wi() else {
+            let r = self.graph.lines.get(self.graph.pos.sel)?.row();
+            let g = &self.snap.graph;
+            let RowKind::Commit(ci) = g.rows.get(r)?.kind else { return None };
+            let refs: Vec<String> = g.labels.get(ci)?
+                .iter()
+                .filter_map(|l| match l.kind {
+                    LabelKind::Branch => Some(format!("refs/heads/{}", l.text)),
+                    LabelKind::Remote => Some(format!("refs/remotes/{}", l.text)),
+                    LabelKind::Worktree | LabelKind::Tag => None,
+                })
+                .collect();
+            if refs.is_empty() {
+                return None;
+            }
+            let sha = g.commits[ci].id.clone();
+            return Some((sha.clone(), cleanup::Target::Refs { sha, refs }));
+        };
         let head = self.snap.worktrees[focused].head.as_ref();
         let candidates: Vec<usize> = (0..self.snap.worktrees.len())
             .filter(|&wi| head.is_some() && self.snap.worktrees[wi].head.as_ref() == head)
             .collect();
-        [Cleanup::Safe, Cleanup::Untracked]
+        let pick = [Cleanup::Safe, Cleanup::Untracked]
             .iter()
             .find_map(|c| candidates.iter().copied().find(|&wi| self.cleanup(wi) == *c))
-            .or(Some(focused))
+            .unwrap_or(focused);
+        worktree(pick)
     }
 
-    /// Carry out a confirmed removal in the background (repository `id` checks everything once
-    /// more).
-    fn remove_worktree(&mut self, id: u64, via: Host, plan: cleanup::Plan) {
+    /// Delete the items `chosen` in `plan` in the background (repository `id`'s host `via`
+    /// checks everything once more).
+    fn run_cleanup(&mut self, id: u64, via: Host, plan: cleanup::Plan, chosen: Vec<bool>) {
         let Some(r) = self.repo_index(id) else {
             self.cleaning = Cleaning::Idle;
-            self.notice = Some(format!("didn't remove {}: its repository is no longer watched", plan.name));
+            self.notice = Some(format!("didn't clean up {}: its repository is no longer watched", plan.name));
             return;
         };
         self.cleaning = Cleaning::Removing;
-        self.notice = Some(format!("removing {}…", plan.name));
+        let what: Vec<String> = plan
+            .items
+            .iter()
+            .zip(&chosen)
+            .filter(|&(_, &c)| c)
+            .map(|(it, _)| it.what.label())
+            .collect();
+        self.notice = Some(format!("deleting {}…", what.join(", ")));
         let (tx, name) = (self.tx.clone(), plan.name.clone());
         let mirror = self.mirror_worker(r, &via);
         mirror.as_ref().unwrap_or(&self.repos[r].worker).cleanup_run(
             plan,
+            chosen,
             Box::new(move |res| {
-                let _ = tx.send(UiMsg::CleanupDone(res.map_err(|e| format!("didn't remove {name}: {e}"))));
+                let _ = tx.send(UiMsg::CleanupDone(res.map_err(|e| format!("didn't clean up {name}: {e}"))));
             }),
         );
     }
 
-    /// Keys while the confirm popup is open: `y`/Enter/Backspace removes, Esc/`n`/`q` cancels.
+    /// Keys while the cleanup popup is open: `↑`/`↓` pick an item, Space toggles it, `a` chooses
+    /// everything that can go, `y`/Enter/Backspace delete what is chosen, Esc/`n`/`q` cancel.
     fn on_confirm_key(&mut self, k: KeyEvent) {
+        let Some(c) = self.confirm.as_mut() else { return };
+        let n = c.plan.items.len();
         match k.code {
+            KeyCode::Up | KeyCode::Char('k') => c.cursor = c.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => c.cursor = (c.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Char(' ') => {
+                let i = c.cursor;
+                c.refused = c.plan.toggle(&mut c.chosen, i).err();
+            }
+            KeyCode::Char('a') => {
+                let all = c.plan.default_choice();
+                // When the default is nothing (the work isn't merged), choose what can go anyway.
+                c.chosen = if all.iter().any(|&x| x) {
+                    all
+                } else {
+                    let mut v = vec![false; n];
+                    for i in 0..n {
+                        if !v[i] {
+                            let _ = c.plan.toggle(&mut v, i);
+                        }
+                    }
+                    v
+                };
+                c.refused = None;
+            }
             KeyCode::Char('y') | KeyCode::Enter | KeyCode::Backspace => {
-                if let Some((id, via, plan)) = self.confirm.take() {
-                    self.remove_worktree(id, via, plan);
+                if !c.chosen.iter().any(|&x| x) {
+                    c.refused = Some("nothing chosen: Space chooses the item under the cursor".into());
+                    return;
+                }
+                if let Some(c) = self.confirm.take() {
+                    self.run_cleanup(c.id, c.via, c.plan, c.chosen);
                 }
             }
             KeyCode::Esc | KeyCode::Char('n' | 'q') => {

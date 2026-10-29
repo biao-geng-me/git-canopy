@@ -318,6 +318,12 @@ fn merged_worktrees_are_marked_for_cleanup() {
     }
     git(&repo, &["merge", "-q", "--squash", "squashed"]);
     git(&repo, &["commit", "-qm", "squash of squashed"]);
+    // part: merged into another branch than main.
+    git(&repo, &["worktree", "add", "-q", "-b", "part", &wt("part"), "main"]);
+    std::fs::write(fx.wt("part").join("part.txt"), "part\n").unwrap();
+    git(&fx.wt("part"), &["add", "part.txt"]);
+    git(&fx.wt("part"), &["commit", "-qm", "part work"]);
+    git(&repo, &["branch", "integration", "part"]);
     // Worktrees without commits of their own that git used just now are held back.
     fx.age(&fx.wt("detached"));
     fx.age(&fx.wt("untracked-only"));
@@ -334,6 +340,10 @@ fn merged_worktrees_are_marked_for_cleanup() {
     let cleanup = |name: &str| find(&s, name).cleanup(s.base.as_deref(), false);
     assert_eq!(landed("ff-done"), Some(Landed::Merged));
     assert_eq!(landed("squashed"), Some(Landed::Applied));
+    assert_eq!(landed("part"), Some(Landed::Merged));
+    assert_eq!(find(&s, "part").merged_into.as_deref(), Some("integration"));
+    assert_eq!(find(&s, "ff-done").merged_into, None, "in main");
+    assert_eq!(cleanup("part"), Cleanup::Safe);
     // docs sits at main with no commits of its own (and has untracked files); detached is a
     // checkout of an older main commit.
     assert_eq!(landed("docs"), Some(Landed::Unused));
@@ -362,6 +372,10 @@ fn merged_worktrees_are_marked_for_cleanup() {
     });
     assert_eq!(find(&s, "ff-done").cleanup(s.base.as_deref(), false), Cleanup::Untracked);
     assert_eq!(find(&s, "squashed").cleanup(s.base.as_deref(), false), Cleanup::No);
+
+    // The branch that had part's work is gone: part is no longer merged.
+    git(&repo, &["branch", "-D", "integration"]);
+    wait_for(&rx, Duration::from_secs(5), |s| find(s, "part").landed.is_none());
 
     // New work on top of the squash: no longer merged.
     git(&fx.wt("squashed"), &["commit", "-qam", "more work"]);
@@ -471,15 +485,18 @@ fn handle_answers_requests() {
     let patch = ask(&|tx| h.patch(target.clone(), None, Box::new(move |r| tx.send(r).unwrap())));
     assert!(patch.unwrap().contains("diff --git"));
 
-    // A dirty worktree: the plan is refused, with the reason as text.
+    // A dirty worktree: its checkout can't go, and says why.
     let plan = ask(&|tx| {
         h.cleanup_plan(
-            w.clone(),
-            "main".into(),
-            Box::new(move |r| tx.send(r.map(|p| p.name)).unwrap()),
+            canopy::cleanup::Target::Worktree(Box::new(w.clone())),
+            Some("main".into()),
+            Box::new(move |r| {
+                let why = r.map(|p| p.items.iter().filter_map(|it| it.blocker.clone()).collect::<Vec<_>>().join("; "));
+                tx.send(why).unwrap()
+            }),
         )
     });
-    assert!(plan.unwrap_err().contains("uncommitted"));
+    assert!(plan.unwrap().contains("uncommitted"));
 }
 
 #[test]

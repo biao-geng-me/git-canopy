@@ -60,6 +60,60 @@ pub fn run<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Run git in `dir` for something that talks to a remote (`ls-remote`, `push`): never prompts
+/// (ssh in batch mode unless an ssh command is configured, no terminal prompts for
+/// credentials), and gives up after `timeout`.
+pub fn run_net<S: AsRef<OsStr>>(dir: &Path, args: &[S], timeout: std::time::Duration) -> Result<Vec<u8>> {
+    let mut cmd = command(dir, args);
+    let configured = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || run(dir, &["config", "core.sshCommand"]).is_ok();
+    if !configured {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run git (is it installed and on PATH?)")?;
+    // Read both pipes on threads so a chatty git can't block on a full pipe while we wait.
+    let mut out_pipe = child.stdout.take().context("git stdout")?;
+    let mut err_pipe = child.stderr.take().context("git stderr")?;
+    let out_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out_pipe, &mut v);
+        v
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut v);
+        v
+    });
+    let sub = args
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or_default();
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("git {sub}: no answer after {} s", timeout.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let (out, err) = (out_t.join().unwrap_or_default(), err_t.join().unwrap_or_default());
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err);
+        bail!("git {sub}: {}", err.trim());
+    }
+    Ok(out)
+}
+
 /// Where a repository lives, resolved from any path inside it.
 #[derive(Clone, Debug)]
 pub struct RepoPaths {

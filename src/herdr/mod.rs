@@ -3,8 +3,8 @@
 //! Talks to the herdr server over its Unix socket (newline-delimited JSON). One connection makes
 //! requests (`agent.list`, `workspace.list`); a second one holds an `events.subscribe` stream whose
 //! events are only used as signals to re-read. Everything is read-only except [`focus`],
-//! [`open_shell_pane`] and [`remove_worktree_at`], which the user triggers explicitly. When herdr
-//! isn't reachable the feature stays hidden.
+//! [`open_shell_pane`], [`remove_worktree_at`] and [`close_workspace_at`], which the user triggers
+//! explicitly. When herdr isn't reachable the feature stays hidden.
 
 pub mod json;
 
@@ -361,7 +361,10 @@ pub fn run_params(pane_id: &str, command: &str) -> String {
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
-pub use client::{focus, focus_at, open_shell_pane, open_shell_pane_at, read_view_at, remove_worktree_at, spawn, spawn_with};
+pub use client::{
+    close_workspace_at, focus, focus_at, open_shell_pane, open_shell_pane_at, read_view_at, remove_worktree_at, spawn,
+    spawn_with,
+};
 
 /// Without Unix sockets the feature is unavailable.
 #[cfg(not(unix))]

@@ -1,7 +1,9 @@
-//! Removing merged worktrees: with plain git, and through a fake herdr server (which removes the
-//! checkout like herdr does and closes the workspace); refusals when something changed after the
-//! confirm popup opened, an agent is busy, the workspace is canopy's own, a checkout herdr made
-//! has no workspace this herdr knows, or a worktree without commits was used just now.
+//! Cleaning up: merged worktrees (into base or any other branch) with plain git and through a
+//! fake herdr server (which removes the checkout like herdr does and closes the workspace),
+//! remote branches, branch labels without a worktree; refusals when something changed after the
+//! popup opened, deleting would leave commits only in what else goes, an agent is busy, the
+//! workspace is canopy's own, a checkout herdr made has no workspace this herdr knows, or a
+//! worktree without commits was used just now.
 #![cfg(unix)]
 
 mod common;
@@ -13,9 +15,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use canopy::cleanup;
+use canopy::cleanup::{self, Plan, Target, What};
 use canopy::herdr::json::Json;
-use canopy::model::{Landed, WorktreeView};
+use canopy::model::WorktreeView;
 
 /// Run git in `dir` with the user's config ignored and a fixed identity; returns stdout.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -67,6 +69,30 @@ fn common_dir(fx: &common::Fixture) -> PathBuf {
     canopy::git::discover(&fx.repo()).unwrap().common_dir
 }
 
+fn plan_for(fx: &common::Fixture, w: &WorktreeView) -> Plan {
+    cleanup::plan(&common_dir(fx), Target::Worktree(Box::new(w.clone())), Some("main"), None, None, None).unwrap()
+}
+
+/// The plan's items, as `label` (allowed) or `label: why` (not).
+fn items(plan: &Plan) -> Vec<String> {
+    plan.items
+        .iter()
+        .map(|it| match &it.blocker {
+            None => it.what.label(),
+            Some(b) => format!("{}: {b}", it.what.label()),
+        })
+        .collect()
+}
+
+/// The labels of the items `chosen`.
+fn chosen(plan: &Plan, chosen: &[bool]) -> Vec<String> {
+    plan.items.iter().zip(chosen).filter(|&(_, &c)| c).map(|(it, _)| it.what.label()).collect()
+}
+
+fn index(plan: &Plan, label: &str) -> usize {
+    plan.items.iter().position(|it| it.what.label() == label).unwrap_or_else(|| panic!("no {label} in {:?}", items(plan)))
+}
+
 #[test]
 fn removes_checkout_and_branch_with_git() {
     let fx = common::Fixture::new();
@@ -74,15 +100,19 @@ fn removes_checkout_and_branch_with_git() {
     std::fs::write(fx.repo().join(".git/info/exclude"), "*.log\n").unwrap();
     std::fs::write(w.path.join("build.log"), "x").unwrap();
 
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None, None).unwrap();
-    assert_eq!(plan.landed, Landed::Merged);
-    assert!(plan.workspace.is_none());
-    assert_eq!(plan.ignored, ["build.log"]);
+    let plan = plan_for(&fx, &w);
+    let checkout = format!("checkout {}", w.path.display());
+    assert_eq!(items(&plan), [checkout.clone(), "branch ff-done".into()]);
+    let What::Checkout { ignored, .. } = &plan.items[0].what else { panic!() };
+    assert_eq!(ignored, &["build.log"]);
+    assert_eq!(plan.items[1].keepers, ["refs/heads/main"]);
+    let all = plan.default_choice();
+    assert_eq!(chosen(&plan, &all), [checkout, "branch ff-done".into()]);
 
-    let notice = cleanup::run(&plan, None).unwrap();
+    let notice = cleanup::run(&plan, &all, None).unwrap();
     assert!(!w.path.exists());
     assert!(!branch_exists(&fx.repo(), "ff-done"));
-    let short = &plan.head[..7];
+    let short = &w.head.as_ref().unwrap()[..7];
     assert!(notice.contains(&format!("git branch ff-done {short}")), "{notice}");
     assert!(!git(&fx.repo(), &["worktree", "list"]).contains("ff-done"));
 }
@@ -101,24 +131,84 @@ fn squash_merged_branch_is_removed_too() {
     git(&repo, &["merge", "-q", "--squash", "squashed"]);
     git(&repo, &["commit", "-qm", "squash"]);
 
-    let w = view(&path, "squashed");
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", None, None, None).unwrap();
-    assert_eq!(plan.landed, Landed::Applied);
-    cleanup::run(&plan, None).unwrap();
+    let plan = plan_for(&fx, &view(&path, "squashed"));
+    let b = index(&plan, "branch squashed");
+    assert_eq!(plan.items[b].keepers, ["refs/heads/main"], "its content is in main");
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
     assert!(!path.exists());
     assert!(!branch_exists(&repo, "squashed"));
 }
 
 #[test]
+fn merged_into_another_branch_than_base() {
+    // An agent's branch merged into an integration branch that isn't main (yet).
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    let path = fx.wt("part");
+    git(&repo, &["worktree", "add", "-q", "-b", "part", &path.to_string_lossy(), "main"]);
+    std::fs::write(path.join("part.txt"), "x\n").unwrap();
+    git(&path, &["add", "."]);
+    git(&path, &["commit", "-qm", "part"]);
+    git(&repo, &["branch", "integration", "part"]);
+
+    let plan = plan_for(&fx, &view(&path, "part"));
+    let b = index(&plan, "branch part");
+    assert_eq!(plan.items[b].keepers, ["refs/heads/integration"]);
+    assert!(plan.items[b].blocker.is_none());
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
+    assert!(!path.exists() && !branch_exists(&repo, "part") && branch_exists(&repo, "integration"));
+}
+
+#[test]
+fn two_branches_at_one_commit_are_not_both_deleted() {
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    let (x, y) = (fx.wt("x"), fx.wt("y"));
+    git(&repo, &["worktree", "add", "-q", "-b", "x", &x.to_string_lossy(), "main"]);
+    std::fs::write(x.join("x.txt"), "x\n").unwrap();
+    git(&x, &["add", "."]);
+    git(&x, &["commit", "-qm", "x"]);
+    git(&repo, &["worktree", "add", "-q", "-b", "y", &y.to_string_lossy(), "x"]);
+
+    // Each is "merged" into the other: the first goes, then the second is the only copy.
+    let px = plan_for(&fx, &view(&x, "x"));
+    assert_eq!(px.items[index(&px, "branch x")].keepers, ["refs/heads/y"]);
+    cleanup::run(&px, &px.default_choice(), None).unwrap();
+    let py = plan_for(&fx, &view(&y, "y"));
+    let b = index(&py, "branch y");
+    assert!(py.items[b].blocker.as_deref().unwrap().contains("not merged"), "{:?}", items(&py));
+    assert!(py.default_choice().iter().all(|&c| !c), "nothing by default when the work isn't merged");
+    // The checkout alone can still go: its branch keeps the work.
+    let mut pick = vec![false; py.items.len()];
+    py.toggle(&mut pick, index(&py, &format!("checkout {}", y.display()))).unwrap();
+    assert!(py.toggle(&mut pick, b).is_err());
+    cleanup::run(&py, &pick, None).unwrap();
+    assert!(!y.exists() && branch_exists(&repo, "y"));
+
+    // The same for two branch labels without a worktree, chosen together.
+    git(&repo, &["branch", "p", "y"]);
+    let sha = git(&repo, &["rev-parse", "y"]);
+    let target = Target::Refs {
+        sha,
+        refs: vec!["refs/heads/p".into(), "refs/heads/y".into()],
+    };
+    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), None, None, None).unwrap();
+    assert_eq!(chosen(&plan, &plan.default_choice()), ["branch p"]);
+    assert!(plan.check(&[true, true]).is_err());
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
+    assert!(!branch_exists(&repo, "p") && branch_exists(&repo, "y"));
+}
+
+#[test]
 fn refuses_when_something_changed_after_planning() {
     let fx = common::Fixture::new();
-    let common = common_dir(&fx);
     let w = merged_worktree(&fx, "ff-done");
 
     // Untracked file appears while the popup is open: nothing is removed.
-    let plan = cleanup::plan(&common, &w, "main", None, None, None).unwrap();
+    let plan = plan_for(&fx, &w);
+    let all = plan.default_choice();
     std::fs::write(w.path.join("new.txt"), "x").unwrap();
-    let err = cleanup::run(&plan, None).unwrap_err().to_string();
+    let err = cleanup::run(&plan, &all, None).unwrap_err().to_string();
     assert!(err.contains("untracked"), "{err}");
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
     std::fs::remove_file(w.path.join("new.txt")).unwrap();
@@ -127,31 +217,27 @@ fn refuses_when_something_changed_after_planning() {
     std::fs::write(w.path.join("more.txt"), "x").unwrap();
     git(&w.path, &["add", "."]);
     git(&w.path, &["commit", "-qm", "more"]);
-    let err = cleanup::run(&plan, None).unwrap_err().to_string();
+    let err = cleanup::run(&plan, &all, None).unwrap_err().to_string();
     assert!(err.contains("HEAD moved"), "{err}");
-    let err = cleanup::plan(&common, &view(&w.path, "ff-done"), "main", None, None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("isn't in main"), "{err}");
+    let plan = plan_for(&fx, &view(&w.path, "ff-done"));
+    assert!(items(&plan)[1].contains("not merged"), "{:?}", items(&plan));
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
-
 }
 
 #[test]
 fn worktrees_without_commits_of_their_own_are_removed() {
     let fx = common::Fixture::new();
-    let common = common_dir(&fx);
 
     // A fresh branch at main: nothing committed to lose; its branch goes too.
     let fresh = fx.wt("fresh");
     git(&fx.repo(), &["worktree", "add", "-q", "-b", "fresh", &fresh.to_string_lossy(), "main"]);
     // Just made: an agent may be about to start there.
-    let err = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None, None).unwrap_err().to_string();
-    assert!(err.contains("an agent may be starting there"), "{err}");
+    let plan = plan_for(&fx, &view(&fresh, "fresh"));
+    assert!(items(&plan)[0].contains("an agent may be starting there"), "{:?}", items(&plan));
+    assert!(plan.default_choice().iter().all(|&c| !c));
     fx.age(&fresh);
-    let plan = cleanup::plan(&common, &view(&fresh, "fresh"), "main", None, None, None).unwrap();
-    assert_eq!(plan.landed, Landed::Unused);
-    cleanup::run(&plan, None).unwrap();
+    let plan = plan_for(&fx, &view(&fresh, "fresh"));
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
     assert!(!fresh.exists() && !branch_exists(&fx.repo(), "fresh"));
 
     // A detached checkout of an older main commit (the fixture's `detached`).
@@ -163,19 +249,97 @@ fn worktrees_without_commits_of_their_own_are_removed() {
         head: Some(git(&det, &["rev-parse", "HEAD"])),
         ..Default::default()
     };
-    let plan = cleanup::plan(&common, &w, "main", None, None, None).unwrap();
-    assert_eq!((plan.landed, plan.branch.as_deref()), (Landed::Unused, None));
-    cleanup::run(&plan, None).unwrap();
+    let plan = plan_for(&fx, &w);
+    assert_eq!(plan.items.len(), 1, "{:?}", items(&plan));
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
     assert!(!det.exists());
+}
 
-    // A new commit on a fresh branch is work of its own: refused.
-    let wip = fx.wt("wip");
-    git(&fx.repo(), &["worktree", "add", "-q", "-b", "wip", &wip.to_string_lossy(), "main"]);
-    std::fs::write(wip.join("wip.txt"), "x").unwrap();
-    git(&wip, &["add", "."]);
-    git(&wip, &["commit", "-qm", "wip"]);
-    let err = cleanup::plan(&common, &view(&wip, "wip"), "main", None, None, None).unwrap_err().to_string();
-    assert!(err.contains("isn't in main"), "{err}");
+#[test]
+fn remote_branch_goes_when_another_remote_branch_has_it() {
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    let path = fx.wt("feat");
+    git(&repo, &["worktree", "add", "-q", "-b", "feat", &path.to_string_lossy(), "main"]);
+    std::fs::write(path.join("feat.txt"), "x\n").unwrap();
+    git(&path, &["add", "."]);
+    git(&path, &["commit", "-qm", "feat"]);
+    git(&path, &["push", "-q", "-u", "origin", "feat"]);
+    fx.age(&path);
+
+    // Pushed, merged nowhere: the remote branch is the only copy there, and the local branch's
+    // only other copy is its own upstream, so nothing is chosen by default.
+    let plan = plan_for(&fx, &view(&path, "feat"));
+    let r = index(&plan, "remote branch origin/feat");
+    assert!(plan.items[r].blocker.as_deref().unwrap().contains("only copy"), "{:?}", items(&plan));
+    assert!(plan.default_choice().iter().all(|&c| !c));
+    assert_eq!(plan.items[index(&plan, "branch feat")].keepers, ["refs/remotes/origin/feat"]);
+
+    // Merged into another branch on the remote (here: pushed as `integration`): everything goes.
+    git(&path, &["push", "-q", "origin", "feat:integration"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    let plan = plan_for(&fx, &view(&path, "feat"));
+    let all = plan.default_choice();
+    assert_eq!(
+        chosen(&plan, &all),
+        [format!("checkout {}", path.display()), "branch feat".into(), "remote branch origin/feat".into()]
+    );
+    let notice = cleanup::run(&plan, &all, None).unwrap();
+    assert!(notice.contains("origin/feat"), "{notice}");
+    let origin = fx.dir.join("origin.git");
+    assert!(git(&origin, &["branch", "--list", "feat"]).is_empty(), "deleted on the remote");
+    assert!(!git(&origin, &["branch", "--list", "integration"]).is_empty());
+    assert!(!branch_exists(&repo, "feat") && !path.exists());
+}
+
+#[test]
+fn remote_branch_that_moved_on_the_remote_is_kept() {
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    git(&repo, &["push", "-q", "origin", "main~1:refs/heads/old", "main~1:refs/heads/keep"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    let sha = git(&repo, &["rev-parse", "main~1"]);
+    let target = Target::Refs {
+        sha,
+        refs: vec!["refs/remotes/origin/old".into()],
+    };
+    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), None, None, None).unwrap();
+    assert_eq!(items(&plan), ["remote branch origin/old"]);
+    // Someone else pushes to it after the plan (this clone's origin/old doesn't know): the
+    // lease keeps it.
+    let main = git(&repo, &["rev-parse", "main"]);
+    git(&fx.dir.join("origin.git"), &["update-ref", "refs/heads/old", &main]);
+    let notice = cleanup::run(&plan, &plan.default_choice(), None).unwrap();
+    assert!(notice.contains("kept origin/old"), "{notice}");
+    assert!(!git(&fx.dir.join("origin.git"), &["branch", "--list", "old"]).is_empty());
+}
+
+#[test]
+fn branch_labels_without_a_worktree() {
+    let fx = common::Fixture::new();
+    let repo = fx.repo();
+    let common = common_dir(&fx);
+    // `old-experiment` (fixture) isn't merged anywhere; `done` is in main.
+    let sha = git(&repo, &["rev-parse", "old-experiment"]);
+    let target = Target::Refs {
+        sha,
+        refs: vec!["refs/heads/old-experiment".into()],
+    };
+    let plan = cleanup::plan(&common, target, Some("main"), None, None, None).unwrap();
+    assert!(items(&plan)[0].contains("not merged"), "{:?}", items(&plan));
+    assert!(plan.default_choice().iter().all(|&c| !c));
+
+    git(&repo, &["branch", "done", "main~1"]);
+    let sha = git(&repo, &["rev-parse", "done"]);
+    let target = Target::Refs {
+        sha,
+        refs: vec!["refs/heads/done".into(), "refs/heads/main".into()],
+    };
+    let plan = cleanup::plan(&common, target, Some("main"), None, None, None).unwrap();
+    assert_eq!(items(&plan)[1], "branch main: it is the base branch");
+    assert_eq!(chosen(&plan, &plan.default_choice()), ["branch done"]);
+    cleanup::run(&plan, &plan.default_choice(), None).unwrap();
+    assert!(!branch_exists(&repo, "done") && branch_exists(&repo, "main"));
 }
 
 /// A herdr stand-in: one workspace backed by `checkout`, one agent in it with `status`;
@@ -221,6 +385,11 @@ impl FakeHerdr {
                         git(&repo, &["worktree", "remove", &checkout]);
                         format!(r#"{{"id":"{id}","result":{{"type":"worktree_removed","workspace_id":"w9"}}}}"#)
                     }
+                    "workspace.close" => {
+                        let params = req.get("params").unwrap();
+                        log.lock().unwrap().push(format!("close {}", params.get_str("workspace_id").unwrap()));
+                        format!(r#"{{"id":"{id}","result":{{"type":"ok"}}}}"#)
+                    }
                     other => panic!("unexpected call: {other}"),
                 };
                 let _ = writeln!(conn, "{reply}");
@@ -244,13 +413,17 @@ fn herdr_workspace_is_removed_through_herdr() {
 
     // herdr made the checkout (it is in herdr's worktree directory) and has its workspace.
     let herdr_dir = w.path.parent().unwrap();
-    let plan = cleanup::plan(&common_dir(&fx), &w, "main", Some(herdr.sock.clone()), Some(herdr_dir), Some("w1")).unwrap();
-    let ws = plan.workspace.as_ref().unwrap();
+    let target = Target::Worktree(Box::new(w.clone()));
+    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), Some(herdr_dir), Some("w1")).unwrap();
+    let What::Workspace(ws) = &plan.items[0].what else { panic!("{:?}", items(&plan)) };
     assert_eq!((ws.id.as_str(), ws.label.as_str(), ws.panes), ("w9", "ff-done", 2));
     // The done agent is in that workspace: closed with it, not left behind.
-    assert!(plan.stray_agents.is_empty());
+    let What::Checkout { stray_agents, .. } = &plan.items[1].what else { panic!() };
+    assert!(stray_agents.is_empty());
+    // A checkout goes with its workspace.
+    assert_eq!(plan.items[1].requires, [0]);
 
-    let notice = cleanup::run(&plan, Some("w1")).unwrap();
+    let notice = cleanup::run(&plan, &plan.default_choice(), Some("w1")).unwrap();
     assert_eq!(*herdr.calls.lock().unwrap(), ["remove w9 force=Some(Bool(false))"]);
     assert!(!w.path.exists());
     assert!(!branch_exists(&fx.repo(), "ff-done"), "herdr leaves the branch; canopy deletes it");
@@ -258,32 +431,54 @@ fn herdr_workspace_is_removed_through_herdr() {
 }
 
 #[test]
+fn herdr_workspace_alone_is_closed() {
+    let fx = common::Fixture::new();
+    let w = merged_worktree(&fx, "ff-done");
+    let herdr = FakeHerdr::start(&w.path, &fx.repo(), "idle");
+    let target = Target::Worktree(Box::new(w.clone()));
+    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), None, None).unwrap();
+    let mut pick = vec![false; plan.items.len()];
+    plan.toggle(&mut pick, 0).unwrap();
+    assert_eq!(chosen(&plan, &pick), ["herdr workspace ff-done"]);
+    // Choosing the branch takes the checkout and the workspace with it; dropping the
+    // workspace drops them again.
+    let b = index(&plan, "branch ff-done");
+    plan.toggle(&mut pick, b).unwrap();
+    assert_eq!(pick, [true, true, true]);
+    plan.toggle(&mut pick, 0).unwrap();
+    assert_eq!(pick, [false, false, false]);
+    plan.toggle(&mut pick, 0).unwrap();
+
+    cleanup::run(&plan, &pick, None).unwrap();
+    assert_eq!(*herdr.calls.lock().unwrap(), ["close w9"]);
+    assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
+}
+
+#[test]
 fn herdr_refusals() {
     let fx = common::Fixture::new();
     let common = common_dir(&fx);
     let w = merged_worktree(&fx, "ff-done");
+    let target = || Target::Worktree(Box::new(w.clone()));
 
     let busy = FakeHerdr::start(&w.path, &fx.repo(), "working");
-    let err = cleanup::plan(&common, &w, "main", Some(busy.sock.clone()), None, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("agent dev is working"), "{err}");
+    let plan = cleanup::plan(&common, target(), Some("main"), Some(busy.sock.clone()), None, None).unwrap();
+    assert!(items(&plan)[0].contains("agent dev is working"), "{:?}", items(&plan));
+    assert!(items(&plan)[1].contains("agent dev is working"), "{:?}", items(&plan));
+    assert!(plan.default_choice().iter().all(|&c| !c));
 
     let idle = FakeHerdr::start(&w.path, &fx.repo(), "idle");
-    let err = cleanup::plan(&common, &w, "main", Some(idle.sock.clone()), None, Some("w9"))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("canopy runs in its herdr workspace"), "{err}");
+    let plan = cleanup::plan(&common, target(), Some("main"), Some(idle.sock.clone()), None, Some("w9")).unwrap();
+    assert!(items(&plan)[0].contains("canopy runs in it"), "{:?}", items(&plan));
+    assert!(plan.default_choice().iter().all(|&c| !c));
 
     // herdr made the checkout, but no workspace this herdr has is backed by it (or herdr isn't
     // reachable): another herdr, maybe on another machine, may have agents in it.
     let herdr_dir = w.path.parent().unwrap();
     let elsewhere = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
     for sock in [Some(elsewhere.sock.clone()), None] {
-        let err = cleanup::plan(&common, &w, "main", sock, Some(herdr_dir), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no herdr workspace here has it"), "{err}");
+        let plan = cleanup::plan(&common, target(), Some("main"), sock, Some(herdr_dir), None).unwrap();
+        assert!(items(&plan)[0].contains("no herdr workspace here has it"), "{:?}", items(&plan));
     }
     assert!(idle.calls.lock().unwrap().is_empty() && busy.calls.lock().unwrap().is_empty());
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));

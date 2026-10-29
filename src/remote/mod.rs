@@ -24,15 +24,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cleanup::Plan;
+use crate::cleanup::{self, Plan};
 use crate::diff::{DiffDoc, Target};
 use crate::graph::Graph;
 use crate::herdr;
-use crate::model::{Snapshot, WorktreeView};
+use crate::model::Snapshot;
 use crate::watch::Request;
 
 /// Wire protocol version, checked in the hello: both sides must speak the same one.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// Server → client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,10 +122,13 @@ pub enum Call {
     },
     Message(String),
     CleanupPlan {
-        worktree: Box<WorktreeView>,
-        base: String,
+        target: cleanup::Target,
+        base: Option<String>,
     },
-    CleanupRun(Box<Plan>),
+    CleanupRun {
+        plan: Box<Plan>,
+        chosen: Vec<bool>,
+    },
     /// Ask the server's herdr to focus this agent pane (`a`); answered with empty text.
     FocusAgent(String),
 }

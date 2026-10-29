@@ -11,11 +11,11 @@ use std::thread;
 use std::time::Duration;
 
 use super::{Answer, Call, Mode, PROTOCOL, RepoInfo, ToClient, ToServer, send};
-use crate::cleanup::Plan;
+use crate::cleanup::{self, Plan};
 use crate::diff::{DiffDoc, Target};
 use crate::graph::Graph;
 use crate::herdr;
-use crate::model::{Snapshot, WorktreeView};
+use crate::model::Snapshot;
 use crate::watch::{Config, Reply, Request};
 
 /// Lines a login script may print before the hello.
@@ -313,20 +313,19 @@ impl RemoteHandle {
         self.conn.call(self.repo, Call::Message(sha), expect(reply, text));
     }
 
-    pub fn cleanup_plan(&self, worktree: WorktreeView, base: String, reply: Reply<Plan>) {
-        self.conn.call(
-            self.repo,
-            Call::CleanupPlan {
-                worktree: Box::new(worktree),
-                base,
-            },
-            expect(reply, plan),
-        );
+    pub fn cleanup_plan(&self, target: cleanup::Target, base: Option<String>, reply: Reply<Plan>) {
+        self.conn.call(self.repo, Call::CleanupPlan { target, base }, expect(reply, plan));
     }
 
-    pub fn cleanup_run(&self, plan: Plan, reply: Reply<String>) {
-        self.conn
-            .call(self.repo, Call::CleanupRun(Box::new(plan)), expect(reply, text));
+    pub fn cleanup_run(&self, plan: Plan, chosen: Vec<bool>, reply: Reply<String>) {
+        self.conn.call(
+            self.repo,
+            Call::CleanupRun {
+                plan: Box::new(plan),
+                chosen,
+            },
+            expect(reply, text),
+        );
     }
 
     /// Ask the server's herdr to focus agent pane `pane`.

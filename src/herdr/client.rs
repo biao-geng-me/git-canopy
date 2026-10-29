@@ -94,6 +94,12 @@ pub fn remove_worktree_at(path: &Path, workspace_id: &str) -> std::io::Result<()
     Rpc::connect(path)?.call("worktree.remove", &params).map(|_| ())
 }
 
+/// Close workspace `workspace_id` (its panes go with it; its checkout stays).
+pub fn close_workspace_at(path: &Path, workspace_id: &str) -> std::io::Result<()> {
+    let params = format!("{{\"workspace_id\":{}}}", json::quote(workspace_id));
+    Rpc::connect(path)?.call("workspace.close", &params).map(|_| ())
+}
+
 fn run(resolve: &dyn Fn() -> Option<PathBuf>, emit: &Emit) {
     let mut backoff = BACKOFF_MIN;
     let mut shown = true; // whether the last emit was a view (so "unreachable" is sent once)
