@@ -154,9 +154,9 @@ herdr; when herdr isn't reachable the feature is invisible. `--no-herdr` turns i
 7. (Later, not now) herdr plugin: `herdr-plugin.toml` with a popup pane running canopy and a startup
    poller that sets a per-workspace `$wt_dirty` sidebar token via `herdr workspace report-metadata`.
 
-## Status (2026-10-29)
+## Status (2026-10-30)
 
-Built since 0.3.0 and committed on `main`, not pushed, not released (`Cargo.toml` still says 0.3.0): multi-repo 0.4 (steps 1–4), remote machines 0.5 steps 1–4 (`canopy serve`, `HOST:PATH`, one repo seen from several machines shown once with forwarded file events, `--herdr-repos` per host, `--host`, `canopy remote install`), folding repository groups in the worktree list (`n`, `f`), `--host` as "the same repositories on that host too" (see Scope), and the cleanup popup with items to pick, merged into any branch, remote branches and branch labels (see Design decisions, Cleanup; `PROTOCOL` 3). Details in the sections below.
+Released as 0.4.0 (2026-10-30), which ships both planned milestones below, "0.4 multi-repo" (steps 1–4) and "0.5 remote machines" (steps 1–4: `canopy serve`, `HOST:PATH`, one repo seen from several machines shown once with forwarded file events, `--herdr-repos` per host, `--host`, `canopy remote install`), plus folding repository groups in the worktree list (`n`, `f`), `--host` as "the same repositories on that host too" (see Scope), and the cleanup popup with items to pick, merged into any branch, remote branches and branch labels (see Design decisions, Cleanup; `PROTOCOL` 4). Assets for x86_64 and aarch64 musl. Details in the sections below.
 
 Open, in rough order:
 - A serve that finds no herdr says so: report the socket path it tried (in the hello or a herdr-state message) so the header/details can show `gh-b-001: no herdr (looked in …)` instead of looking like a host without agents (the user hit this with `CANOPY_REMOTE_CMD` exported in another shell).
@@ -164,7 +164,6 @@ Open, in rough order:
 - Maybe herdr's saved machines as hosts (`herdr machine list`).
 - `workspace.close` (only the herdr workspace picked) is tested against the fake socket only, not a live herdr; herdr's CLI says only "Close a workspace", so check on a throwaway server that it leaves the checkout.
 - The base-branch guess is wrong when the integration branch isn't main/master/trunk/develop (whisker_sensor_repo: `bluerov-whisker-imu`, 119 commits ahead of `main`): ahead/behind, change size, overlaps and `b` compare with `main` there. Cleanup no longer depends on it. Maybe `git config canopy.base` per repo, or a hint when everything is in the main worktree's branch.
-- Release 0.5 when the user asks (bump, tag, musl asset; an aarch64 asset would help `remote install` for Arm hosts).
 
 ## Roadmap after 0.2
 
@@ -239,10 +238,7 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
 
 - Commit after each milestone (small, descriptive messages). Remote: `origin` =
   github.com/biao-geng-me/git-canopy (public). Push and publish releases only when the user asks.
-- Releases: bump `Cargo.toml`, commit "Release x.y.z", annotated tag `vx.y.z` ("canopy x.y.z"), then a
-  GitHub release with `canopy-x86_64-unknown-linux-musl.tar.gz` (static musl build: `canopy`,
-  README, LICENSE) and its `.sha256` (`scripts/release.sh`). The asset name has no version so
-  `releases/latest/download/...` in the README stays valid.
+- Releases: bump `Cargo.toml`, commit "Release x.y.z", annotated tag `vx.y.z` ("canopy x.y.z"), then a GitHub release with `canopy-x86_64-unknown-linux-musl.tar.gz` and `canopy-aarch64-unknown-linux-musl.tar.gz` (static musl builds: `canopy`, README, LICENSE) and their `.sha256` (`scripts/release.sh`, run once on each arch: x86 on a sporc node, aarch64 on tigris, with separate `CARGO_TARGET_DIR`s). The asset names have no version so `releases/latest/download/...` in the README stays valid. `gh` isn't logged in on tigris.
 - Keep `cargo clippy` clean and `cargo test` green.
 - README.md for users; this file for design intent — update it when design decisions change.
 

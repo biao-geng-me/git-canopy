@@ -1,6 +1,6 @@
 [package]
 name = "git-canopy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Many trees, one canopy: a live TUI showing every git worktree of a repo at a glance"
 authors = ["Biao Geng <biao.geng.me@gmail.com>"]
