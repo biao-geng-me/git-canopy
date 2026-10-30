@@ -78,11 +78,11 @@ you over to a git TUI.
 Requires `git` (2.36 or newer) at runtime. Linux (including WSL2) is what canopy is built and tested
 on; other Unixes may work.
 
-**Prebuilt (Linux x86_64):** a fully static binary is attached to each
+**Prebuilt (Linux x86_64 and aarch64):** a fully static binary is attached to each
 [release](https://github.com/biao-geng-me/git-canopy/releases):
 
 ```sh
-curl -L https://github.com/biao-geng-me/git-canopy/releases/latest/download/canopy-x86_64-unknown-linux-musl.tar.gz \
+curl -L https://github.com/biao-geng-me/git-canopy/releases/latest/download/canopy-$(uname -m)-unknown-linux-musl.tar.gz \
   | tar -xz -C ~/.local/bin canopy
 ```
 
@@ -94,7 +94,7 @@ cargo install --git https://github.com/biao-geng-me/git-canopy   # installs the 
 
 Optional: `ln -s "$(command -v canopy)" ~/.local/bin/git-canopy` makes `git canopy` work.
 
-For a fully static Linux binary from a checkout: `cargo build --release --target x86_64-unknown-linux-musl`.
+For a fully static Linux binary from a checkout: `cargo build --release --target $(uname -m)-unknown-linux-musl`.
 
 ## Usage
 
