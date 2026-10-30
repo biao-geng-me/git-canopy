@@ -77,10 +77,33 @@ pub enum Landed {
 /// offered for cleanup: an agent may have just started there and not changed anything yet.
 pub const FRESH_SECS: i64 = 3600;
 
-/// Why a checkout herdr made (under its worktree directory) isn't offered for cleanup when no
-/// reachable herdr server has a workspace for it.
-pub const HERDR_UNSEEN: &str =
-    "herdr made it, but no herdr workspace here has it: it may be in use from another herdr (another machine?)";
+/// A checkout herdr made (under its worktree directory) that no reachable herdr server has a
+/// workspace for: its workspace was closed and the checkout left behind, or a herdr canopy can't
+/// reach (another machine's) has agents in it. `ago`: seconds since git last used it. Refused
+/// (`Err`) while that is under [`FRESH_SECS`], whatever its commits, since such an agent may be
+/// working there; else a warning (`Ok`): it can be picked, but is never removed by default.
+pub fn herdr_unseen(ago: Option<i64>) -> Result<String, String> {
+    match ago {
+        Some(ago) if ago < FRESH_SECS => Err(format!(
+            "used {} min ago and no herdr here has its workspace: another herdr's agent may be in it",
+            ago.max(0) / 60
+        )),
+        Some(ago) => Ok(format!(
+            "no herdr here has its workspace (closed? another machine's?); last used {} ago",
+            ago_text(ago)
+        )),
+        None => Ok("no herdr here has its workspace (closed? another machine's?)".to_string()),
+    }
+}
+
+/// `40 min`, `5 h`, `13 days`.
+fn ago_text(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s < 2 * 86400 => format!("{} h", s / 3600),
+        s => format!("{} days", s / 86400),
+    }
+}
 
 /// Whether removing a worktree (and its branch) would lose nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

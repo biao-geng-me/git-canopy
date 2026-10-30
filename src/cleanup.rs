@@ -63,6 +63,9 @@ pub struct Item {
     pub keepers: Vec<String>,
     /// Why this item can't be deleted at all (shown next to it).
     pub blocker: Option<String>,
+    /// Why this item may be deleted only when picked by hand: never in [`Plan::default_choice`]
+    /// (shown next to it).
+    pub warning: Option<String>,
     /// Items that go with this one (indexes into [`Plan::items`]): a branch takes its checkout,
     /// a checkout the herdr workspace backed by it.
     pub requires: Vec<usize>,
@@ -204,9 +207,10 @@ impl Plan {
     }
 
     /// What a double Backspace deletes: every item that can go, in order, as long as they can
-    /// all go together. Nothing when the worktree's work isn't merged into another branch (only
-    /// its own upstream has it, or nothing does): removing just the checkout, or the local
-    /// branch of pushed work, is then something to pick in the popup.
+    /// all go together, except items with a warning (and those that go only with them). Nothing
+    /// when the worktree's work isn't merged into another branch (only its own upstream has it,
+    /// or nothing does): removing just the checkout, or the local branch of pushed work, is then
+    /// something to pick in the popup.
     pub fn default_choice(&self) -> Vec<bool> {
         let mut chosen = vec![false; self.items.len()];
         let upstream: Vec<String> = self
@@ -219,7 +223,11 @@ impl Plan {
             .collect();
         for i in 0..self.items.len() {
             if !chosen[i] {
-                let _ = self.toggle(&mut chosen, i);
+                let mut next = chosen.clone();
+                let warned = |c: &[bool]| c.iter().zip(&self.items).any(|(&c, it)| c && it.warning.is_some());
+                if self.toggle(&mut next, i).is_ok() && !warned(&next) {
+                    chosen = next;
+                }
             }
         }
         // A worktree's cleanup is all or nothing by default: its branch goes (with its checkout
@@ -333,6 +341,7 @@ fn worktree_items(
             sha: None,
             keepers: Vec::new(),
             blocker,
+            warning: None,
             requires: Vec::new(),
         });
     }
@@ -344,8 +353,13 @@ fn worktree_items(
     if blocker.is_none() {
         blocker = busy.clone();
     }
+    let mut warning = None;
     if blocker.is_none() && ws_index.is_none() && herdr_dir.is_some_and(|d| w.path.starts_with(d)) {
-        blocker = Some(crate::model::HERDR_UNSEEN.to_string());
+        let used = git::worktree::admin_dir(&w.path).and_then(|a| git::worktree::last_used(&a));
+        match crate::model::herdr_unseen(used.map(|t| crate::model::now_secs() - t)) {
+            Ok(w) => warning = Some(w),
+            Err(b) => blocker = Some(b),
+        }
     }
     if blocker.is_none()
         && let Some(ago) = fresh_for(dir, w, &containing)
@@ -364,6 +378,7 @@ fn worktree_items(
         sha: Some(head.clone()),
         keepers: containing.clone(),
         blocker,
+        warning,
         requires: ws_index.into_iter().collect(),
     });
 
@@ -424,6 +439,7 @@ fn branch_items(
         sha: Some(sha.to_string()),
         keepers,
         blocker,
+        warning: None,
         requires: checkout.into_iter().collect(),
     });
     if let Some(up) = refs::upstream(dir, b)? {
@@ -445,6 +461,7 @@ fn remote_item(dir: &Path, up: Upstream, base: Option<&str>, items: &mut Vec<Ite
             sha: None,
             keepers: Vec::new(),
             blocker: Some("already gone here (deleted on the remote, or never fetched)".to_string()),
+            warning: None,
             requires: Vec::new(),
         });
         return Ok(());
@@ -476,6 +493,7 @@ fn remote_item(dir: &Path, up: Upstream, base: Option<&str>, items: &mut Vec<Ite
         sha: Some(sha),
         keepers,
         blocker,
+        warning: None,
         requires: Vec::new(),
     });
     Ok(())

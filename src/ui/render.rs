@@ -1282,6 +1282,12 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
         )),
         Cleanup::No => {}
     }
+    if app.cleanup(wi) != Cleanup::No && app.herdr_unseen(app.active, w) {
+        spans.push(Span::styled(
+            ", but no herdr here has its workspace: pick it in the popup",
+            Style::new().fg(C_MODIFIED),
+        ));
+    }
     if app.snap.watching && !w.watched && w.has_worktree() {
         spans.push(sep());
         spans.push(Span::styled("not watched: polled", dim));
@@ -2125,6 +2131,9 @@ fn draw_confirm(f: &mut Frame, c: &crate::ui::Confirm) {
         match blocked {
             Some(b) => lines.push(detail(b, dim)),
             None => {
+                if let Some(w) = &item.warning {
+                    lines.push(detail(w.clone(), warn));
+                }
                 let kept: Vec<&str> = item
                     .keepers
                     .iter()

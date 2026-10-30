@@ -2119,7 +2119,8 @@ impl App {
     pub fn cleanup_in(&self, r: usize, wi: usize) -> Cleanup {
         let Some(repo) = self.repos.get(r) else { return Cleanup::No };
         let Some(w) = repo.snap.worktrees.get(wi) else { return Cleanup::No };
-        if self.herdr_unseen(r, w) {
+        let used_ago = w.git_used_at.map(|t| crate::model::now_secs() - t);
+        if self.herdr_unseen(r, w) && crate::model::herdr_unseen(used_ago).is_err() {
             return Cleanup::No;
         }
         w.cleanup(repo.snap.base.as_deref(), self.agent_busy(r, wi))
@@ -2127,8 +2128,9 @@ impl App {
 
     /// Whether herdr made worktree `w` but no herdr workspace canopy can see has it, so agents
     /// in it (say, from a herdr on another machine sharing the filesystem) would go unnoticed.
-    /// `w` is in repository `r`; its host's herdr is the one asked.
-    fn herdr_unseen(&self, r: usize, w: &crate::model::WorktreeView) -> bool {
+    /// `w` is in repository `r`; its host's herdr is the one asked. Cleanup refuses it while git
+    /// used it recently, else only picks it by hand (`model::herdr_unseen`).
+    pub fn herdr_unseen(&self, r: usize, w: &crate::model::WorktreeView) -> bool {
         let Some(repo) = self.repos.get(r) else { return false };
         let hosts = std::iter::once(repo.host.clone()).chain(repo.mirrors.iter().map(|m| Host::Ssh(m.host.clone())));
         let in_herdr_dir = hosts

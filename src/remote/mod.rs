@@ -32,7 +32,7 @@ use crate::model::Snapshot;
 use crate::watch::Request;
 
 /// Wire protocol version, checked in the hello: both sides must speak the same one.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Server → client.
 #[derive(Debug, Serialize, Deserialize)]

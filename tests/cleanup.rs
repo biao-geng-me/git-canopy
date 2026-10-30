@@ -473,13 +473,40 @@ fn herdr_refusals() {
     assert!(plan.default_choice().iter().all(|&c| !c));
 
     // herdr made the checkout, but no workspace this herdr has is backed by it (or herdr isn't
-    // reachable): another herdr, maybe on another machine, may have agents in it.
+    // reachable): another herdr, maybe on another machine, may have agents in it. Refused while
+    // git used it in the last hour.
     let herdr_dir = w.path.parent().unwrap();
     let elsewhere = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
     for sock in [Some(elsewhere.sock.clone()), None] {
         let plan = cleanup::plan(&common, target(), Some("main"), sock, Some(herdr_dir), None).unwrap();
-        assert!(items(&plan)[0].contains("no herdr workspace here has it"), "{:?}", items(&plan));
+        assert!(items(&plan)[0].contains("another herdr's agent may be in it"), "{:?}", items(&plan));
     }
     assert!(idle.calls.lock().unwrap().is_empty() && busy.calls.lock().unwrap().is_empty());
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
+}
+
+#[test]
+fn checkout_herdr_made_but_cannot_see_is_picked_by_hand() {
+    let fx = common::Fixture::new();
+    let w = merged_worktree(&fx, "ff-done");
+    fx.age(&w.path);
+    let herdr_dir = w.path.parent().unwrap();
+    // A herdr whose only workspace is the main checkout: this one's workspace was closed (and
+    // herdr left the checkout), or another herdr has it.
+    let herdr = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
+    let target = Target::Worktree(Box::new(w.clone()));
+    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), Some(herdr_dir), None).unwrap();
+    let c = plan.items.iter().position(|it| matches!(it.what, What::Checkout { .. })).unwrap();
+    assert!(plan.items[c].blocker.is_none(), "{:?}", items(&plan));
+    let warning = plan.items[c].warning.as_deref().unwrap();
+    assert!(warning.contains("last used 2 h ago"), "{warning}");
+    // Never by default (nor the branch, which goes only with it).
+    assert!(plan.default_choice().iter().all(|&c| !c), "{:?}", items(&plan));
+
+    let mut pick = vec![false; plan.items.len()];
+    plan.toggle(&mut pick, index(&plan, "branch ff-done")).unwrap();
+    assert!(pick[c]);
+    cleanup::run(&plan, &pick, None).unwrap();
+    assert!(herdr.calls.lock().unwrap().is_empty(), "plain git worktree remove, no herdr call");
+    assert!(!w.path.exists() && !branch_exists(&fx.repo(), "ff-done"));
 }
