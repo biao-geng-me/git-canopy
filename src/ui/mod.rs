@@ -279,6 +279,8 @@ pub struct App {
     pub graph_jump: Option<PathBuf>,
     pub diff: Option<DiffView>,
     pub help: bool,
+    /// First help line shown when the popup doesn't fit (clamped by render).
+    pub help_scroll: usize,
     pub quit: bool,
     pub areas: Areas,
     /// Graph width the open rows' text was wrapped for.
@@ -561,6 +563,7 @@ impl App {
             graph_jump: None,
             diff: None,
             help: false,
+            help_scroll: 0,
             quit: false,
             areas: Areas::default(),
             wrap_width: 0,
@@ -2053,6 +2056,12 @@ impl App {
                 }
             }
             UiMsg::Input(Event::Mouse(_)) if self.confirm.is_some() => {}
+            UiMsg::Input(Event::Mouse(m)) if self.help => match m.kind {
+                MouseEventKind::ScrollDown => self.help_scroll += 3,
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::Down(_) => self.help = false,
+                _ => {}
+            },
             UiMsg::Input(Event::Mouse(m)) => {
                 match self.diff.as_mut() {
                     Some(d) => {
@@ -2336,8 +2345,21 @@ impl App {
             return;
         }
         if self.help {
-            // Any key closes the help popup; Ctrl-C still quits.
-            self.help = false;
+            // Scroll keys scroll a help popup that doesn't fit; any other key closes it; Ctrl-C
+            // still quits.
+            let s = &mut self.help_scroll;
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => *s += 1,
+                KeyCode::Up | KeyCode::Char('k') => *s = s.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => *s += 10,
+                KeyCode::PageUp => *s = s.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => *s = 0,
+                KeyCode::End | KeyCode::Char('G') => *s = usize::MAX,
+                _ => self.help = false,
+            }
+            if self.help {
+                return;
+            }
             if !(ctrl && k.code == KeyCode::Char('c')) {
                 return;
             }
@@ -2346,7 +2368,10 @@ impl App {
         match k.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('r') => self.repos.iter().for_each(|r| r.worker.request(Request::Refresh)),
             KeyCode::Char('a') => self.focus_agent(),
             KeyCode::Char('n') => self.next_attention(),
@@ -3165,7 +3190,10 @@ impl App {
             Action::None => {}
             Action::Close => self.diff = None,
             Action::Reload => self.reload_diff(),
-            Action::Help => self.help = true,
+            Action::Help => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             Action::Quit => self.quit = true,
         }
     }

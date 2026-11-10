@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_diff(f, app, main);
         draw_diff_footer(f, app, footer);
         if app.help {
-            draw_help(f);
+            draw_help(f, app);
         }
         return;
     }
@@ -80,7 +80,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_confirm(f, c);
     }
     if app.help {
-        draw_help(f);
+        draw_help(f, app);
     }
 }
 
@@ -2275,42 +2275,149 @@ fn draw_confirm(f: &mut Frame, c: &crate::ui::Confirm) {
     f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), rect);
 }
 
-fn draw_help(f: &mut Frame) {
-    let area = f.area();
-    let build = format!(" canopy {}", env!("CANOPY_BUILD"));
-    let widest = HELP.iter().map(|(_, d)| d.width()).max().unwrap_or(0) as u16;
-    let w = (1 + 19 + widest + 3).max(build.width() as u16 + 3).min(area.width); // " key  description " + frame
-    let h = (HELP.len() as u16 + 2 + 4).min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
+/// Width of the key column in the help popup: the longest key and two spaces.
+fn help_key_width() -> usize {
+    HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0) + 2
+}
+
+/// How the help popup is laid out in a screen of `width` × `height`: `HELP` flowed into columns
+/// (each a range of `HELP`, a blank line never starting one), as few as fit the height, as many as
+/// fit the width; the popup scrolls when even those don't fit.
+#[derive(Debug, PartialEq)]
+struct HelpLayout {
+    cols: Vec<std::ops::Range<usize>>,
+    /// Lines in the tallest column.
+    rows: usize,
+    /// Popup size, frame included.
+    width: u16,
+    height: u16,
+    /// A blank line above and below the entries.
+    padded: bool,
+}
+
+fn help_layout(width: u16, height: u16) -> HelpLayout {
+    let flow = |k: usize| {
+        let per = HELP.len().div_ceil(k);
+        let mut cols = Vec::new();
+        let mut i = 0;
+        while i < HELP.len() {
+            while i < HELP.len() && HELP[i].0.is_empty() {
+                i += 1;
+            }
+            let end = (i + per).min(HELP.len());
+            if i < end {
+                cols.push(i..end);
+            }
+            i = end;
+        }
+        let rows = cols.iter().map(|c| c.len()).max().unwrap_or(0);
+        // " key  description" per column, a space between columns, the frame.
+        let w: usize = cols
+            .iter()
+            .map(|c| 1 + help_key_width() + HELP[c.clone()].iter().map(|(_, d)| d.width()).max().unwrap_or(0) + 1)
+            .sum::<usize>()
+            + 2;
+        (cols, rows, w)
     };
-    let mut lines: Vec<Line> = HELP
+    let mut best = None;
+    for k in 1..=4 {
+        let (cols, rows, w) = flow(k);
+        if w > width as usize && k > 1 {
+            break;
+        }
+        let fits = rows + 2 <= height as usize;
+        best = Some((cols, rows, w));
+        if fits {
+            break;
+        }
+    }
+    let (cols, rows, w) = best.expect("at least one column");
+    let padded = rows + 4 <= height as usize;
+    HelpLayout {
+        width: (w as u16).min(width),
+        height: ((rows + 2 + if padded { 2 } else { 0 }) as u16).min(height),
+        cols,
+        rows,
+        padded,
+    }
+}
+
+fn draw_help(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let l = help_layout(area.width, area.height);
+    let rect = Rect {
+        x: area.x + (area.width - l.width) / 2,
+        y: area.y + (area.height - l.height) / 2,
+        width: l.width,
+        height: l.height,
+    };
+    let visible = (l.height as usize).saturating_sub(if l.padded { 4 } else { 2 });
+    app.help_scroll = app.help_scroll.min(l.rows.saturating_sub(visible));
+    let kw = help_key_width();
+    let widths: Vec<usize> = l
+        .cols
         .iter()
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:<19}"), Style::new().fg(Color::Cyan)),
-                Span::raw(*d),
-            ])
+        .map(|c| HELP[c.clone()].iter().map(|(_, d)| d.width()).max().unwrap_or(0))
+        .collect();
+    let lines: Vec<Line> = (0..l.rows)
+        .skip(app.help_scroll)
+        .take(visible)
+        .map(|r| {
+            let mut spans = Vec::new();
+            for (c, w) in l.cols.iter().zip(&widths) {
+                let (k, d) = HELP
+                    .get(c.start + r)
+                    .filter(|_| c.start + r < c.end)
+                    .copied()
+                    .unwrap_or(("", ""));
+                spans.push(Span::styled(format!(" {k:<kw$}"), Style::new().fg(Color::Cyan)));
+                spans.push(Span::raw(format!("{d:<w$} ")));
+            }
+            Line::from(spans)
         })
         .collect();
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(build, Style::new().fg(C_DIM)));
+    let below = l.rows - app.help_scroll - lines.len();
+    let more = match (app.help_scroll > 0, below > 0) {
+        (_, true) => format!(" ↓ {below} more "),
+        (true, false) => " ↑ ".to_string(),
+        _ => String::new(),
+    };
     f.render_widget(Clear, rect);
-    // A popup over other content keeps a full frame.
-    let block = Block::bordered()
+    // A popup over other content keeps a full frame. The build goes on it, so it's never cut off.
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border_style(true))
         .title(" keys ")
-        .padding(Padding::vertical(1));
+        .title_bottom(
+            Line::styled(format!(" canopy {} ", env!("CANOPY_BUILD")), Style::new().fg(C_DIM)).right_aligned(),
+        )
+        .padding(Padding::vertical(l.padded as u16));
+    if !more.is_empty() {
+        block = block.title_bottom(Line::styled(more, Style::new().fg(Color::Cyan)).left_aligned());
+    }
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_fits_or_scrolls() {
+        let all =
+            |l: &HelpLayout| (0..HELP.len()).all(|i| HELP[i].0.is_empty() || l.cols.iter().any(|c| c.contains(&i)));
+        // Tall enough: one padded column.
+        let l = help_layout(200, 60);
+        assert_eq!((l.cols.len(), l.padded, l.rows), (1, true, HELP.len()));
+        // Short but wide: columns, everything shown.
+        let l = help_layout(200, 24);
+        assert!(l.cols.len() > 1 && l.rows + 2 <= 24, "{l:?}");
+        assert!(all(&l));
+        assert!(l.cols.iter().all(|c| !HELP[c.start].0.is_empty()));
+        // Short and narrow: one column that scrolls.
+        let l = help_layout(80, 24);
+        assert_eq!((l.cols.len(), l.height, l.padded), (1, 24, false));
+    }
 
     #[test]
     fn dates_and_ages() {

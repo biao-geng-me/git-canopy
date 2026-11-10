@@ -286,6 +286,10 @@ herdr does cross-machine development (saved SSH machines, each with its own herd
   lead-in (cyan when focused), plus a plain rule above the footer; no side lines, those columns stay
   blank (`render::panel`, with `render::content` for hit-testing/paging). Inside tmux/herdr, which draw their own pane borders,
   boxes were visual clutter. Only the `?` popup keeps a full frame, since it floats over content.
+  The `?` popup puts the build (version, commit, date, target) on its bottom border so it is never
+  clipped, flows the keys into as many columns as the width allows when they don't fit the height
+  (`help_layout`), and scrolls (↑↓ j k PgUp PgDn g G, wheel; `↓ n more` on the border) only when
+  even that doesn't fit; any other key or a click closes it.
 - **Shells:** `s` / double-click on a worktree's path opens a shell there, first that works:
   (1) a herdr pane split below canopy's own (`pane.split` with `target_pane_id` = `HERDR_PANE_ID`,
   `direction: "down"`, the worktree as `cwd`, `focus: true`); herdr runs the user's shell there and
