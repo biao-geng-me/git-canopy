@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up a development checkout: `canopy` and `git-canopy` in ~/.local/bin point at
-# target/release/canopy, and a post-commit hook rebuilds it in the background after every commit,
-# so the installed canopy always runs the latest commit. Re-running is harmless.
+# target/release/canopy, and git hooks rebuild it in the background after every commit and pull
+# (post-commit, post-merge, post-rewrite), so the installed canopy always runs the latest commit. Re-running is harmless.
 # CANOPY_BIN_DIR overrides ~/.local/bin (e.g. a per-arch bin dir when $HOME is shared by
 # machines of different architectures). Where sbatch and ~/sw/x86_64/cargo exist (RIT RC), the
 # hook also submits scripts/build-x86.sh for the x86_64 cluster.
@@ -14,8 +14,8 @@ CARGO=$(command -v cargo)
 HOOK=$(git rev-parse --git-path hooks/post-commit)
 cat >"$HOOK" <<HOOK
 #!/bin/sh
-# Rebuild the release binary in the background after each commit (installed by
-# scripts/install-dev.sh). Builds queue behind each other (flock); log in
+# Rebuild the release binary in the background after each commit or pull (installed by
+# scripts/install-dev.sh as post-commit, post-merge and post-rewrite). Builds queue behind each other (flock); log in
 # target/post-commit-build.log.
 cd "\$(git rev-parse --show-toplevel)" || exit 0
 mkdir -p target
@@ -30,6 +30,10 @@ if command -v sbatch >/dev/null && [ -d "\$HOME/sw/x86_64/cargo" ]; then
 fi
 HOOK
 chmod +x "$HOOK"
+# post-merge: git pull (merge or fast-forward); post-rewrite: git pull --rebase, commit --amend.
+for h in post-merge post-rewrite; do
+  cp "$HOOK" "$(git rev-parse --git-path hooks/$h)"
+done
 "$CARGO" build --release
 mkdir -p "$BIN"
 ln -sfn "$ROOT/target/release/canopy" "$BIN/canopy"
