@@ -29,7 +29,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -47,7 +51,10 @@ fn branch_exists(repo: &Path, b: &str) -> bool {
 fn merged_worktree(fx: &common::Fixture, name: &str) -> WorktreeView {
     let repo = fx.repo();
     let path = fx.wt(name);
-    git(&repo, &["worktree", "add", "-q", "-b", name, &path.to_string_lossy(), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", name, &path.to_string_lossy(), "main"],
+    );
     std::fs::write(path.join(format!("{name}.txt")), "work\n").unwrap();
     git(&path, &["add", "."]);
     git(&path, &["commit", "-qm", "work"]);
@@ -70,7 +77,15 @@ fn common_dir(fx: &common::Fixture) -> PathBuf {
 }
 
 fn plan_for(fx: &common::Fixture, w: &WorktreeView) -> Plan {
-    cleanup::plan(&common_dir(fx), Target::Worktree(Box::new(w.clone())), Some("main"), None, None, None).unwrap()
+    cleanup::plan(
+        &common_dir(fx),
+        Target::Worktree(Box::new(w.clone())),
+        Some("main"),
+        None,
+        None,
+        None,
+    )
+    .unwrap()
 }
 
 /// The plan's items, as `label` (allowed) or `label: why` (not).
@@ -86,11 +101,19 @@ fn items(plan: &Plan) -> Vec<String> {
 
 /// The labels of the items `chosen`.
 fn chosen(plan: &Plan, chosen: &[bool]) -> Vec<String> {
-    plan.items.iter().zip(chosen).filter(|&(_, &c)| c).map(|(it, _)| it.what.label()).collect()
+    plan.items
+        .iter()
+        .zip(chosen)
+        .filter(|&(_, &c)| c)
+        .map(|(it, _)| it.what.label())
+        .collect()
 }
 
 fn index(plan: &Plan, label: &str) -> usize {
-    plan.items.iter().position(|it| it.what.label() == label).unwrap_or_else(|| panic!("no {label} in {:?}", items(plan)))
+    plan.items
+        .iter()
+        .position(|it| it.what.label() == label)
+        .unwrap_or_else(|| panic!("no {label} in {:?}", items(plan)))
 }
 
 #[test]
@@ -103,7 +126,9 @@ fn removes_checkout_and_branch_with_git() {
     let plan = plan_for(&fx, &w);
     let checkout = format!("checkout {}", w.path.display());
     assert_eq!(items(&plan), [checkout.clone(), "branch ff-done".into()]);
-    let What::Checkout { ignored, .. } = &plan.items[0].what else { panic!() };
+    let What::Checkout { ignored, .. } = &plan.items[0].what else {
+        panic!()
+    };
     assert_eq!(ignored, &["build.log"]);
     assert_eq!(plan.items[1].keepers, ["refs/heads/main"]);
     let all = plan.default_choice();
@@ -122,7 +147,18 @@ fn squash_merged_branch_is_removed_too() {
     let fx = common::Fixture::new();
     let repo = fx.repo();
     let path = fx.wt("squashed");
-    git(&repo, &["worktree", "add", "-q", "-b", "squashed", &path.to_string_lossy(), "main"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "squashed",
+            &path.to_string_lossy(),
+            "main",
+        ],
+    );
     for line in ["one\n", "one\ntwo\n"] {
         std::fs::write(path.join("sq.txt"), line).unwrap();
         git(&path, &["add", "sq.txt"]);
@@ -145,7 +181,10 @@ fn merged_into_another_branch_than_base() {
     let fx = common::Fixture::new();
     let repo = fx.repo();
     let path = fx.wt("part");
-    git(&repo, &["worktree", "add", "-q", "-b", "part", &path.to_string_lossy(), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "part", &path.to_string_lossy(), "main"],
+    );
     std::fs::write(path.join("part.txt"), "x\n").unwrap();
     git(&path, &["add", "."]);
     git(&path, &["commit", "-qm", "part"]);
@@ -164,7 +203,10 @@ fn two_branches_at_one_commit_are_not_both_deleted() {
     let fx = common::Fixture::new();
     let repo = fx.repo();
     let (x, y) = (fx.wt("x"), fx.wt("y"));
-    git(&repo, &["worktree", "add", "-q", "-b", "x", &x.to_string_lossy(), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "x", &x.to_string_lossy(), "main"],
+    );
     std::fs::write(x.join("x.txt"), "x\n").unwrap();
     git(&x, &["add", "."]);
     git(&x, &["commit", "-qm", "x"]);
@@ -176,11 +218,19 @@ fn two_branches_at_one_commit_are_not_both_deleted() {
     cleanup::run(&px, &px.default_choice(), None).unwrap();
     let py = plan_for(&fx, &view(&y, "y"));
     let b = index(&py, "branch y");
-    assert!(py.items[b].blocker.as_deref().unwrap().contains("not merged"), "{:?}", items(&py));
-    assert!(py.default_choice().iter().all(|&c| !c), "nothing by default when the work isn't merged");
+    assert!(
+        py.items[b].blocker.as_deref().unwrap().contains("not merged"),
+        "{:?}",
+        items(&py)
+    );
+    assert!(
+        py.default_choice().iter().all(|&c| !c),
+        "nothing by default when the work isn't merged"
+    );
     // The checkout alone can still go: its branch keeps the work.
     let mut pick = vec![false; py.items.len()];
-    py.toggle(&mut pick, index(&py, &format!("checkout {}", y.display()))).unwrap();
+    py.toggle(&mut pick, index(&py, &format!("checkout {}", y.display())))
+        .unwrap();
     assert!(py.toggle(&mut pick, b).is_err());
     cleanup::run(&py, &pick, None).unwrap();
     assert!(!y.exists() && branch_exists(&repo, "y"));
@@ -230,10 +280,17 @@ fn worktrees_without_commits_of_their_own_are_removed() {
 
     // A fresh branch at main: nothing committed to lose; its branch goes too.
     let fresh = fx.wt("fresh");
-    git(&fx.repo(), &["worktree", "add", "-q", "-b", "fresh", &fresh.to_string_lossy(), "main"]);
+    git(
+        &fx.repo(),
+        &["worktree", "add", "-q", "-b", "fresh", &fresh.to_string_lossy(), "main"],
+    );
     // Just made: an agent may be about to start there.
     let plan = plan_for(&fx, &view(&fresh, "fresh"));
-    assert!(items(&plan)[0].contains("an agent may be starting there"), "{:?}", items(&plan));
+    assert!(
+        items(&plan)[0].contains("an agent may be starting there"),
+        "{:?}",
+        items(&plan)
+    );
     assert!(plan.default_choice().iter().all(|&c| !c));
     fx.age(&fresh);
     let plan = plan_for(&fx, &view(&fresh, "fresh"));
@@ -260,7 +317,10 @@ fn remote_branch_goes_when_another_remote_branch_has_it() {
     let fx = common::Fixture::new();
     let repo = fx.repo();
     let path = fx.wt("feat");
-    git(&repo, &["worktree", "add", "-q", "-b", "feat", &path.to_string_lossy(), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feat", &path.to_string_lossy(), "main"],
+    );
     std::fs::write(path.join("feat.txt"), "x\n").unwrap();
     git(&path, &["add", "."]);
     git(&path, &["commit", "-qm", "feat"]);
@@ -271,9 +331,16 @@ fn remote_branch_goes_when_another_remote_branch_has_it() {
     // only other copy is its own upstream, so nothing is chosen by default.
     let plan = plan_for(&fx, &view(&path, "feat"));
     let r = index(&plan, "remote branch origin/feat");
-    assert!(plan.items[r].blocker.as_deref().unwrap().contains("only copy"), "{:?}", items(&plan));
+    assert!(
+        plan.items[r].blocker.as_deref().unwrap().contains("only copy"),
+        "{:?}",
+        items(&plan)
+    );
     assert!(plan.default_choice().iter().all(|&c| !c));
-    assert_eq!(plan.items[index(&plan, "branch feat")].keepers, ["refs/remotes/origin/feat"]);
+    assert_eq!(
+        plan.items[index(&plan, "branch feat")].keepers,
+        ["refs/remotes/origin/feat"]
+    );
 
     // Merged into another branch on the remote (here: pushed as `integration`): everything goes.
     git(&path, &["push", "-q", "origin", "feat:integration"]);
@@ -282,12 +349,19 @@ fn remote_branch_goes_when_another_remote_branch_has_it() {
     let all = plan.default_choice();
     assert_eq!(
         chosen(&plan, &all),
-        [format!("checkout {}", path.display()), "branch feat".into(), "remote branch origin/feat".into()]
+        [
+            format!("checkout {}", path.display()),
+            "branch feat".into(),
+            "remote branch origin/feat".into()
+        ]
     );
     let notice = cleanup::run(&plan, &all, None).unwrap();
     assert!(notice.contains("origin/feat"), "{notice}");
     let origin = fx.dir.join("origin.git");
-    assert!(git(&origin, &["branch", "--list", "feat"]).is_empty(), "deleted on the remote");
+    assert!(
+        git(&origin, &["branch", "--list", "feat"]).is_empty(),
+        "deleted on the remote"
+    );
     assert!(!git(&origin, &["branch", "--list", "integration"]).is_empty());
     assert!(!branch_exists(&repo, "feat") && !path.exists());
 }
@@ -296,7 +370,16 @@ fn remote_branch_goes_when_another_remote_branch_has_it() {
 fn remote_branch_that_moved_on_the_remote_is_kept() {
     let fx = common::Fixture::new();
     let repo = fx.repo();
-    git(&repo, &["push", "-q", "origin", "main~1:refs/heads/old", "main~1:refs/heads/keep"]);
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "main~1:refs/heads/old",
+            "main~1:refs/heads/keep",
+        ],
+    );
     git(&repo, &["fetch", "-q", "origin"]);
     let sha = git(&repo, &["rev-parse", "main~1"]);
     let target = Target::Refs {
@@ -357,12 +440,20 @@ impl FakeHerdr {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let (checkout, repo, log) = (checkout.to_string_lossy().into_owned(), repo.to_path_buf(), calls.clone());
+        let (checkout, repo, log) = (
+            checkout.to_string_lossy().into_owned(),
+            repo.to_path_buf(),
+            calls.clone(),
+        );
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut conn) = conn else { break };
                 let mut line = String::new();
-                if BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap_or(0) == 0 {
+                if BufReader::new(conn.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap_or(0)
+                    == 0
+                {
                     continue;
                 }
                 let req = Json::parse(line.trim()).unwrap();
@@ -387,7 +478,9 @@ impl FakeHerdr {
                     }
                     "workspace.close" => {
                         let params = req.get("params").unwrap();
-                        log.lock().unwrap().push(format!("close {}", params.get_str("workspace_id").unwrap()));
+                        log.lock()
+                            .unwrap()
+                            .push(format!("close {}", params.get_str("workspace_id").unwrap()));
                         format!(r#"{{"id":"{id}","result":{{"type":"ok"}}}}"#)
                     }
                     other => panic!("unexpected call: {other}"),
@@ -414,11 +507,23 @@ fn herdr_workspace_is_removed_through_herdr() {
     // herdr made the checkout (it is in herdr's worktree directory) and has its workspace.
     let herdr_dir = w.path.parent().unwrap();
     let target = Target::Worktree(Box::new(w.clone()));
-    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), Some(herdr_dir), Some("w1")).unwrap();
-    let What::Workspace(ws) = &plan.items[0].what else { panic!("{:?}", items(&plan)) };
+    let plan = cleanup::plan(
+        &common_dir(&fx),
+        target,
+        Some("main"),
+        Some(herdr.sock.clone()),
+        Some(herdr_dir),
+        Some("w1"),
+    )
+    .unwrap();
+    let What::Workspace(ws) = &plan.items[0].what else {
+        panic!("{:?}", items(&plan))
+    };
     assert_eq!((ws.id.as_str(), ws.label.as_str(), ws.panes), ("w9", "ff-done", 2));
     // The done agent is in that workspace: closed with it, not left behind.
-    let What::Checkout { stray_agents, .. } = &plan.items[1].what else { panic!() };
+    let What::Checkout { stray_agents, .. } = &plan.items[1].what else {
+        panic!()
+    };
     assert!(stray_agents.is_empty());
     // A checkout goes with its workspace.
     assert_eq!(plan.items[1].requires, [0]);
@@ -426,7 +531,10 @@ fn herdr_workspace_is_removed_through_herdr() {
     let notice = cleanup::run(&plan, &plan.default_choice(), Some("w1")).unwrap();
     assert_eq!(*herdr.calls.lock().unwrap(), ["remove w9 force=Some(Bool(false))"]);
     assert!(!w.path.exists());
-    assert!(!branch_exists(&fx.repo(), "ff-done"), "herdr leaves the branch; canopy deletes it");
+    assert!(
+        !branch_exists(&fx.repo(), "ff-done"),
+        "herdr leaves the branch; canopy deletes it"
+    );
     assert!(notice.contains("herdr workspace ff-done"), "{notice}");
 }
 
@@ -436,7 +544,15 @@ fn herdr_workspace_alone_is_closed() {
     let w = merged_worktree(&fx, "ff-done");
     let herdr = FakeHerdr::start(&w.path, &fx.repo(), "idle");
     let target = Target::Worktree(Box::new(w.clone()));
-    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), None, None).unwrap();
+    let plan = cleanup::plan(
+        &common_dir(&fx),
+        target,
+        Some("main"),
+        Some(herdr.sock.clone()),
+        None,
+        None,
+    )
+    .unwrap();
     let mut pick = vec![false; plan.items.len()];
     plan.toggle(&mut pick, 0).unwrap();
     assert_eq!(chosen(&plan, &pick), ["herdr workspace ff-done"]);
@@ -468,7 +584,15 @@ fn herdr_refusals() {
     assert!(plan.default_choice().iter().all(|&c| !c));
 
     let idle = FakeHerdr::start(&w.path, &fx.repo(), "idle");
-    let plan = cleanup::plan(&common, target(), Some("main"), Some(idle.sock.clone()), None, Some("w9")).unwrap();
+    let plan = cleanup::plan(
+        &common,
+        target(),
+        Some("main"),
+        Some(idle.sock.clone()),
+        None,
+        Some("w9"),
+    )
+    .unwrap();
     assert!(items(&plan)[0].contains("canopy runs in it"), "{:?}", items(&plan));
     assert!(plan.default_choice().iter().all(|&c| !c));
 
@@ -479,7 +603,11 @@ fn herdr_refusals() {
     let elsewhere = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
     for sock in [Some(elsewhere.sock.clone()), None] {
         let plan = cleanup::plan(&common, target(), Some("main"), sock, Some(herdr_dir), None).unwrap();
-        assert!(items(&plan)[0].contains("another herdr's agent may be in it"), "{:?}", items(&plan));
+        assert!(
+            items(&plan)[0].contains("another herdr's agent may be in it"),
+            "{:?}",
+            items(&plan)
+        );
     }
     assert!(idle.calls.lock().unwrap().is_empty() && busy.calls.lock().unwrap().is_empty());
     assert!(w.path.exists() && branch_exists(&fx.repo(), "ff-done"));
@@ -495,8 +623,20 @@ fn checkout_herdr_made_but_cannot_see_is_picked_by_hand() {
     // herdr left the checkout), or another herdr has it.
     let herdr = FakeHerdr::start(&fx.repo(), &fx.repo(), "idle");
     let target = Target::Worktree(Box::new(w.clone()));
-    let plan = cleanup::plan(&common_dir(&fx), target, Some("main"), Some(herdr.sock.clone()), Some(herdr_dir), None).unwrap();
-    let c = plan.items.iter().position(|it| matches!(it.what, What::Checkout { .. })).unwrap();
+    let plan = cleanup::plan(
+        &common_dir(&fx),
+        target,
+        Some("main"),
+        Some(herdr.sock.clone()),
+        Some(herdr_dir),
+        None,
+    )
+    .unwrap();
+    let c = plan
+        .items
+        .iter()
+        .position(|it| matches!(it.what, What::Checkout { .. }))
+        .unwrap();
     assert!(plan.items[c].blocker.is_none(), "{:?}", items(&plan));
     let warning = plan.items[c].warning.as_deref().unwrap();
     assert!(warning.contains("last used 2 h ago"), "{warning}");
@@ -507,6 +647,9 @@ fn checkout_herdr_made_but_cannot_see_is_picked_by_hand() {
     plan.toggle(&mut pick, index(&plan, "branch ff-done")).unwrap();
     assert!(pick[c]);
     cleanup::run(&plan, &pick, None).unwrap();
-    assert!(herdr.calls.lock().unwrap().is_empty(), "plain git worktree remove, no herdr call");
+    assert!(
+        herdr.calls.lock().unwrap().is_empty(),
+        "plain git worktree remove, no herdr call"
+    );
     assert!(!w.path.exists() && !branch_exists(&fx.repo(), "ff-done"));
 }

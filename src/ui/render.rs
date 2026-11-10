@@ -210,7 +210,11 @@ pub fn cleanup_span(c: Cleanup, w: &WorktreeView) -> Option<Span<'static>> {
 /// Spaces after the worktree rows' marker column: two when a row shows `⌫`, which many fonts
 /// draw wider than its cell.
 fn marker_gap<'a>(mut markers: impl Iterator<Item = &'a Span<'static>>) -> usize {
-    if markers.any(|m| m.content == CLEANUP_GLYPH) { 2 } else { 1 }
+    if markers.any(|m| m.content == CLEANUP_GLYPH) {
+        2
+    } else {
+        1
+    }
 }
 
 /// `+staged ~modified ?untracked !unmerged`, or a state word when there are no counts. New
@@ -221,7 +225,10 @@ pub fn count_spans(w: &WorktreeView, icons: bool) -> Vec<Span<'static>> {
     if let Some(st) = &w.status {
         let files = st.untracked - st.untracked_dirs;
         let (file, dir) = if icons {
-            (format!("{NF_FILE} {files}"), format!("{NF_FOLDER} {}", st.untracked_dirs))
+            (
+                format!("{NF_FILE} {files}"),
+                format!("{NF_FOLDER} {}", st.untracked_dirs),
+            )
         } else {
             (format!("?{files}"), format!("?{}/", st.untracked_dirs))
         };
@@ -385,7 +392,10 @@ fn wt_rows(app: &App, wide: bool) -> Vec<Option<WtRow>> {
             Some(WtRow {
                 marker: cleanup_span(app.cleanup_in(r, wi), w).unwrap_or_else(|| marker(w)),
                 name: Span::styled(w.name.clone(), style),
-                agent: app.agent_activity_in(r, wi).map(|a| agent_spans(a, wide)).unwrap_or_default(),
+                agent: app
+                    .agent_activity_in(r, wi)
+                    .map(|a| agent_spans(a, wide))
+                    .unwrap_or_default(),
                 counts: count_spans(w, app.nerd_font),
                 ab: ab_spans(w, base),
                 size: if wide { size_spans(w) } else { Vec::new() },
@@ -440,7 +450,12 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
     }
     // Agents by state, most urgent first, in the worktree rows' glyphs and colors.
     let mut agents: Vec<Span<'static>> = Vec::new();
-    for state in [AgentState::Blocked, AgentState::Working, AgentState::Done, AgentState::Idle] {
+    for state in [
+        AgentState::Blocked,
+        AgentState::Working,
+        AgentState::Done,
+        AgentState::Idle,
+    ] {
         let n = app.repo_agents_in_state(r, state);
         if n > 0 {
             let act = herdr::Activity { state, count: 1 };
@@ -455,9 +470,14 @@ fn repo_header(app: &App, r: usize) -> Line<'static> {
     if dirty > 0 {
         spans.push(Span::styled(format!("  ✎ {dirty}"), Style::new().fg(C_MODIFIED)));
     }
-    let cleanable = (0..snap.worktrees.len()).filter(|&wi| app.cleanup_in(r, wi) != Cleanup::No).count();
+    let cleanable = (0..snap.worktrees.len())
+        .filter(|&wi| app.cleanup_in(r, wi) != Cleanup::No)
+        .count();
     if cleanable > 0 {
-        spans.push(Span::styled(format!("  {CLEANUP_GLYPH} {cleanable}"), Style::new().fg(Color::Green)));
+        spans.push(Span::styled(
+            format!("  {CLEANUP_GLYPH} {cleanable}"),
+            Style::new().fg(Color::Green),
+        ));
     }
     Line::from(spans)
 }
@@ -728,7 +748,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect, wide: bool) {
     let dirty = all().filter(|w| w.is_dirty()).count();
     let mut title = vec![Span::raw(" worktrees ")];
     if app.repos.len() > 1 {
-        title.push(Span::styled(format!("{} repos · ", app.repos.len()), Style::new().fg(C_DIM)));
+        title.push(Span::styled(
+            format!("{} repos · ", app.repos.len()),
+            Style::new().fg(C_DIM),
+        ));
     }
     if app.active_only {
         title.push(Span::styled("active only (f) · ", Style::new().fg(Color::Cyan)));
@@ -1065,7 +1088,10 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect) {
     let mut title = vec![Span::raw(" graph ")];
     if app.headers() {
         let name = app.repo_label(app.active);
-        title.push(Span::styled(format!("{name} "), Style::new().add_modifier(Modifier::BOLD)));
+        title.push(Span::styled(
+            format!("{name} "),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
     }
     if let Some(b) = &app.snap.base {
         title.push(Span::styled(format!("· base {b} "), Style::new().fg(C_DIM)));
@@ -1172,7 +1198,10 @@ fn repo_details(app: &App, r: usize) -> Line<'static> {
     let warn = Style::new().fg(C_CONFLICT);
     let host = repo.host.remote().map(|h| format!("{h}:")).unwrap_or_default();
     if let Some(e) = &repo.error {
-        return Line::from(vec![Span::raw(format!("{host}{} ", repo.common_dir.display())), Span::styled(first_line(e), warn)]);
+        return Line::from(vec![
+            Span::raw(format!("{host}{} ", repo.common_dir.display())),
+            Span::styled(first_line(e), warn),
+        ]);
     }
     let mut spans = vec![Span::raw(format!("{host}{}", tilde(&repo.common_dir)))];
     match app.remote_of(r).map(|x| &x.state) {
@@ -1197,7 +1226,10 @@ fn repo_details(app: &App, r: usize) -> Line<'static> {
             Some(RemoteState::Down { reason, .. }) => {
                 spans.push(Span::styled(format!("{}: {}", m.host, first_line(reason)), warn));
             }
-            _ => spans.push(Span::styled(format!("also watched from {} (its edits, its agents)", m.host), dim)),
+            _ => spans.push(Span::styled(
+                format!("also watched from {} (its edits, its agents)", m.host),
+                dim,
+            )),
         }
     }
     if let Some(b) = &snap.base {
@@ -1267,7 +1299,11 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
     };
     if let Some(text) = landed {
         spans.push(sep());
-        let style = if w.is_merged() { Style::new().fg(Color::Green) } else { dim };
+        let style = if w.is_merged() {
+            Style::new().fg(Color::Green)
+        } else {
+            dim
+        };
         spans.push(Span::styled(text, style));
     }
     match app.cleanup(wi) {
@@ -1275,7 +1311,10 @@ fn worktree_details(app: &App, wi: usize) -> Option<Line<'static>> {
             ", nothing to lose: Backspace removes it",
             Style::new().fg(C_UNUSED),
         )),
-        Cleanup::Safe => spans.push(Span::styled(", safe to clean up (Backspace)", Style::new().fg(Color::Green))),
+        Cleanup::Safe => spans.push(Span::styled(
+            ", safe to clean up (Backspace)",
+            Style::new().fg(Color::Green),
+        )),
         Cleanup::Untracked => spans.push(Span::styled(
             ", cleaning up would lose untracked files",
             Style::new().fg(C_MODIFIED),
@@ -1423,11 +1462,18 @@ pub fn local_date(t: i64) -> String {
     let zone = if tm.tm_zone.is_null() {
         String::new()
     } else {
-        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_string_lossy().into_owned()
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+            .to_string_lossy()
+            .into_owned()
     };
     let zone = if zone.is_empty() {
         let off = tm.tm_gmtoff / 60;
-        format!("{}{:02}{:02}", if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60)
+        format!(
+            "{}{:02}{:02}",
+            if off < 0 { '-' } else { '+' },
+            off.abs() / 60,
+            off.abs() % 60
+        )
     } else {
         zone
     };
@@ -1952,10 +1998,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let line = match app.focus {
-        Focus::Worktrees => app.wt.lines.get(app.wt.pos.sel).and_then(|l| match app.wt_ref(l.row())? {
-            WtRef::Tree(_, wi) => worktree_details(app, wi),
-            WtRef::Header(r) => Some(repo_details(app, r)),
-        }),
+        Focus::Worktrees => app
+            .wt
+            .lines
+            .get(app.wt.pos.sel)
+            .and_then(|l| match app.wt_ref(l.row())? {
+                WtRef::Tree(_, wi) => worktree_details(app, wi),
+                WtRef::Header(r) => Some(repo_details(app, r)),
+            }),
         Focus::Graph => graph_details(app),
     };
     if app.notice.is_some() {
@@ -2053,13 +2103,22 @@ const HELP: &[(&str, &str)] = &[
     ("a  dbl-click agent", "jump to the worktree's agent in herdr"),
     ("n", "next worktree whose agent is blocked (else done)"),
     ("f", "only active worktrees (changes, busy or done agents)"),
-    ("Space → ←  on a repo", "fold / unfold its worktrees (quiet repos start folded)"),
+    (
+        "Space → ←  on a repo",
+        "fold / unfold its worktrees (quiet repos start folded)",
+    ),
     ("s  dbl-click path", "shell in the worktree (pane below, or inset)"),
     ("t", "git TUI in the worktree (lazygit, gitui, tig)"),
     ("b", "diff vs base: all changes since the fork"),
     ("o  dbl-click ⚠", "overlaps: both sides' changes to shared files"),
-    ("Backspace", "clean up: choose checkout, workspace, branch, remote branch"),
-    ("Backspace ×2", "delete what can go without the popup (checks still run)"),
+    (
+        "Backspace",
+        "clean up: choose checkout, workspace, branch, remote branch",
+    ),
+    (
+        "Backspace ×2",
+        "delete what can go without the popup (checks still run)",
+    ),
     ("Ctrl-]", "leave the inset shell (exit closes it)"),
     ("y y", "copy the sha / path / file under the cursor"),
     ("y h  y s", "copy sha / short sha"),
@@ -2107,16 +2166,28 @@ fn draw_confirm(f: &mut Frame, c: &crate::ui::Confirm) {
         };
         let what = match &item.what {
             What::Workspace(ws) => {
-                let panes = if ws.panes == 1 { "1 pane".to_string() } else { format!("{} panes", ws.panes) };
+                let panes = if ws.panes == 1 {
+                    "1 pane".to_string()
+                } else {
+                    format!("{} panes", ws.panes)
+                };
                 format!("herdr workspace {} ({panes})", ws.label)
             }
             What::Checkout { path, .. } => format!("checkout {}", tilde(path)),
             What::Branch(b) => format!("branch {b}"),
             What::Remote(u) => format!("remote branch {}", u.short()),
         };
-        let at = item.sha.as_deref().map(|s| format!(" at {}", &s[..s.len().min(7)])).unwrap_or_default();
+        let at = item
+            .sha
+            .as_deref()
+            .map(|s| format!(" at {}", &s[..s.len().min(7)]))
+            .unwrap_or_default();
         let selected = i == c.cursor;
-        let row_style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+        let row_style = if selected {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
         let text_style = if blocked.is_some() { dim } else { Style::new() };
         if selected {
             cursor_line = lines.len();
@@ -2149,7 +2220,13 @@ fn draw_confirm(f: &mut Frame, c: &crate::ui::Confirm) {
                 }
             }
         }
-        if let What::Checkout { ignored, ignored_total, stray_agents, .. } = &item.what {
+        if let What::Checkout {
+            ignored,
+            ignored_total,
+            stray_agents,
+            ..
+        } = &item.what
+        {
             if *ignored_total > 0 {
                 let more = ignored_total.saturating_sub(ignored.len());
                 let mut list = ignored.join(", ");

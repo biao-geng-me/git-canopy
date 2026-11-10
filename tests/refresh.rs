@@ -295,7 +295,11 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -305,12 +309,18 @@ fn merged_worktrees_are_marked_for_cleanup() {
     let repo = fx.repo();
     let wt = |name: &str| fx.wt(name).to_string_lossy().into_owned();
     // ff-done: fast-forwarded into main. squashed: squash-merged into main.
-    git(&repo, &["worktree", "add", "-q", "-b", "ff-done", &wt("ff-done"), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "ff-done", &wt("ff-done"), "main"],
+    );
     std::fs::write(fx.wt("ff-done").join("ff.txt"), "ff\n").unwrap();
     git(&fx.wt("ff-done"), &["add", "ff.txt"]);
     git(&fx.wt("ff-done"), &["commit", "-qm", "ff work"]);
     git(&repo, &["merge", "-q", "--ff-only", "ff-done"]);
-    git(&repo, &["worktree", "add", "-q", "-b", "squashed", &wt("squashed"), "main"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "squashed", &wt("squashed"), "main"],
+    );
     for line in ["one\n", "one\ntwo\n"] {
         std::fs::write(fx.wt("squashed").join("sq.txt"), line).unwrap();
         git(&fx.wt("squashed"), &["add", "sq.txt"]);
@@ -370,7 +380,10 @@ fn merged_worktrees_are_marked_for_cleanup() {
     let s = wait_for(&rx, Duration::from_secs(5), |s| {
         find(s, "ff-done").is_dirty() && find(s, "squashed").is_dirty()
     });
-    assert_eq!(find(&s, "ff-done").cleanup(s.base.as_deref(), false), Cleanup::Untracked);
+    assert_eq!(
+        find(&s, "ff-done").cleanup(s.base.as_deref(), false),
+        Cleanup::Untracked
+    );
     assert_eq!(find(&s, "squashed").cleanup(s.base.as_deref(), false), Cleanup::No);
 
     // The branch that had part's work is gone: part is no longer merged.
@@ -491,7 +504,13 @@ fn handle_answers_requests() {
             canopy::cleanup::Target::Worktree(Box::new(w.clone())),
             Some("main".into()),
             Box::new(move |r| {
-                let why = r.map(|p| p.items.iter().filter_map(|it| it.blocker.clone()).collect::<Vec<_>>().join("; "));
+                let why = r.map(|p| {
+                    p.items
+                        .iter()
+                        .filter_map(|it| it.blocker.clone())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                });
                 tx.send(why).unwrap()
             }),
         )
@@ -534,12 +553,17 @@ fn another_machines_events_reach_the_worker() {
     // A commit (git dir events): ahead/behind moves without any poll.
     git(&fx.wt("fix-parser"), &["commit", "-qam", "more"]);
     assert!(
-        rx_until(&rx, Duration::from_secs(5), |s| find(s, "fix-parser").vs_base == Some((2, 1))),
+        rx_until(&rx, Duration::from_secs(5), |s| find(s, "fix-parser").vs_base
+            == Some((2, 1))),
         "the forwarded ref change reached the worker"
     );
 }
 
-fn rx_until(rx: &mpsc::Receiver<std::sync::Arc<Snapshot>>, timeout: Duration, pred: impl Fn(&Snapshot) -> bool) -> bool {
+fn rx_until(
+    rx: &mpsc::Receiver<std::sync::Arc<Snapshot>>,
+    timeout: Duration,
+    pred: impl Fn(&Snapshot) -> bool,
+) -> bool {
     let deadline = Instant::now() + timeout;
     while let Ok(s) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         if pred(&s) {
@@ -557,9 +581,18 @@ fn deleted_remote_branch_disappears() {
         if how != "push" {
             git(&fx.repo(), &["pack-refs", "--all"]);
         }
-        let cfg = Config { interval: Duration::from_secs(3600), ..Config::default() };
+        let cfg = Config {
+            interval: Duration::from_secs(3600),
+            ..Config::default()
+        };
         let (_h, rx) = spawn(&fx, cfg);
-        let has = |s: &Snapshot| s.graph.labels.iter().flatten().any(|l| l.text.contains("origin/feat-auth"));
+        let has = |s: &Snapshot| {
+            s.graph
+                .labels
+                .iter()
+                .flatten()
+                .any(|l| l.text.contains("origin/feat-auth"))
+        };
         wait_for(&rx, Duration::from_secs(10), |s| s.watching && has(s));
         std::thread::sleep(Duration::from_millis(500));
         if how == "prune" {

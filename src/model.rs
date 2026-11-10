@@ -460,7 +460,10 @@ mod tests {
         assert_eq!(blocked(&|w| w.is_current = true), "canopy runs in this worktree");
         assert_eq!(blocked(&|w| w.locked = Some(String::new())), "it is locked");
         assert_eq!(blocked(&|w| w.op = Some(Operation::Rebasing)), "REBASING in progress");
-        assert_eq!(blocked(&|w| w.branch = Some("main".into())), "it has the base branch main checked out");
+        assert_eq!(
+            blocked(&|w| w.branch = Some("main".into())),
+            "it has the base branch main checked out"
+        );
         assert_eq!(
             blocked(&|w| {
                 w.landed = None;

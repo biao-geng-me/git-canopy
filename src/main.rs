@@ -259,7 +259,9 @@ fn remote_install(args: &[String]) -> ExitCode {
             extra => return usage_error(&format!("unexpected argument: {extra}")),
         }
     }
-    let Some(host) = host else { return usage_error("remote install needs a HOST") };
+    let Some(host) = host else {
+        return usage_error("remote install needs a HOST");
+    };
     let opts = canopy::remote::install::Install { host, dir, binary };
     match canopy::remote::install::run(&opts) {
         Ok(path) => {
@@ -295,7 +297,11 @@ fn main() -> ExitCode {
         }
     };
     if args.serve {
-        let paths = if args.paths.is_empty() { vec![PathBuf::from(".")] } else { args.paths };
+        let paths = if args.paths.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            args.paths
+        };
         // Errors per path go to the client; this one means the protocol couldn't even start.
         return match canopy::remote::serve::run(paths, args.cfg, args.herdr) {
             Ok(()) => ExitCode::SUCCESS,
@@ -374,7 +380,10 @@ mod tests {
     #[test]
     fn remote_arguments() {
         let r = |s: &str| remote_arg(Path::new(s));
-        assert_eq!(r("gh-b-001:/home/me/proj"), Some(("gh-b-001".into(), "/home/me/proj".into())));
+        assert_eq!(
+            r("gh-b-001:/home/me/proj"),
+            Some(("gh-b-001".into(), "/home/me/proj".into()))
+        );
         assert_eq!(r("me@box:proj"), Some(("me@box".into(), "proj".into())));
         assert_eq!(r("box:"), Some(("box".into(), ".".into())));
         assert_eq!(r("./a:b"), None);

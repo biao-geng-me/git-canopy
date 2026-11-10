@@ -115,7 +115,10 @@ pub fn upstream(dir: &Path, branch: &str) -> Result<Option<Upstream>> {
     let (Some(tracking), Some(remote), Some(remote_ref)) = (f.next(), f.next(), f.next()) else {
         return Ok(None);
     };
-    match (tracking.starts_with("refs/remotes/"), remote_ref.strip_prefix("refs/heads/")) {
+    match (
+        tracking.starts_with("refs/remotes/"),
+        remote_ref.strip_prefix("refs/heads/"),
+    ) {
         (true, Some(b)) if !remote.is_empty() && remote != "." => Ok(Some(Upstream {
             tracking: tracking.to_string(),
             remote: remote.to_string(),

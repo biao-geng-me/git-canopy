@@ -314,7 +314,8 @@ impl RemoteHandle {
     }
 
     pub fn cleanup_plan(&self, target: cleanup::Target, base: Option<String>, reply: Reply<Plan>) {
-        self.conn.call(self.repo, Call::CleanupPlan { target, base }, expect(reply, plan));
+        self.conn
+            .call(self.repo, Call::CleanupPlan { target, base }, expect(reply, plan));
     }
 
     pub fn cleanup_run(&self, plan: Plan, chosen: Vec<bool>, reply: Reply<String>) {

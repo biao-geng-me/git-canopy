@@ -30,10 +30,10 @@ use std::time::{Duration, Instant};
 use notify::RecursiveMode;
 
 use crate::fsinfo::{self, Events};
-use crate::{cleanup, diff};
 use crate::git::{self, RepoPaths, changes::FileChange, log::Commit, refs::RefEntry};
 use crate::graph::Graph;
 use crate::model::{self, Changes, Landed, Overlap, Snapshot, WorktreeView};
+use crate::{cleanup, diff};
 use hub::Watches;
 use trees::TreeWatch;
 
@@ -220,7 +220,14 @@ impl Calls {
             let sock = if herdr { crate::herdr::socket_path() } else { None };
             let herdr_dir = crate::herdr::worktree_dir();
             let own = std::env::var("HERDR_WORKSPACE_ID").ok();
-            cleanup::plan(&dir, target, base.as_deref(), sock, herdr_dir.as_deref(), own.as_deref())
+            cleanup::plan(
+                &dir,
+                target,
+                base.as_deref(),
+                sock,
+                herdr_dir.as_deref(),
+                own.as_deref(),
+            )
         });
     }
 
@@ -779,7 +786,9 @@ impl Worker {
     /// Events-only: reload just the worktree list (which directories to watch); returns whether
     /// it changed.
     fn list_worktrees(&mut self) -> bool {
-        let Ok((entries, raw)) = git::worktree::list(self.repo_dir()) else { return false };
+        let Ok((entries, raw)) = git::worktree::list(self.repo_dir()) else {
+            return false;
+        };
         let mut h = DefaultHasher::new();
         raw.hash(&mut h);
         let fp = h.finish();
@@ -942,7 +951,13 @@ impl Worker {
                     *due += period;
                 }
             }
-            let before = (w.status.clone(), w.changed_at, w.git_used_at, w.status_error.clone(), w.op);
+            let before = (
+                w.status.clone(),
+                w.changed_at,
+                w.git_used_at,
+                w.status_error.clone(),
+                w.op,
+            );
             match res {
                 Ok(st) => {
                     w.changed_at = last_edited(&w.path, &st.paths);
@@ -952,8 +967,19 @@ impl Worker {
                 Err(e) => w.status_error = Some(format!("{e:#}")),
             }
             w.op = w.admin_dir.as_deref().and_then(git::worktree::operation);
-            w.git_used_at = w.admin_dir.as_deref().filter(|_| !w.is_main).and_then(git::worktree::last_used);
-            changed |= before != (w.status.clone(), w.changed_at, w.git_used_at, w.status_error.clone(), w.op);
+            w.git_used_at = w
+                .admin_dir
+                .as_deref()
+                .filter(|_| !w.is_main)
+                .and_then(git::worktree::last_used);
+            changed |= before
+                != (
+                    w.status.clone(),
+                    w.changed_at,
+                    w.git_used_at,
+                    w.status_error.clone(),
+                    w.op,
+                );
         }
         changed
     }
@@ -1189,7 +1215,10 @@ impl Worker {
         // they are keyed by the refs fingerprint too.
         enum Check {
             Reflog(String),
-            Elsewhere { branch: Option<String>, paths: Option<Vec<String>> },
+            Elsewhere {
+                branch: Option<String>,
+                paths: Option<Vec<String>>,
+            },
         }
         let main_branch = self.worktrees.first().and_then(|w| w.branch.clone());
         let mut keys: Vec<Option<LandedKey>> = vec![None; self.worktrees.len()];
@@ -1197,7 +1226,9 @@ impl Worker {
         for (s, f) in sides.iter().zip(&fork) {
             let (Some(wi), Some(f)) = (s.wi, f) else { continue };
             let w = &self.worktrees[wi];
-            let Some((ahead, _)) = w.vs_base.filter(|_| !s.is_base) else { continue };
+            let Some((ahead, _)) = w.vs_base.filter(|_| !s.is_base) else {
+                continue;
+            };
             let fp = if ahead == 0 { 0 } else { self.fingerprint };
             let key = (base_sha.clone(), s.head.clone(), w.branch.clone(), fp);
             keys[wi] = Some(key.clone());
@@ -1232,7 +1263,11 @@ impl Worker {
                     .and_then(|refs| other_branch(&dir, refs, branch.as_deref(), main_branch.as_deref()));
                 match (into, paths) {
                     (Some(into), _) => {
-                        let landed = if branch.as_deref().is_some_and(moved) { Landed::Merged } else { Landed::Unused };
+                        let landed = if branch.as_deref().is_some_and(moved) {
+                            Landed::Merged
+                        } else {
+                            Landed::Unused
+                        };
                         Some((landed, Some(into)))
                     }
                     (None, Some(paths)) => git::changes::same_content(&dir, head, base, paths)
@@ -1259,7 +1294,9 @@ impl Worker {
         };
         let mut overlaps: Vec<Vec<Overlap>> = vec![Vec::new(); self.worktrees.len()];
         // A merged worktree's work is in base already: overlapping it means nothing.
-        let merged = |s: &Side| s.wi.is_some_and(|wi| matches!(landed[wi], Some((Landed::Merged | Landed::Applied, _))));
+        let merged = |s: &Side| {
+            s.wi.is_some_and(|wi| matches!(landed[wi], Some((Landed::Merged | Landed::Applied, _))))
+        };
         for (i, j, from_i, from_j) in &pairs {
             let (a, b) = (&sides[*i], &sides[*j]);
             if merged(a) || merged(b) {
@@ -1389,7 +1426,9 @@ type LandedKey = (String, String, Option<String>, u64);
 /// worktree's branch before others.
 fn other_branch(dir: &Path, refs: Vec<String>, branch: Option<&str>, main_branch: Option<&str>) -> Option<String> {
     let own = branch.map(|b| format!("refs/heads/{b}"));
-    let upstream = branch.and_then(|b| git::refs::upstream(dir, b).ok().flatten()).map(|u| u.tracking);
+    let upstream = branch
+        .and_then(|b| git::refs::upstream(dir, b).ok().flatten())
+        .map(|u| u.tracking);
     let main = main_branch.map(|b| format!("refs/heads/{b}"));
     refs.into_iter()
         .filter(|r| Some(r) != own.as_ref() && Some(r) != upstream.as_ref())

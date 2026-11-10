@@ -223,10 +223,7 @@ impl App {
             ),
             Field::Branch => ("branch".to_string(), Payload::Text(ctx.branch.unwrap_or_default())),
             Field::Subject => ("subject".to_string(), Payload::Text(ctx.subject.unwrap_or_default())),
-            Field::Message => (
-                "message".to_string(),
-                Payload::Message(sha),
-            ),
+            Field::Message => ("message".to_string(), Payload::Message(sha)),
             Field::Path => {
                 let path = ctx.path.unwrap_or_default().to_string_lossy().into_owned();
                 ("path".to_string(), Payload::Text(path))

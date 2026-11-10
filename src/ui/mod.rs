@@ -131,7 +131,10 @@ enum Cleaning {
     /// Checking a target (a worktree's path, or a commit's sha) before the popup. `confirmed`:
     /// Backspace was pressed again meanwhile, so the plan's default choice is deleted as soon as
     /// the checks pass, without the popup.
-    Checking { key: String, confirmed: bool },
+    Checking {
+        key: String,
+        confirmed: bool,
+    },
     /// The confirm popup is open (`App::confirm`).
     Confirming,
     Removing,
@@ -356,7 +359,11 @@ pub struct Repo {
 impl Repo {
     /// Its main worktree's directory name (the path argument's until the first snapshot).
     fn display_name(&self) -> String {
-        if self.snap.repo_name.is_empty() { self.name.clone() } else { self.snap.repo_name.clone() }
+        if self.snap.repo_name.is_empty() {
+            self.name.clone()
+        } else {
+            self.snap.repo_name.clone()
+        }
     }
 }
 
@@ -366,7 +373,11 @@ fn local_machine() -> &'static str {
     NAME.get_or_init(|| {
         let full = crate::remote::hostname();
         let short = full.split('.').next().unwrap_or_default();
-        if short.is_empty() { "this machine".into() } else { short.into() }
+        if short.is_empty() {
+            "this machine".into()
+        } else {
+            short.into()
+        }
     })
 }
 
@@ -487,7 +498,10 @@ pub enum RemoteState {
     /// Connected to canopy `version` there.
     Up(String),
     /// Disconnected (or never connected), retried at `retry`.
-    Down { reason: String, retry: Instant },
+    Down {
+        reason: String,
+        retry: Instant,
+    },
 }
 
 const RETRY_MIN: Duration = Duration::from_secs(2);
@@ -591,10 +605,18 @@ impl App {
     /// name (`alpha/repo`, `beta/repo`).
     pub fn repo_label(&self, r: usize) -> String {
         let name = Repo::display_name;
-        let Some(repo) = self.repos.get(r) else { return String::new() };
+        let Some(repo) = self.repos.get(r) else {
+            return String::new();
+        };
         let own = name(repo);
         let at = repo.host.remote().map(|h| format!(" @ {h}")).unwrap_or_default();
-        if self.repos.iter().filter(|x| x.host == repo.host && name(x) == own).count() < 2 {
+        if self
+            .repos
+            .iter()
+            .filter(|x| x.host == repo.host && name(x) == own)
+            .count()
+            < 2
+        {
             return format!("{own}{at}");
         }
         let main = repo.snap.worktrees.iter().find(|w| w.is_main).map(|w| w.path.as_path());
@@ -609,10 +631,16 @@ impl App {
     /// project, each on a machine of its own (one repository watched here and with `--host`),
     /// else [`App::repo_label`].
     pub fn header_label(&self, r: usize) -> String {
-        let Some(repo) = self.repos.get(r) else { return String::new() };
+        let Some(repo) = self.repos.get(r) else {
+            return String::new();
+        };
         let first = self.repos[0].display_name();
         let one_project = self.repos.iter().all(|x| x.display_name() == first)
-            && self.repos.iter().enumerate().all(|(i, x)| self.repos[..i].iter().all(|y| y.host != x.host));
+            && self
+                .repos
+                .iter()
+                .enumerate()
+                .all(|(i, x)| self.repos[..i].iter().all(|y| y.host != x.host));
         if !one_project {
             return self.repo_label(r);
         }
@@ -735,7 +763,10 @@ impl App {
                 snap: Arc::new(Snapshot::default()),
                 name,
                 worker: Worker::Remote(None),
-                remote: Some(RemoteSlot { arg: Some(arg), id: None }),
+                remote: Some(RemoteSlot {
+                    arg: Some(arg),
+                    id: None,
+                }),
                 error: None,
                 identity: None,
                 mirrors: Vec::new(),
@@ -770,7 +801,12 @@ impl App {
         rm.attempt += 1;
         rm.state = RemoteState::Connecting;
         let (host, attempt) = (rm.host.clone(), rm.attempt);
-        let cmd = remote::ssh(&self.ssh, &host, &program, &remote::serve_args(&cfg, with_herdr, &rm.paths));
+        let cmd = remote::ssh(
+            &self.ssh,
+            &host,
+            &program,
+            &remote::serve_args(&cfg, with_herdr, &rm.paths),
+        );
         let emit_host = host.clone();
         match remote::connect(cmd, move |event| {
             let host = emit_host.clone();
@@ -900,8 +936,12 @@ impl App {
         let mut drop: Vec<u64> = Vec::new();
         let mut mirrored: Vec<(u64, usize, Mirror)> = Vec::new();
         for (r, repo) in self.repos.iter().enumerate() {
-            let Some(slot) = repo.remote.filter(|_| repo.host == host) else { continue };
-            let Some(Ok(info)) = slot.arg.and_then(|a| answers.get(a)) else { continue };
+            let Some(slot) = repo.remote.filter(|_| repo.host == host) else {
+                continue;
+            };
+            let Some(Ok(info)) = slot.arg.and_then(|a| answers.get(a)) else {
+                continue;
+            };
             if seen.contains(&info.id) {
                 drop.push(repo.id);
                 continue;
@@ -971,7 +1011,9 @@ impl App {
     /// A mirror whose repository is no longer watched (a herdr-found one dropped after its
     /// grace) takes its place: a repository of its own again, watched in full on its host.
     fn promote(&mut self, m: Mirror) {
-        let Some(rm) = self.remotes.iter().find(|x| x.host == m.host) else { return };
+        let Some(rm) = self.remotes.iter().find(|x| x.host == m.host) else {
+            return;
+        };
         if let (Some(id), Some(conn)) = (m.id, &rm.conn) {
             conn.watch(id, crate::remote::Mode::Full);
         }
@@ -1012,7 +1054,9 @@ impl App {
             return;
         }
         let rm = &mut self.remotes[ri];
-        let (Some(view), Some(conn)) = (&rm.herdr, &rm.conn) else { return };
+        let (Some(view), Some(conn)) = (&rm.herdr, &rm.conn) else {
+            return;
+        };
         let fresh: Vec<PathBuf> = herdr::dirs(view)
             .into_iter()
             .filter(|p| !rm.found.contains_key(p) && !rm.asked.contains(p))
@@ -1074,8 +1118,16 @@ impl App {
         for info in wanted {
             // Known on this host already, as a repository or a mirror: re-link (new ids after
             // a reconnect).
-            if let Some(repo) = self.repos.iter_mut().find(|r| r.host == host && r.common_dir == info.common_dir) {
-                if let Some(slot) = repo.remote.as_mut().filter(|s| s.arg.is_none() && s.id != Some(info.id)) {
+            if let Some(repo) = self
+                .repos
+                .iter_mut()
+                .find(|r| r.host == host && r.common_dir == info.common_dir)
+            {
+                if let Some(slot) = repo
+                    .remote
+                    .as_mut()
+                    .filter(|s| s.arg.is_none() && s.id != Some(info.id))
+                {
                     slot.id = Some(info.id);
                     repo.worker = Worker::Remote(handle(info.id));
                     watch(info.id, Mode::Full);
@@ -1096,9 +1148,10 @@ impl App {
                 continue;
             }
             changed = true;
-            let owner = info.identity.as_ref().and_then(|ident| {
-                self.repos.iter().position(|x| x.identity.as_ref() == Some(ident))
-            });
+            let owner = info
+                .identity
+                .as_ref()
+                .and_then(|ident| self.repos.iter().position(|x| x.identity.as_ref() == Some(ident)));
             match owner {
                 Some(o) => {
                     watch(info.id, Mode::Events);
@@ -1124,7 +1177,10 @@ impl App {
                         common_dir: info.common_dir.clone(),
                         snap: Arc::new(Snapshot::default()),
                         worker: Worker::Remote(handle(info.id)),
-                        remote: Some(RemoteSlot { arg: None, id: Some(info.id) }),
+                        remote: Some(RemoteSlot {
+                            arg: None,
+                            id: Some(info.id),
+                        }),
                         error: None,
                         identity: info.identity.clone(),
                         mirrors: Vec::new(),
@@ -1214,10 +1270,15 @@ impl App {
     /// an operation in progress, an agent working, blocked or done (its work to review), or no
     /// status yet.
     pub fn is_active(&self, r: usize, wi: usize) -> bool {
-        let Some(w) = self.repos.get(r).and_then(|x| x.snap.worktrees.get(wi)) else { return false };
-        let agent = self
-            .agent_activity_in(r, wi)
-            .is_some_and(|a| matches!(a.state, herdr::AgentState::Working | herdr::AgentState::Blocked | herdr::AgentState::Done));
+        let Some(w) = self.repos.get(r).and_then(|x| x.snap.worktrees.get(wi)) else {
+            return false;
+        };
+        let agent = self.agent_activity_in(r, wi).is_some_and(|a| {
+            matches!(
+                a.state,
+                herdr::AgentState::Working | herdr::AgentState::Blocked | herdr::AgentState::Done
+            )
+        });
         (w.has_worktree() && w.status.is_none()) || w.is_dirty() || w.op.is_some() || agent
     }
 
@@ -1325,7 +1386,11 @@ impl App {
     /// Whether the worktree list has a header row per repository: with several, or with any on
     /// another machine (its header says which, and whether it is connected).
     pub fn headers(&self) -> bool {
-        self.repos.len() > 1 || self.repos.iter().any(|r| r.host != Host::Local || !r.mirrors.is_empty())
+        self.repos.len() > 1
+            || self
+                .repos
+                .iter()
+                .any(|r| r.host != Host::Local || !r.mirrors.is_empty())
     }
 
     /// The state of remote host `name`.
@@ -1344,7 +1409,11 @@ impl App {
         if r == self.active {
             self.repos.remove(r);
             self.active = 0;
-            self.graph = self.repos.first_mut().map(|x| std::mem::take(&mut x.graph)).unwrap_or_default();
+            self.graph = self
+                .repos
+                .first_mut()
+                .map(|x| std::mem::take(&mut x.graph))
+                .unwrap_or_default();
             self.snap = self.repos.first().map_or_else(Default::default, |x| x.snap.clone());
         } else {
             self.repos.remove(r);
@@ -1363,7 +1432,9 @@ impl App {
     /// `--herdr-repos`: look up the repositories of directories herdr reports that aren't known
     /// yet (off the UI thread), then add and remove repositories to match.
     fn discover_repos(&mut self) {
-        let (Some(d), Some(view)) = (&mut self.discovery, &self.herdr) else { return };
+        let (Some(d), Some(view)) = (&mut self.discovery, &self.herdr) else {
+            return;
+        };
         let fresh: Vec<PathBuf> = herdr::dirs(view)
             .into_iter()
             .filter(|p| !d.dirs.contains_key(p) && !d.asked.contains(p))
@@ -1389,7 +1460,9 @@ impl App {
     /// through herdr that have had none for [`HERDR_REPO_GRACE`]. Nothing is removed while
     /// herdr isn't reachable (no news isn't "gone").
     fn reconcile_repos(&mut self, now: Instant) {
-        let (Some(d), Some(view)) = (&self.discovery, &self.herdr) else { return };
+        let (Some(d), Some(view)) = (&self.discovery, &self.herdr) else {
+            return;
+        };
         let mut wanted: Vec<RepoPaths> = Vec::new();
         for p in herdr::dirs(view) {
             if let Some(Some(repo)) = d.dirs.get(&p)
@@ -1405,15 +1478,17 @@ impl App {
             repo.unseen_since = if seen { None } else { repo.unseen_since.or(Some(now)) };
         }
         for w in wanted {
-            if !self.repos.iter().any(|r| r.host == Host::Local && r.common_dir == w.common_dir) {
+            if !self
+                .repos
+                .iter()
+                .any(|r| r.host == Host::Local && r.common_dir == w.common_dir)
+            {
                 self.add_repo(w, true);
             }
         }
-        while let Some(r) = self
-            .repos
-            .iter()
-            .position(|x| x.host == Host::Local && x.from_herdr && x.unseen_since.is_some_and(|t| now >= t + HERDR_REPO_GRACE))
-        {
+        while let Some(r) = self.repos.iter().position(|x| {
+            x.host == Host::Local && x.from_herdr && x.unseen_since.is_some_and(|t| now >= t + HERDR_REPO_GRACE)
+        }) {
             self.remove_repo(r);
         }
     }
@@ -1461,7 +1536,12 @@ impl App {
 
     /// Keep the invariant that the graph shows the selected worktree-list row's repository.
     fn follow_wt_selection(&mut self) {
-        let r = self.wt.lines.get(self.wt.pos.sel).and_then(|l| self.wt_ref(l.row())).map(WtRef::repo);
+        let r = self
+            .wt
+            .lines
+            .get(self.wt.pos.sel)
+            .and_then(|l| self.wt_ref(l.row()))
+            .map(WtRef::repo);
         if let Some(r) = r {
             self.activate(r);
         }
@@ -1488,7 +1568,10 @@ impl App {
     pub fn row_key(&self, f: Focus, r: usize) -> Option<Key> {
         match f {
             Focus::Worktrees => match self.wt_ref(r)? {
-                WtRef::Header(ri) => Some(Key::Repo(self.repos[ri].host.clone(), self.repos[ri].common_dir.clone())),
+                WtRef::Header(ri) => Some(Key::Repo(
+                    self.repos[ri].host.clone(),
+                    self.repos[ri].common_dir.clone(),
+                )),
                 WtRef::Tree(ri, _) => self
                     .wt_at(r)
                     .map(|(_, w)| Key::Worktree(self.repos[ri].host.clone(), w.path.clone())),
@@ -1758,7 +1841,9 @@ impl App {
 
     /// Ask the repository that has `key` for its doc, as inset request `req`.
     fn load_doc(&self, key: Key, req: u64) {
-        let Some((r, target)) = self.diff_target_in(&key) else { return };
+        let Some((r, target)) = self.diff_target_in(&key) else {
+            return;
+        };
         let tx = self.tx.clone();
         self.repos[r].worker.doc(
             target,
@@ -2076,7 +2161,8 @@ impl App {
             .repos
             .iter()
             .map(|repo| {
-                let hosts = std::iter::once(repo.host.clone()).chain(repo.mirrors.iter().map(|m| Host::Ssh(m.host.clone())));
+                let hosts =
+                    std::iter::once(repo.host.clone()).chain(repo.mirrors.iter().map(|m| Host::Ssh(m.host.clone())));
                 let views: Vec<&Arc<herdr::View>> = hosts.filter_map(|h| self.herdr_of(&h)).collect();
                 match views.as_slice() {
                     [] => None,
@@ -2117,8 +2203,12 @@ impl App {
     /// Whether worktree `wi` of repository `r` could be removed (with its branch) without losing
     /// anything. Any agent in it that isn't idle or done counts as busy.
     pub fn cleanup_in(&self, r: usize, wi: usize) -> Cleanup {
-        let Some(repo) = self.repos.get(r) else { return Cleanup::No };
-        let Some(w) = repo.snap.worktrees.get(wi) else { return Cleanup::No };
+        let Some(repo) = self.repos.get(r) else {
+            return Cleanup::No;
+        };
+        let Some(w) = repo.snap.worktrees.get(wi) else {
+            return Cleanup::No;
+        };
         let used_ago = w.git_used_at.map(|t| crate::model::now_secs() - t);
         if self.herdr_unseen(r, w) && crate::model::herdr_unseen(used_ago).is_err() {
             return Cleanup::No;
@@ -2186,7 +2276,9 @@ impl App {
     /// `a`: ask herdr to focus the pane of the selected worktree's most urgent agent.
     /// On a remote host, its herdr is asked (which switches the herdr clients attached to it).
     fn focus_agent(&mut self) {
-        let Some(repo) = self.repos.get(self.active) else { return };
+        let Some(repo) = self.repos.get(self.active) else {
+            return;
+        };
         let Some(view) = &repo.view else { return };
         let agent = self
             .focused_wi()
@@ -2394,7 +2486,9 @@ impl App {
         let (len, page) = (self.graph.lines.len(), self.page());
         let pos = self.graph.pos;
         let near_end = pos.sel + 2 * page >= len || pos.offset + 2 * page >= len;
-        let Some(repo) = self.repos.get_mut(self.active) else { return };
+        let Some(repo) = self.repos.get_mut(self.active) else {
+            return;
+        };
         if self.snap.graph.truncated && near_end && repo.more_requested_at != rows {
             repo.more_requested_at = rows;
             repo.worker.request(Request::LoadMore);
@@ -2512,7 +2606,9 @@ impl App {
             return None;
         }
         let i = self.wt.lines.get(line)?.row();
-        let WtRef::Tree(_, wi) = self.wt_ref(i)? else { return None };
+        let WtRef::Tree(_, wi) = self.wt_ref(i)? else {
+            return None;
+        };
         let fields = self.wt_fields.get(&i)?;
         if fields.agent.as_ref().is_some_and(|r| r.contains(&col)) {
             return Some(WtField::Agent);
@@ -2586,13 +2682,17 @@ impl App {
                 return;
             }
         }
-        let Some(repo) = self.repos.get(self.active) else { return };
+        let Some(repo) = self.repos.get(self.active) else {
+            return;
+        };
         let (tx, id) = (self.tx.clone(), repo.id);
         let name = match &target {
             cleanup::Target::Worktree(w) => w.name.clone(),
-            cleanup::Target::Refs { refs, .. } => {
-                refs.iter().map(|r| crate::git::refs::short(r)).collect::<Vec<_>>().join(", ")
-            }
+            cleanup::Target::Refs { refs, .. } => refs
+                .iter()
+                .map(|r| crate::git::refs::short(r))
+                .collect::<Vec<_>>()
+                .join(", "),
         };
         // Planned (and later carried out) where the herdr that has the worktree's workspace
         // runs, so that herdr closes it; on a shared filesystem that may be a mirror's host.
@@ -2621,7 +2721,10 @@ impl App {
     fn cleanup_target(&self) -> Option<(String, cleanup::Target)> {
         let worktree = |wi: usize| {
             let w = self.snap.worktrees.get(wi)?;
-            Some((w.path.to_string_lossy().into_owned(), cleanup::Target::Worktree(Box::new(w.clone()))))
+            Some((
+                w.path.to_string_lossy().into_owned(),
+                cleanup::Target::Worktree(Box::new(w.clone())),
+            ))
         };
         if self.focus != Focus::Graph {
             return worktree(self.focused_wi()?);
@@ -2629,8 +2732,12 @@ impl App {
         let Some(focused) = self.focused_wi() else {
             let r = self.graph.lines.get(self.graph.pos.sel)?.row();
             let g = &self.snap.graph;
-            let RowKind::Commit(ci) = g.rows.get(r)?.kind else { return None };
-            let refs: Vec<String> = g.labels.get(ci)?
+            let RowKind::Commit(ci) = g.rows.get(r)?.kind else {
+                return None;
+            };
+            let refs: Vec<String> = g
+                .labels
+                .get(ci)?
                 .iter()
                 .filter_map(|l| match l.kind {
                     LabelKind::Branch => Some(format!("refs/heads/{}", l.text)),
@@ -2660,7 +2767,10 @@ impl App {
     fn run_cleanup(&mut self, id: u64, via: Host, plan: cleanup::Plan, chosen: Vec<bool>) {
         let Some(r) = self.repo_index(id) else {
             self.cleaning = Cleaning::Idle;
-            self.notice = Some(format!("didn't clean up {}: its repository is no longer watched", plan.name));
+            self.notice = Some(format!(
+                "didn't clean up {}: its repository is no longer watched",
+                plan.name
+            ));
             return;
         };
         self.cleaning = Cleaning::Removing;
@@ -2678,7 +2788,9 @@ impl App {
             plan,
             chosen,
             Box::new(move |res| {
-                let _ = tx.send(UiMsg::CleanupDone(res.map_err(|e| format!("didn't clean up {name}: {e}"))));
+                let _ = tx.send(UiMsg::CleanupDone(
+                    res.map_err(|e| format!("didn't clean up {name}: {e}")),
+                ));
             }),
         );
     }
@@ -2837,10 +2949,13 @@ impl App {
         if self.shell.is_some() && self.areas.shell.contains(pos) {
             return None;
         }
-        [(Focus::Worktrees, self.areas.worktrees), (Focus::Graph, self.areas.graph)]
-            .into_iter()
-            .find(|(_, a)| render::content(*a).contains(pos))
-            .map(|(f, _)| (f, pos.y))
+        [
+            (Focus::Worktrees, self.areas.worktrees),
+            (Focus::Graph, self.areas.graph),
+        ]
+        .into_iter()
+        .find(|(_, a)| render::content(*a).contains(pos))
+        .map(|(f, _)| (f, pos.y))
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -2952,7 +3067,9 @@ impl App {
         };
         let r = l.row();
         let Some(key) = self.target(f, r) else { return };
-        let Some((repo, target)) = self.diff_target_in(&key) else { return };
+        let Some((repo, target)) = self.diff_target_in(&key) else {
+            return;
+        };
         let title = match &key {
             Key::Commit(id) => {
                 let short = &id[..id.len().min(7)];
@@ -3128,7 +3245,8 @@ fn repo_name(common_dir: &Path) -> String {
     } else {
         common_dir
     };
-    dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())
+    dir.file_name()
+        .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
@@ -3353,7 +3471,10 @@ mod tests {
         let mut app = App::new(tx, &Config::default(), LayoutMode::Stacked);
         app.ssh = fake_ssh.into();
         // `#` comments out the serve arguments that follow.
-        app.remote_cmd = format!("cat '{}'; sleep 0.3; echo 'box went away' >&2; exit 3 #", script.display());
+        app.remote_cmd = format!(
+            "cat '{}'; sleep 0.3; echo 'box went away' >&2; exit 3 #",
+            script.display()
+        );
         app.add_remote("box".into(), vec!["/r/a".into(), "/r/a/wt".into(), "/r/nope".into()]);
         assert_eq!(app.repos.len(), 3, "a placeholder per path");
         assert!(app.headers());
@@ -3361,8 +3482,16 @@ mod tests {
 
         let mut saw_agents = false;
         loop {
-            let msg = rx.recv_timeout(Duration::from_secs(10)).expect("events from the fake server");
-            let closed = matches!(&msg, UiMsg::Remote { event: remote::Event::Closed(_), .. });
+            let msg = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("events from the fake server");
+            let closed = matches!(
+                &msg,
+                UiMsg::Remote {
+                    event: remote::Event::Closed(_),
+                    ..
+                }
+            );
             app.handle(msg);
             if app.remotes[0].herdr.is_some() {
                 saw_agents = app.repo_agents_in_state(0, herdr::AgentState::Blocked) == 1;
@@ -3377,7 +3506,12 @@ mod tests {
         assert_eq!(app.repos[0].snap.worktrees.len(), 1);
         assert_eq!(app.repo_label(0), "a @ box");
         assert_eq!(app.header_label(0), "a @ box", "two repositories on one machine: named");
-        assert!(app.repos[1].error.as_deref().is_some_and(|e| e.contains("not a repository")));
+        assert!(
+            app.repos[1]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not a repository"))
+        );
         assert!(saw_agents, "the host's herdr agents map onto its worktrees");
         assert_eq!(app.herdr_dir_of(&Host::Ssh("box".into())), Some(Path::new("/r/herdr")));
         // Gone: the snapshot stays, agents don't, a retry is scheduled.
@@ -3389,7 +3523,9 @@ mod tests {
         assert!(app.next_deadline().is_some());
         let err = Arc::new(std::sync::Mutex::new(None));
         let e2 = err.clone();
-        app.repos[0].worker.message("x".into(), Box::new(move |r| *e2.lock().unwrap() = Some(r)));
+        app.repos[0]
+            .worker
+            .message("x".into(), Box::new(move |r| *e2.lock().unwrap() = Some(r)));
         assert_eq!(err.lock().unwrap().clone(), Some(Err(NOT_CONNECTED.to_string())));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3410,7 +3546,11 @@ mod tests {
         use crate::remote::{PROTOCOL, RepoInfo, ToClient};
         let dir = fake_ssh("mirror");
         let repo_dir = dir.join("repo");
-        let ok = std::process::Command::new("git").args(["init", "-q"]).arg(&repo_dir).status().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo_dir)
+            .status()
+            .unwrap();
         assert!(ok.success());
         let paths = crate::git::discover(&repo_dir).unwrap();
         let identity = crate::git::identity(&paths.common_dir);
@@ -3467,7 +3607,13 @@ mod tests {
         let mut blocked_seen = 0;
         loop {
             let msg = rx.recv_timeout(Duration::from_secs(10)).expect("events");
-            let closed = matches!(&msg, UiMsg::Remote { event: remote::Event::Closed(_), .. });
+            let closed = matches!(
+                &msg,
+                UiMsg::Remote {
+                    event: remote::Event::Closed(_),
+                    ..
+                }
+            );
             app.handle(msg);
             if app.repos.len() == 1 {
                 blocked_seen = blocked_seen.max(app.repo_agents_in_state(0, herdr::AgentState::Blocked));
@@ -3481,13 +3627,23 @@ mod tests {
         assert_eq!(app.repos[0].mirrors.len(), 1);
         assert_eq!(app.repos[0].mirrors[0].host, "node");
         assert!(app.headers());
-        assert_eq!(app.header_label(0), local_machine(), "one project: its header names the machine");
+        assert_eq!(
+            app.header_label(0),
+            local_machine(),
+            "one project: its header names the machine"
+        );
         assert_eq!(blocked_seen, 1, "the other machine's agent is on the shared tree");
         // The other machine was told to forward file events only.
         let sent = std::fs::read_to_string(&sent).unwrap();
         let msg: crate::remote::ToServer = serde_json::from_str(sent.trim()).unwrap();
         assert!(
-            matches!(msg, crate::remote::ToServer::Watch { repo: 0, mode: crate::remote::Mode::Events }),
+            matches!(
+                msg,
+                crate::remote::ToServer::Watch {
+                    repo: 0,
+                    mode: crate::remote::Mode::Events
+                }
+            ),
             "{sent}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3544,7 +3700,11 @@ mod tests {
         };
         let mut reply = Vec::new();
         crate::remote::send(&mut reply, &found).unwrap();
-        std::fs::write(dir.join("found"), String::from_utf8(reply).unwrap().replace("999999", "__ID__")).unwrap();
+        std::fs::write(
+            dir.join("found"),
+            String::from_utf8(reply).unwrap().replace("999999", "__ID__"),
+        )
+        .unwrap();
         let sent = dir.join("sent");
         let d = dir.display();
 
@@ -3568,14 +3728,21 @@ mod tests {
             app.handle(msg);
         }
         let r = &app.repos[0];
-        assert_eq!((r.host.clone(), r.common_dir.clone()), (Host::Ssh("node".into()), PathBuf::from("/r/b/.git")));
+        assert_eq!(
+            (r.host.clone(), r.common_dir.clone()),
+            (Host::Ssh("node".into()), PathBuf::from("/r/b/.git"))
+        );
         assert_eq!(app.repo_label(0), "b @ node");
         assert_eq!(app.header_label(0), "node");
 
         // The agent left: the repository stays for the grace, then goes, unwatched there.
         let attempt = app.remotes[0].attempt;
         let event = remote::Event::Herdr(Some(Arc::new(agent_view(&[]))));
-        app.handle(UiMsg::Remote { host: "node".into(), attempt, event });
+        app.handle(UiMsg::Remote {
+            host: "node".into(),
+            attempt,
+            event,
+        });
         assert_eq!(app.repos.len(), 1);
         assert!(app.next_deadline().is_some());
         app.reconcile_remote(0, Instant::now() + HERDR_REPO_GRACE + Duration::from_secs(1));
@@ -3588,7 +3755,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert!(log.contains("Discover") && log.contains(r#"{"Watch":{"repo":0,"mode":"Full"}}"#), "{log}");
+        assert!(
+            log.contains("Discover") && log.contains(r#"{"Watch":{"repo":0,"mode":"Full"}}"#),
+            "{log}"
+        );
         assert!(log.contains(r#"{"Unwatch":{"repo":0}}"#), "{log}");
         drop(app);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3621,7 +3791,10 @@ mod tests {
         // a is busy (changes) and stays open; b, quiet, starts folded.
         app.on_repo_snapshot(0, snap(vec![wt("/w/a", true), wt("/w/a-x", false)]));
         app.on_repo_snapshot(1, snap(vec![wt("/w/b", false)]));
-        assert_eq!(app.wt_rows, [WtRef::Header(0), WtRef::Tree(0, 0), WtRef::Tree(0, 1), WtRef::Header(1)]);
+        assert_eq!(
+            app.wt_rows,
+            [WtRef::Header(0), WtRef::Tree(0, 0), WtRef::Tree(0, 1), WtRef::Header(1)]
+        );
         // Space on a header folds it; the cursor stays on the header.
         app.set_cursor(Focus::Worktrees, 0);
         app.on_key(key(' '));
@@ -3638,14 +3811,24 @@ mod tests {
         app.map_agents();
         app.on_key(key('n'));
         assert!(!app.is_folded(1));
-        assert_eq!(app.selected_worktree().map(|w| w.path.clone()), Some(PathBuf::from("/w/b")));
+        assert_eq!(
+            app.selected_worktree().map(|w| w.path.clone()),
+            Some(PathBuf::from("/w/b"))
+        );
         assert_eq!(app.active, 1);
 
         // `f`: only active worktrees (a's dirty one stays, folded inside its header).
         app.on_repo_snapshot(0, snap(vec![wt("/w/a", false), wt("/w/a-x", false)]));
         app.on_key(key('f'));
-        assert_eq!(app.wt_rows, [WtRef::Header(1), WtRef::Tree(1, 0)], "a has nothing active: gone");
-        assert_eq!(app.selected_worktree().map(|w| w.path.clone()), Some(PathBuf::from("/w/b")));
+        assert_eq!(
+            app.wt_rows,
+            [WtRef::Header(1), WtRef::Tree(1, 0)],
+            "a has nothing active: gone"
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.path.clone()),
+            Some(PathBuf::from("/w/b"))
+        );
         app.on_key(key('f'));
         assert_eq!(app.wt_rows.len(), 3, "a folded, b open again");
     }

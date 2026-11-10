@@ -176,7 +176,10 @@ pub fn assign(view: &View, worktrees: &[PathBuf]) -> Vec<Vec<usize>> {
         let by_cwd = a.cwd.as_deref().and_then(|c| deepest(c, worktrees));
         let by_workspace = || {
             // Workspace ids are per herdr server: two hosts' `w1` are different workspaces.
-            let ws = view.workspaces.iter().find(|w| w.id == a.workspace_id && w.host == a.host)?;
+            let ws = view
+                .workspaces
+                .iter()
+                .find(|w| w.id == a.workspace_id && w.host == a.host)?;
             deepest(ws.checkout.as_deref()?, worktrees)
         };
         if let Some(wi) = by_cwd.or_else(by_workspace) {
@@ -378,14 +381,18 @@ mod tests {
 
     #[test]
     fn worktree_dir_config() {
-        let toml = "[ui]\ndirectory = \"/nope\"\n\n[worktrees]\n# directory = \"~/old\"\ndirectory = \"~/trees\" # mine\n";
+        let toml =
+            "[ui]\ndirectory = \"/nope\"\n\n[worktrees]\n# directory = \"~/old\"\ndirectory = \"~/trees\" # mine\n";
         assert_eq!(config_worktree_dir(toml).as_deref(), Some("~/trees"));
         assert_eq!(config_worktree_dir("[worktrees]\n"), None);
         let env = |k: &str| match k {
             "HOME" => Some("/nonexistent-home".to_string()),
             _ => None,
         };
-        assert_eq!(worktree_dir_from(env), Some(PathBuf::from("/nonexistent-home/.herdr/worktrees")));
+        assert_eq!(
+            worktree_dir_from(env),
+            Some(PathBuf::from("/nonexistent-home/.herdr/worktrees"))
+        );
     }
 
     // Captured from herdr 0.9.3 (`agent.list` / `workspace.list`), trimmed and anonymized.

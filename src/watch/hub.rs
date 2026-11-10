@@ -126,7 +126,9 @@ impl Hub {
     /// Drop `id`'s interest in `dir`; true when nobody else watches it.
     fn forget(&self, id: usize, dir: &Path) -> bool {
         let mut routes = self.routes.lock().unwrap();
-        let Some(owners) = routes.owners.get_mut(dir) else { return false };
+        let Some(owners) = routes.owners.get_mut(dir) else {
+            return false;
+        };
         owners.retain(|&o| o != id);
         let last = owners.is_empty();
         if last {

@@ -71,9 +71,15 @@ mod packed_cells {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Cell>, D::Error> {
         let (chars, colors) = <(String, Vec<u8>)>::deserialize(d)?;
         if chars.chars().count() != colors.len() {
-            return Err(serde::de::Error::custom("graph cells: characters and colors differ in length"));
+            return Err(serde::de::Error::custom(
+                "graph cells: characters and colors differ in length",
+            ));
         }
-        Ok(chars.chars().zip(colors).map(|(ch, color)| Cell { ch, color }).collect())
+        Ok(chars
+            .chars()
+            .zip(colors)
+            .map(|(ch, color)| Cell { ch, color })
+            .collect())
     }
 }
 

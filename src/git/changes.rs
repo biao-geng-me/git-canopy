@@ -90,9 +90,18 @@ pub const MAX_APPLIED_FILES: usize = 2000;
 
 /// Whether every path in `paths` has the same content (or is absent) in commits `a` and `b`.
 pub fn same_content(dir: &Path, a: &str, b: &str, paths: &[String]) -> Result<bool> {
-    let mut args: Vec<String> = ["diff-tree", "-r", "--quiet", "--no-renames", "--no-ext-diff", a, b, "--"]
-        .map(String::from)
-        .to_vec();
+    let mut args: Vec<String> = [
+        "diff-tree",
+        "-r",
+        "--quiet",
+        "--no-renames",
+        "--no-ext-diff",
+        a,
+        b,
+        "--",
+    ]
+    .map(String::from)
+    .to_vec();
     args.extend(paths.iter().map(|p| format!(":(literal){p}")));
     let out = super::command(dir, &args)
         .output()

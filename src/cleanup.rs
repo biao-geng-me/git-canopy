@@ -34,7 +34,10 @@ pub enum Target {
     Worktree(Box<WorktreeView>),
     /// A graph commit without a worktree: its branch labels, as full ref names
     /// (`refs/heads/x`, `refs/remotes/origin/x`).
-    Refs { sha: String, refs: Vec<String> },
+    Refs {
+        sha: String,
+        refs: Vec<String>,
+    },
 }
 
 /// What cleaning up a target could delete, item by item, for the popup and for [`run`].
@@ -168,7 +171,11 @@ impl Plan {
                 return Err(format!("{}: {b}", item.what.label()));
             }
             if let Some(&r) = item.requires.iter().find(|&&r| !on(r)) {
-                return Err(format!("{} goes only with {}", item.what.label(), self.items[r].what.label()));
+                return Err(format!(
+                    "{} goes only with {}",
+                    item.what.label(),
+                    self.items[r].what.label()
+                ));
             }
             if item.sha.is_some() && !item.keepers.iter().any(|k| !gone.contains(k)) {
                 let others: Vec<&str> = item.keepers.iter().map(|k| refs::short(k)).collect();
@@ -284,9 +291,11 @@ pub fn plan(
 /// `refs` in the order they are worth naming: the base branch, the main worktree's branch,
 /// other local branches, then remote ones (each alphabetically).
 fn sort_keepers(dir: &Path, base: Option<&str>, refs: &mut [String]) {
-    let main = git::worktree::list(dir)
-        .ok()
-        .and_then(|(entries, _)| entries.first().and_then(|e| e.branch_name().map(|b| format!("refs/heads/{b}"))));
+    let main = git::worktree::list(dir).ok().and_then(|(entries, _)| {
+        entries
+            .first()
+            .and_then(|e| e.branch_name().map(|b| format!("refs/heads/{b}")))
+    });
     let base = base.map(|b| format!("refs/heads/{b}"));
     refs.sort_by_key(|r| {
         (
@@ -315,7 +324,12 @@ fn worktree_items(
     sort_keepers(dir, base, &mut containing);
 
     // The herdr workspace backed by the checkout, and the agents in it or in the checkout.
-    let ws = view.and_then(|v| v.workspaces.iter().find(|ws| ws.checkout.as_deref() == Some(&w.path)).cloned());
+    let ws = view.and_then(|v| {
+        v.workspaces
+            .iter()
+            .find(|ws| ws.checkout.as_deref() == Some(&w.path))
+            .cloned()
+    });
     let mut busy = None;
     let mut stray = Vec::new();
     for a in view.map_or(&[][..], |v| &v.agents[..]) {
@@ -348,7 +362,11 @@ fn worktree_items(
 
     // The checkout: its committed work stays in its branch (or whatever contains a detached
     // HEAD); what can't be recovered is what isn't committed.
-    let st = if w.has_worktree() { Some(git::status::load(&w.path)) } else { None };
+    let st = if w.has_worktree() {
+        Some(git::status::load(&w.path))
+    } else {
+        None
+    };
     let mut blocker = checkout_blocker(w, st.as_ref(), &head);
     if blocker.is_none() {
         blocker = busy.clone();
@@ -364,9 +382,16 @@ fn worktree_items(
     if blocker.is_none()
         && let Some(ago) = fresh_for(dir, w, &containing)
     {
-        blocker = Some(format!("no commits yet and git used it {} min ago: an agent may be starting there", ago / 60));
+        blocker = Some(format!(
+            "no commits yet and git used it {} min ago: an agent may be starting there",
+            ago / 60
+        ));
     }
-    let (ignored, ignored_total) = if blocker.is_none() { ignored(&w.path) } else { (Vec::new(), 0) };
+    let (ignored, ignored_total) = if blocker.is_none() {
+        ignored(&w.path)
+    } else {
+        (Vec::new(), 0)
+    };
     let checkout = items.len();
     items.push(Item {
         what: What::Checkout {
@@ -406,7 +431,10 @@ fn checkout_blocker(w: &WorktreeView, st: Option<&Result<git::status::Status>>, 
             Ok(st) if st.oid.as_deref() != Some(head) || st.branch != w.branch => "its HEAD moved".to_string(),
             Ok(st) if st.staged + st.modified + st.unmerged > 0 => "it has uncommitted changes".to_string(),
             Ok(st) if st.untracked > 0 => {
-                format!("{} untracked file(s) would be lost: delete them first (s opens a shell there)", st.untracked)
+                format!(
+                    "{} untracked file(s) would be lost: delete them first (s opens a shell there)",
+                    st.untracked
+                )
             }
             Ok(_) => return None,
         }
@@ -477,7 +505,10 @@ fn remote_item(dir: &Path, up: Upstream, base: Option<&str>, items: &mut Vec<Ite
     if keepers.is_empty()
         && let Some(bu) = &base_up
         && let Some(bu_sha) = refs::resolve(dir, &bu.tracking)
-        && matches!(crate::cleanup::landed(dir, &bu_sha, &sha, None), Ok(Some(Landed::Applied)))
+        && matches!(
+            crate::cleanup::landed(dir, &bu_sha, &sha, None),
+            Ok(Some(Landed::Applied))
+        )
     {
         keepers.push(bu.tracking.clone());
     }
@@ -546,7 +577,10 @@ fn fresh_for(dir: &Path, w: &WorktreeView, containing: &[String]) -> Option<i64>
     if !containing.iter().any(|r| Some(r) != own.as_ref()) {
         return None;
     }
-    let moved = w.branch.as_deref().is_some_and(|b| changes::reflog_len(dir, b, 2).is_ok_and(|n| n >= 2));
+    let moved = w
+        .branch
+        .as_deref()
+        .is_some_and(|b| changes::reflog_len(dir, b, 2).is_ok_and(|n| n >= 2));
     if moved {
         return None;
     }
@@ -588,7 +622,14 @@ pub fn run(plan: &Plan, chosen: &[bool], own_workspace: Option<&str>) -> Result<
     }
     fresh.check(&now).map_err(anyhow::Error::msg)?;
 
-    let pick = |f: fn(&What) -> bool| fresh.items.iter().zip(&now).filter(move |&(it, &c)| c && f(&it.what)).map(|(it, _)| it);
+    let pick = |f: fn(&What) -> bool| {
+        fresh
+            .items
+            .iter()
+            .zip(&now)
+            .filter(move |&(it, &c)| c && f(&it.what))
+            .map(|(it, _)| it)
+    };
     let ws = pick(|w| matches!(w, What::Workspace(_))).next();
     let checkout = pick(|w| matches!(w, What::Checkout { .. })).next();
     let mut done: Vec<String> = Vec::new();
@@ -610,7 +651,9 @@ pub fn run(plan: &Plan, chosen: &[bool], own_workspace: Option<&str>) -> Result<
     }
     let mut restore = Vec::new();
     for item in pick(|w| matches!(w, What::Branch(_))) {
-        let (What::Branch(b), Some(sha)) = (&item.what, &item.sha) else { continue };
+        let (What::Branch(b), Some(sha)) = (&item.what, &item.sha) else {
+            continue;
+        };
         // Only while it still points at the checked commit.
         if refs::resolve(&fresh.common_dir, &format!("refs/heads/{b}")).as_ref() != Some(sha) {
             done.push(format!("kept branch {b}: it moved"));
@@ -622,7 +665,9 @@ pub fn run(plan: &Plan, chosen: &[bool], own_workspace: Option<&str>) -> Result<
         restore.push(format!("git branch {b} {short}"));
     }
     for item in pick(|w| matches!(w, What::Remote(_))) {
-        let (What::Remote(up), Some(sha)) = (&item.what, &item.sha) else { continue };
+        let (What::Remote(up), Some(sha)) = (&item.what, &item.sha) else {
+            continue;
+        };
         match delete_remote(&fresh.common_dir, up, sha, &item.keepers) {
             Ok(()) => done.push(up.short().to_string()),
             Err(e) => done.push(format!("kept {}: {e:#}", up.short())),
@@ -640,8 +685,14 @@ pub fn run(plan: &Plan, chosen: &[bool], own_workspace: Option<&str>) -> Result<
 fn delete_remote(dir: &Path, up: &Upstream, sha: &str, keepers: &[String]) -> Result<()> {
     let mut confirmed = false;
     for k in keepers {
-        let (Some(k_up), Some(k_sha)) = (refs::remote_of(dir, k)?, refs::resolve(dir, k)) else { continue };
-        let out = git::run_net(dir, &["ls-remote", &k_up.remote, &format!("refs/heads/{}", k_up.branch)], NET_TIMEOUT)?;
+        let (Some(k_up), Some(k_sha)) = (refs::remote_of(dir, k)?, refs::resolve(dir, k)) else {
+            continue;
+        };
+        let out = git::run_net(
+            dir,
+            &["ls-remote", &k_up.remote, &format!("refs/heads/{}", k_up.branch)],
+            NET_TIMEOUT,
+        )?;
         if String::from_utf8_lossy(&out).split_whitespace().next() == Some(k_sha.as_str()) {
             confirmed = true;
             break;
@@ -651,7 +702,17 @@ fn delete_remote(dir: &Path, up: &Upstream, sha: &str, keepers: &[String]) -> Re
         bail!("no other remote branch has its commits there now (fetch, then try again)");
     }
     let lease = format!("--force-with-lease=refs/heads/{}:{sha}", up.branch);
-    git::run_net(dir, &["push", "--porcelain", &lease, &up.remote, &format!(":refs/heads/{}", up.branch)], NET_TIMEOUT)?;
+    git::run_net(
+        dir,
+        &[
+            "push",
+            "--porcelain",
+            &lease,
+            &up.remote,
+            &format!(":refs/heads/{}", up.branch),
+        ],
+        NET_TIMEOUT,
+    )?;
     Ok(())
 }
 
@@ -666,7 +727,10 @@ pub fn landed(dir: &Path, base_sha: &str, head: &str, branch: Option<&str>) -> R
     let Some(fork) = changes::merge_base(dir, base_sha, head)? else {
         return Ok(None);
     };
-    let files: Vec<String> = changes::between(dir, &fork, head)?.into_iter().map(|f| f.path).collect();
+    let files: Vec<String> = changes::between(dir, &fork, head)?
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
     if files.is_empty() || files.len() > changes::MAX_APPLIED_FILES {
         return Ok(None);
     }
@@ -675,7 +739,14 @@ pub fn landed(dir: &Path, base_sha: &str, head: &str, branch: Option<&str>) -> R
 
 /// Ignored files and directories (`dir/`) in the checkout, which removing it deletes too.
 fn ignored(path: &Path) -> (Vec<String>, usize) {
-    let args = ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"];
+    let args = [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    ];
     let Ok(out) = git::run(path, &args) else {
         return (Vec::new(), 0);
     };
